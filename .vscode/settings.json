@@ -1,0 +1,37 @@
+{
+  "//": "맞춤법 검사(cSpell)가 모르는 우리 말들. 코드 동작과는 아무 상관이 없고, 파란 물결선을 없애려고 둔 것입니다. 새 프로젝트나 줄임말이 생기면 여기에 한 줄 더 넣으면 됩니다.",
+
+  "cSpell.words": [
+    "aether", "apk", "arista", "assy", "automotive",
+    "bizlink", "bloom", "busbar",
+    "corva", "curie",
+    "dday", "dotenv",
+    "efem", "enclosure", "epc", "ericsson", "ess",
+    "faraday", "fastapi", "favs", "fcst", "flyctl",
+    "hrva",
+    "intellian", "isocalendar",
+    "jabil", "jks",
+    "kefico", "kla", "kmw", "kpe",
+    "lseg", "libreoffice",
+    "mkoo",
+    "nokia", "nrt",
+    "openpyxl", "oneview",
+    "pdftoppm", "plexus", "poppler", "powerbox", "pubspec", "pyflakes",
+    "schaeffler", "sdi", "semicon", "semiconductor", "spacex", "starlink", "starship",
+    "texon", "tgz", "tolon",
+    "uvicorn",
+    "valeo", "vvdn",
+    "wdm",
+    "xlsm", "xlsx",
+    "yfp"
+  ],
+
+  "cSpell.ignorePaths": [
+    "backups/**",
+    "_scratch/**",
+    "Claude outputs/**",
+    "**/*.bak_*",
+    "**/build/**",
+    "**/.dart_tool/**"
+  ]
+}
