@@ -106,12 +106,12 @@
       "columns": "week",
       "sections": [
         {
-          "name": "413",
+          "name": "403",
           "rows": [
             {
               "key": "t413",
               "label": "직납",
-              "dev_type": "413"
+              "dev_type": "403"
             }
           ]
         },
