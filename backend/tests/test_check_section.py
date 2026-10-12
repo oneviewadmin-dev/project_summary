@@ -31,9 +31,12 @@ assert rank_of("StatusWords.soon") == 3, '집중관리가 아직 문제로 잡�
 assert rank_of("'비고'") == 4
 ok += 1
 
-# ── 이슈는 빨강. 파란색이면 '참고' 처럼 보인다 ──
+# ── 이슈는 주황(EA580C). 파란색·회색이면 '참고' 처럼 보인다 ──
+#
+# 2.3.51 전에는 지연과 같은 빨강(DC2626)이었다. 한 목록에서 지연과
+# 특이사항이 같은 색이라 구분이 안 됐다. 홈 신호등과 같은 주황으로 맞췄다.
 m = re.search(r"case StatusWords.issue:\s*\n\s*return const Color\(0xFF(\w+)\);", S)
-assert m and m.group(1) == 'DC2626', f'특이사항 색이 {m and m.group(1)}'
+assert m and m.group(1) == 'EA580C', f'특이사항 색이 {m and m.group(1)}'
 ok += 1
 
 # ── '참고'(임박·비고) 블록은 없앴다 ──

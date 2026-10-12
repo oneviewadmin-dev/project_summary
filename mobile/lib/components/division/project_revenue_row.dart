@@ -48,7 +48,9 @@ class ProjectRevenueRow extends StatelessWidget {
       case '지연':
         return AppColors.statusRed;
       case '주의':
-        return AppColors.summaryCaution;
+        // 집중관리(주의)는 홈 신호등과 같은 노랑. 아래 달성률 기반 색과
+        // 값이 겹치지 않게 일부러 토큰을 쓰지 않는다.
+        return const Color(0xFFF59E0B);
     }
     final r = _rate;
     if (r == null) return AppColors.statusGray;

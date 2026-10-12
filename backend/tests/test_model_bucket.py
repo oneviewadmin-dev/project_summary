@@ -102,8 +102,10 @@ assert "final g = (m['display_group'] ?? m['group'] ?? '').toString();" in D, \
     '섞인 목록에서 카드 종류를 모델마다 안 고른다'
 assert 'this.initialFilter' in D
 ok += 1
-# 상태별 색 (지연 빨강 · 임박 주황 · 정상 초록)
-assert '0xFFDC2626' in D and '0xFFE97132' in D and '0xFF059669' in D
+# 상태별 색 (지연 빨강 · 집중관리 노랑 · 정상 초록)
+# 집중관리는 2.3.51 에서 주황(E97132) → 노랑(F59E0B). 특이사항의 주황과
+# 구분이 안 돼서 바꿨다. 1-3 용어 사전의 색 표가 이 값을 그대로 적는다.
+assert '0xFFDC2626' in D and '0xFFF59E0B' in D and '0xFF059669' in D
 ok += 1
 
 # 비었을 때 문구
