@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.51",
-  "latest_version_code": 74,
+  "latest_version": "2.3.52",
+  "latest_version_code": 75,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "상태 색을 화면마다 같게 맞췄습니다.\n\n- 집중관리는 노랑, 특이사항은 주황\n- 목록에서 특이사항이 지연과 같던 것 수정\n- 사업부 · 전체 현황 카드도 같은 색",
+  "release_notes": "새 자료가 올라오면 알아서 바뀝니다.\n\n- 관리자가 엑셀을 올리면 30초 안에 반영\n- 당겨서 새로고침할 일이 없습니다\n- 설정에서 자동 새로고침을 끄면 안 바뀝니다",
   "force_update": false
 }
