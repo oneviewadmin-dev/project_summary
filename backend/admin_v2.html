@@ -7658,6 +7658,7 @@ if (!_currentProjectKey) { /* 프로젝트 선택 대기 중 */ return; }
   }
 
   // ── 프로젝트별 유형 관리 ──
+  // window 에도 걸어 둔다 — 업로드 직후 자동 갱신(ovAfterImport)이 부른다.
   function loadTypes(projectKey) {
     if (!projectKey) return;
     fetch('/admin/projects/' + encodeURIComponent(projectKey) + '/types')
@@ -7799,6 +7800,13 @@ if (!projKey) { /* 프로젝트 선택 대기 중 */ return; }
           var tb = document.getElementById('mdl-table-box');
           if (tb) loadModels(_currentProjectKey, tb);
           loadTypes(_currentProjectKey);
+          try { if (window.wbRefresh) window.wbRefresh(); } catch (_e) {}
+          try {
+            if (typeof window.loadModelList === 'function') {
+              var _ms0 = document.getElementById('wp-month-sel');
+              window.loadModelList(_ms0 ? _ms0.value : null);
+            }
+          } catch (_e) {}
         } else {
           alert('❌ 실패: ' + (d.detail || '알 수 없는 오류'));
         }
@@ -7857,8 +7865,7 @@ if (!projKey) { /* 프로젝트 선택 대기 중 */ return; }
             }
             if (window.mdlToast && _ap > 0 && _sk === 0) window.mdlToast('✅ ' + _msg);
             else alert((_ap > 0 ? '✅ ' : '⚠️ ') + _msg);
-            var tb = document.getElementById('mdl-table-box');
-            if (tb) loadModels(_currentProjectKey, tb);
+            if (window.ovAfterImport) window.ovAfterImport();
           } else {
             alert('❌ 실패: ' + (d.detail || '알 수 없는 오류'));
           }
@@ -7867,6 +7874,8 @@ if (!projKey) { /* 프로젝트 선택 대기 중 */ return; }
     }
     
   };
+
+  window.loadTypes = loadTypes;
 
   window.loadModels = function loadModels(projectKey, container) {
     if (!projectKey) {
@@ -8987,6 +8996,65 @@ window._ovProjectKey = function() {
 
 // ===== 주차별 계획: 모델별 개별 입력 (MutationObserver 방식) =====
 (function(){
+
+  // ── 월 고르개에 넣을 달 목록 ─────────────────────────────────────
+  //
+  // 전에는 이번 달 앞뒤 2개월만 넣었다. 그래서 4월처럼 숫자가 들어 있는데도
+  // 목록에 없는 달이 생겼다 — 「연간 내보내기」 창은 그 달을 「자료 있음」 으로
+  // 보여 주는데 정작 고쳐 보려면 고를 수가 없었다. 두 화면이 서로 다른 말을
+  // 한 셈이다. 그래서 같은 곳(plan-export/months)에 물어서,
+  //   숫자가 있는 달  ∪  이번 달 앞뒤 2개월
+  // 을 넣는다. 앞뒤 2개월을 남기는 이유는 아직 숫자가 없는 다음 달에도
+  // 처음 적어 넣어야 하기 때문이다.
+  window._wpMonthOptions = function(pk, cb) {
+    var base = new Date();
+    var win = [];
+    for (var off = -2; off <= 2; off++) {
+      var d = new Date(base.getFullYear(), base.getMonth() + off, 1);
+      win.push(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'));
+    }
+    function done(extra) {
+      var seen = {}, out = [];
+      win.concat(extra || []).forEach(function (m) {
+        if (m && !seen[m]) { seen[m] = 1; out.push(m); }
+      });
+      out.sort();
+      cb(out);
+    }
+    if (!pk) { done([]); return; }
+    // 앞뒤 2개월이 해를 넘으면 두 해를 다 물어본다
+    var years = {};
+    win.forEach(function (m) { years[m.slice(0, 4)] = 1; });
+    var ys = Object.keys(years), got = [], left = ys.length;
+    ys.forEach(function (y) {
+      fetch('/admin/projects/' + encodeURIComponent(pk) +
+            '/plan-export/months?year=' + y, { credentials: 'same-origin' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) { got = got.concat((d && d.has) || []); })
+        .catch(function () {})
+        .then(function () { if (--left <= 0) done(got); });
+    });
+  };
+
+  window._wpFillMonthSel = function (sel, cur, pk, after) {
+    function paint(list) {
+      // 같은 목록이면 다시 그리지 않는다 — 열려 있는 드롭다운이 닫힌다
+      var now = [];
+      for (var i = 0; i < sel.options.length; i++) now.push(sel.options[i].value);
+      if (now.join(',') === list.join(',')) { if (after) after(list); return; }
+      sel.innerHTML = '';
+      list.forEach(function (mv) {
+        var opt = document.createElement('option');
+        opt.value = mv;
+        opt.textContent = mv.slice(0, 4) + '년 ' + parseInt(mv.slice(5), 10) + '월';
+        if (mv === cur) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      if (after) after(list);
+    }
+    window._wpMonthOptions(pk, paint);
+  };
+
   var _wpMonth = new Date().toISOString().slice(0,7);
 
   function _wpFindWeeklyTable() {
@@ -9035,16 +9103,8 @@ window._ovProjectKey = function() {
     card.parentElement.insertBefore(box, card.nextSibling);
 
     var sel = document.getElementById('wp-month-sel');
-    var base = new Date();
-    for (var off = -2; off <= 2; off++) {
-      var d = new Date(base.getFullYear(), base.getMonth() + off, 1);
-      var mv = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
-      var opt = document.createElement('option');
-      opt.value = mv;
-      opt.textContent = d.getFullYear() + '년 ' + (d.getMonth() + 1) + '월';
-      if (mv === _wpMonth) opt.selected = true;
-      sel.appendChild(opt);
-    }
+    window._wpFillMonthSel(sel, _wpMonth,
+      (window._ovProjectKey && window._ovProjectKey()) || '');
     sel.onchange = function(){
       _wpMonth = this.value;
       _wpLoadModels();
@@ -9284,6 +9344,10 @@ window._ovProjectKey = function() {
     if (pk && pk !== _lastProjectKey) {
       _lastProjectKey = pk;
       loadModelList();
+      // 월 목록은 프로젝트마다 다르다. 화면이 처음 그려질 때는 아직
+      // 프로젝트를 고르기 전이라 앞뒤 2개월만 들어간다 — 고른 뒤에
+      // 다시 채워야 숫자가 있는 달이 나온다.
+      if (window.initMonthSelect) window.initMonthSelect();
     }
   }
   setInterval(watchProjectChange, 1000);
@@ -9291,17 +9355,9 @@ window._ovProjectKey = function() {
   window.initMonthSelect = function() {
     var sel = document.getElementById('wp-month-sel');
     if (!sel) return;
-    sel.innerHTML = '';
-    var base = new Date();
-    for (var off = -2; off <= 2; off++) {
-      var d = new Date(base.getFullYear(), base.getMonth() + off, 1);
-      var mv = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
-      var opt = document.createElement('option');
-      opt.value = mv;
-      opt.textContent = d.getFullYear() + '년 ' + (d.getMonth() + 1) + '월';
-      if (mv === _wpMonth) opt.selected = true;
-      sel.appendChild(opt);
-    }
+    // 숫자가 있는 달도 전부 넣는다 (_wpFillMonthSel 주석 참조)
+    window._wpFillMonthSel(sel, _wpMonth,
+      (window._ovProjectKey && window._ovProjectKey()) || '');
     sel.onchange = function() {
       _wpMonth = this.value;
       loadModelList(this.value);
@@ -9384,9 +9440,7 @@ window._ovProjectKey = function() {
           }
           if (window.mdlToast) window.mdlToast(msg.split('\n')[0]);
           if (msg.indexOf('\n') >= 0) alert(msg);
-          if (window.wbRefresh) window.wbRefresh();
-          var msel = document.getElementById('wp-month-sel');
-          if (window.loadModelList) window.loadModelList(msel && msel.value);
+          if (window.ovAfterImport) window.ovAfterImport();
         })
         .catch(function(e) {
           btn.disabled = false;
@@ -9417,10 +9471,7 @@ window._ovProjectKey = function() {
           var msg = '개발 프로세스 ' + (res.applied || 0) + '건 반영';
           if (res.skipped) msg += ' · 못 찾은 줄 ' + res.skipped + '개';
           if (window.mdlToast) window.mdlToast(msg);
-          if (typeof window.loadModelList === 'function') {
-            var ms = document.getElementById('wp-month-sel');
-            window.loadModelList(ms ? ms.value : null);
-          }
+          if (window.ovAfterImport) window.ovAfterImport();
         })
         .catch(function(e) {
           if (btn) { btn.disabled = false; btn.textContent = '📁 엑셀 올리기'; }
@@ -9470,11 +9521,7 @@ window._ovProjectKey = function() {
             msg += ' · 신규 ' + res.model_created.length + '개';
           }
           if (window.mdlToast) window.mdlToast(msg);
-          if (typeof window.loadModelList === 'function') {
-            var ms = document.getElementById('wp-month-sel');
-            window.loadModelList(ms ? ms.value : null);
-          }
-          if (window.wbRefresh) window.wbRefresh();
+          if (window.ovAfterImport) window.ovAfterImport();
         })
         .catch(function(e) {
           if (btn) { btn.disabled = false; btn.textContent = '📁 엑셀 올리기'; }
@@ -9778,10 +9825,7 @@ window._ovProjectKey = function() {
               }
               if (window.mdlToast) window.mdlToast(nm + ' → ' + mid + ' 로 묶었습니다');
               close();
-              if (typeof window.loadModelList === 'function') {
-                var _ms = document.getElementById('wp-month-sel');
-                window.loadModelList(_ms ? _ms.value : null);
-              }
+              if (window.ovAfterImport) window.ovAfterImport();
               if (typeof window._pfRerun === 'function') window._pfRerun(pk, f);
             })
             .catch(function(e) {
@@ -9839,14 +9883,7 @@ window._ovProjectKey = function() {
               if (res.week_notes) msg += ' · 사유 ' + res.week_notes + '주차';
               window.mdlToast(msg);
             }
-            if (window.wbRefresh) window.wbRefresh();
-            // 모델 값이 바뀌었으면 모델 목록도 다시 그린다
-            if (res.model_updated || (res.model_created || []).length) {
-              if (typeof window.loadModelList === 'function') {
-                var _ms = document.getElementById('wp-month-sel');
-                window.loadModelList(_ms ? _ms.value : null);
-              }
-            }
+            if (window.ovAfterImport) window.ovAfterImport();
           })
           .catch(function(e) { close(); alert('반영 실패: ' + e.message); });
       };
@@ -9958,8 +9995,8 @@ window._ovProjectKey = function() {
               window.mdlToast('신규 ' + res.added + ' · 갱신 ' + res.updated +
                               ' · 고객사 ' + (res.projects || []).length + '곳');
             }
-            if (window.loadModelList) window.loadModelList();
-            else location.reload();
+            if (window.ovAfterImport) window.ovAfterImport();
+            else if (!window.loadModelList) location.reload();
           })
           .catch(function(e) { close(); alert('반영 실패: ' + e.message); });
       };
@@ -10766,6 +10803,58 @@ window._ovProjectKey = function() {
       window.renderWeeklyBoard(pk, (msel && msel.value) || '');
     } catch (e) {
       console.warn('[board] 자동 갱신 실패', e);
+    }
+  };
+
+
+  // 업로드·반영 직후 그 결과가 걸린 화면을 한 번에 다시 그린다.
+  //
+  // 예전에는 올리는 자리마다 손으로 적어 둬서 엇갈렸다 — 주차 보드는
+  // 바뀌는데 모델 목록은 새로고침해야 보이고, 신규 모델은 아예 안 보였다.
+  // 올리는 자리는 전부 여기 하나를 부른다.
+  //
+  // 모델 목록 표에만 조건을 단다. 저장 안 한 수정이 남아 있으면 다시
+  // 그리지 않는다 — 다시 그리면 적어 둔 값이 그대로 날아간다.
+  window.ovAfterImport = function() {
+    // ① 주차별 계획 탭 목록 — 신규 모델과 바뀐 주차가 여기로 들어온다
+    try {
+      if (typeof window.loadModelList === 'function') {
+        var msel = document.getElementById('wp-month-sel');
+        window.loadModelList(msel ? msel.value : null);
+      }
+    } catch (e) { console.warn('[refresh] 주차 계획 목록 갱신 실패', e); }
+
+    // ② 모델 목록 표
+    //
+    // mdlRefresh('all') 이 서버에서 다시 받아 표·지연 배지를 바꾸고,
+    // 끝에서 주차 현황 보드와 매출 카드까지 같이 다시 그린다. 표가 없는
+    // 화면이면 보드만 돌린다.
+    var box = document.getElementById('mdl-table-box');
+    if (!box || typeof window.mdlRefresh !== 'function') {
+      try { if (window.wbRefresh) window.wbRefresh(); } catch (e) {}
+      return;
+    }
+
+    // 저장 안 한 수정이 남아 있으면 표는 건드리지 않는다 — 다시 그리면
+    // 적어 둔 값이 그대로 날아간다. 대신 왜 안 바뀌는지 알려 준다.
+    var warn = document.getElementById('mdl-save-msg');
+    if (warn && (warn.textContent || '').indexOf('저장') >= 0) {
+      if (window.mdlToast) {
+        window.mdlToast('모델 목록에 저장 안 한 수정이 있어 그 표는 그대로 뒀습니다');
+      }
+      try { if (window.wbRefresh) window.wbRefresh(); } catch (e) {}
+      return;
+    }
+
+    try {
+      window.mdlRefresh('all');
+      if (typeof window.loadTypes === 'function') {
+        var pk = (window._ovProjectKey && window._ovProjectKey()) || '';
+        if (pk) window.loadTypes(pk);
+      }
+    } catch (e) {
+      console.warn('[refresh] 모델 목록 갱신 실패', e);
+      try { if (window.wbRefresh) window.wbRefresh(); } catch (e2) {}
     }
   };
 

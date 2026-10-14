@@ -45,6 +45,7 @@ import 'revenue_detail_screen.dart';
 import 'chat_screen.dart';
 import 'settings_screen.dart';
 import '../services/settings_service.dart';
+import '../services/data_version_service.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -59,18 +60,73 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void _setupAutoRefresh() {
     _autoRefreshTimer?.cancel();
     final min = SettingsService.instance.autoRefreshMinutes.value;
-    if (min <= 0) return;
+    if (min <= 0) {
+      _stopDataWatch();
+      return;
+    }
     _autoRefreshTimer = Timer.periodic(Duration(minutes: min), (_) {
       if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
         _refresh();
       }
     });
+    _startDataWatch();
+  }
+
+  // ── 올린 자료 바로 비추기 ──────────────────────────────────
+  //
+  // 위 타이머는 '몇 분마다 전부 다시 받기'다. 설정을 5분으로 두면
+  // 관리자가 엑셀을 올려도 최대 5분을 기다려야 했다.
+  //
+  // 그래서 30초마다 서버에 '자료 바뀌었나' 한 줄만 묻고, 바뀐 때에만
+  // 전체를 다시 받는다. 평소에는 60바이트쯤이라 통신량이 늘지 않는다.
+  //
+  // 설정에서 자동 새로고침을 [끔] 으로 두면 이것도 멈춘다 — '끔' 이
+  // 거짓말이 되면 안 된다.
+  static const Duration _dataWatchEvery = Duration(seconds: 30);
+  Timer? _dataWatchTimer;
+  String? _lastDataVersion;
+  bool _dataWatchBusy = false;
+
+  void _startDataWatch() {
+    _dataWatchTimer?.cancel();
+    _dataWatchTimer = Timer.periodic(_dataWatchEvery, (_) => _checkDataVersion());
+    _checkDataVersion();
+  }
+
+  void _stopDataWatch() {
+    _dataWatchTimer?.cancel();
+    _dataWatchTimer = null;
+  }
+
+  Future<void> _checkDataVersion() async {
+    if (_dataWatchBusy) return;
+    // 앱이 막 켜진 동안에는 lifecycleState 가 아직 null 이다. 그때까지
+    // 건너뛰면 켜고 첫 30초는 감시가 아예 안 돈다 — null 은 통과시킨다.
+    final ls = WidgetsBinding.instance.lifecycleState;
+    if (ls != null && ls != AppLifecycleState.resumed) return;
+    _dataWatchBusy = true;
+    try {
+      final v = await DataVersionService.fetch();
+      // 못 받아온 건 '안 바뀐 것'으로 둔다. 신호가 나쁠 때 새로고침이
+      // 계속 돌면 느려지기만 한다.
+      if (v == null) return;
+      final before = _lastDataVersion;
+      _lastDataVersion = v;
+      if (before != null && before != v && mounted) {
+        await _refresh();
+      }
+    } finally {
+      _dataWatchBusy = false;
+    }
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _refresh();
+      // 꺼 둔 사이에 바뀌었을 수 있다. 방금 전부 받았으니 기준만 다시 잡는다.
+      _lastDataVersion = null;
+      _checkDataVersion();
     }
   }
 
@@ -226,6 +282,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // 현재 선택된 하단 네비 탭. 첫 탭이 '홈'.
   AppNavTab _currentTab = AppNavTab.home;
+
+  @override
+  void dispose() {
+    _autoRefreshTimer?.cancel();
+    _stopDataWatch();
+    SettingsService.instance.autoRefreshMinutes.removeListener(_setupAutoRefresh);
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
 
   @override
   void initState() {

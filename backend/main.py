@@ -1876,6 +1876,52 @@ def health():
     return {"status": "ok", "time": datetime.now().isoformat()}
 
 
+# ─── 자료 버전 — 앱이 "새 자료 들어왔나" 묻는 창구 ───────────────
+#
+# 관리자가 엑셀을 올리면 앱이 알아서 당겨받게 하려고 둔다. 앱은 이 한 줄만
+# 자주 물어보고, 값이 바뀐 때에만 전체를 다시 받는다. 매번 전부 받으면
+# 통신량이 수십 배가 되고 서버도 버티지 못한다.
+#
+# 쓰는 쪽에는 손을 대지 않는다 — 자료 파일의 수정 시각과 크기만 본다.
+# 그래서 엑셀 업로드든 화면에서 고친 것이든 터미널로 넣은 것이든 똑같이
+# 잡힌다. 저장 경로마다 '버전 올리기'를 심어 두면 언젠가 한 곳을 빠뜨린다.
+_DATA_VERSION_FILES = (
+    "models.json",            # 프로젝트·모델·주차별 계획
+    "revenue.json",           # 매출 실적·예상·타겟
+    "home_orders.json",       # 사장님 지시사항
+    "division_targets.json",  # 사업부별 월 매출 타겟
+    "purchases.json",         # 매입·지급
+    "overtime.json",          # 잔업·특근
+    "notes.json",             # 프로젝트 메모
+    "reports_latest.json",    # 주간보고 (PPT)
+)
+
+
+@app.get("/data-version")
+def data_version():
+    """자료가 바뀌었는지 한 줄로 알려준다. 앱의 자동 반영이 이걸 본다."""
+    import hashlib as _hl
+    parts, newest = [], 0.0
+    for name in _DATA_VERSION_FILES:
+        try:
+            st = (DATA_DIR / name).stat()
+        except OSError:
+            parts.append(name + ":-")      # 아직 없는 파일도 상태의 하나다
+            continue
+        parts.append("%s:%d:%d" % (name, int(st.st_mtime), st.st_size))
+        newest = max(newest, st.st_mtime)
+    token = _hl.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    return JSONResponse(
+        {
+            "version": token,
+            "updated_at": (datetime.fromtimestamp(newest).isoformat()
+                           if newest else ""),
+        },
+        # 중간에 끼어 있는 캐시가 옛 값을 돌려주면 자동 반영이 영원히 안 돈다.
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
 # =========================================================
 # 2. PPT 업로드
 # =========================================================

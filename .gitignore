@@ -189,3 +189,7 @@ backend/models_prod_backup_0826.json
 backend/models_recovered.json
 backend/models_trace.json
 backend/models.json
+# _save_models 가 덮어쓰기 전에 남기는 자동 백업. 로컬에서 서버 코드를
+# 한 번 띄우기만 해도 생긴다.
+backend/models.json.auto_*
+backend/models.json.tmp
