@@ -1,3 +1,11 @@
+# 버전은 전부 == 로 못 박는다. >= 로 두면 아무것도 안 고쳤는데 다음 배포 때
+# 새 버전이 받아져서 서버가 안 뜰 수 있다. 실제로 이 셋만 >= 였고,
+# 2026-10-14 에 운영 서버에 깔려 있던 버전 그대로 고정했다
+# (flyctl ssh console -a project-summary-mkoo -C "pip show <이름>" 로 확인).
+# 올릴 때는 한 번에 하나씩, 올리고 나서 /health 와 푸시 알림을 확인한다.
+# firebase-admin 은 7.x 가 나와 있다 — 메이저가 바뀐 것이라 푸시 쪽을
+# 꼭 시험해 보고 올린다.
+
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
 python-pptx==1.0.2
@@ -9,7 +17,7 @@ Pillow==11.0.0
 pdf2image==1.17.0
 python-dotenv==1.0.1
 openpyxl==3.1.5
-faiss-cpu>=1.11
-numpy>=2.0
+faiss-cpu==1.15.1
+numpy==2.4.6
 beautifulsoup4==4.12.3
-firebase-admin>=6.5.0
+firebase-admin==6.8.0

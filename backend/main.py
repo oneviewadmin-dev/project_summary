@@ -22415,19 +22415,6 @@ def register_device_token(payload: dict):
 
 
 
-@app.post("/admin/push/update-notice")
-def admin_push_update_notice(_admin: int = Depends(get_admin_session)):
-    """업데이트 공지 푸시 발송 (관리자 전용)"""
-    result = _send_fcm_to_all(
-        "새 버전 업데이트 안내",
-        "새 버전 2.1.2가 배포되었습니다. 최신 APK를 설치해주세요.",
-        data={
-            "type": "app_update",
-            "url": "https://github.com/msk05317/project_summary/releases/tag/v2.1.2",
-        },
-    )
-    return result
-
 
 @app.post("/admin/fcm-test")
 def admin_fcm_test(_admin: int = Depends(get_admin_session)):
