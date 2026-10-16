@@ -925,11 +925,17 @@ window._attachAutoListBehavior = function(el){
       document.querySelectorAll('.nav-item').forEach(function(x){ x.classList.remove('active'); });
       el.classList.add('active');
       const pg = el.getAttribute('data-page');
+      // 지금 어느 화면인지 적어 둔다. 사업부를 바꿀 때 '그 화면'을 다시
+      // 그리려면 이게 있어야 한다.
+      window._v2Page = pg;
       document.getElementById('v2-crumb-page').textContent = PAGE_LABEL[pg] || pg;
       if (window._v2SyncCrumbBiz) window._v2SyncCrumbBiz();
       renderPage(pg);
     });
   });
+
+  // 사업부를 바꿨을 때 '보고 있던 화면'을 다시 그리려고 밖에서도 부른다.
+  window._v2RenderPage = function(pg){ renderPage(pg); };
 
   function renderPage(pg){
     const c = document.getElementById('v2-content');
@@ -6378,7 +6384,8 @@ window.renderAdminV2ByDivision = function(){
 
   // 파트넘버를 따로 관리하는 프로젝트. 모델명과 품번이 다른 곳들이다.
   // (세 군데에 같은 목록이 박혀 있어서 큐리를 넣을 때 하나를 빼먹기 쉬웠다)
-  window.PN_PROJECTS = ['powerbox', 'major_module', 'frame', 'spacex'];
+  window.PN_PROJECTS = ['powerbox', 'major_module', 'frame', 'spacex',
+                       'arista_pcb'];
   window._mdlHasPN = function(pk) {
     return (window.PN_PROJECTS || []).indexOf(pk || '') !== -1;
   };
@@ -8092,9 +8099,17 @@ var sidebarSel = document.getElementById('v2-division-select');
     if (sidebarSel) {
       sidebarSel.addEventListener('change', function() {
         if (window._v2SyncCrumbBiz) window._v2SyncCrumbBiz();
-        // 사업부 변경 시 모델 관리 페이지 다시 렌더링
-        if (typeof renderModelsPage === 'function') {
-          renderModelsPage();
+        // 보고 있던 화면을 그대로 다시 그린다.
+        //
+        // 예전에는 어느 화면에 있든 모델 관리를 그렸다. 그래서 매입 관리나
+        // 매출 관리에서 사업부를 바꾸면, 왼쪽 메뉴와 빵부스러기는 '매입 관리'
+        // 인데 본문만 모델 관리로 바뀌었다. 화면이 안 따라오는 것처럼 보여
+        // 한참 기다리게 된다. 실제로 그렇게 보였다.
+        var _pg = window._v2Page || 'models';
+        if (_pg === 'models') {
+          if (typeof renderModelsPage === 'function') renderModelsPage();
+        } else if (typeof window._v2RenderPage === 'function') {
+          window._v2RenderPage(_pg);
         }
         var divId = sidebarSel.value || 'semiconductor';
         fetch('/projects').then(function(r){ return r.json(); }).then(function(d){
@@ -8164,12 +8179,16 @@ var sidebarSel = document.getElementById('v2-division-select');
               '<button type="button" class="ov-btn" id="mdl-import-btn" aria-haspopup="true" aria-expanded="false">📁 엑셀 ▾</button>' +
               '<div class="ov-menu" id="mdl-import-menu" hidden>' +
                 '<button type="button" id="mdl-bloom-btn" hidden>📊 일 보고 자료 올리기</button>' +
-                // 이 메뉴에는 '여기서 실제로 일어나는 것' 만 둔다. 양식 받기와
-                // 엑셀 올리기는 주차별 계획 탭 한 곳이고, 그쪽으로 가는 안내는
-                // 아래 '이 표는 무엇인가요' 에 한 줄로 둔다 — 메뉴에 두면
-                // 올리는 자리가 두 곳인 것처럼 읽힌다.
-                // 개발 프로세스 엑셀도 주차별 계획 탭의 '엑셀 올리기' 가 받는다.
-                // 올리는 버튼이 하나뿐이면 어느 엑셀이든 거기 올리면 된다.
+                // 주차·공정 엑셀은 주차별 계획 탭 한 곳에서 받는다. 그쪽으로
+                // 가는 안내는 아래 '이 표는 무엇인가요' 에 한 줄로 둔다.
+                //
+                // 그런데 '모델을 새로 만드는' 것만은 거기서 못 한다. 주차 양식은
+                // 판가·재료비 칸이 없어서 등록이 안 되고, 올리면 '이 줄들은 아직
+                // 등록된 모델이 아닙니다' 만 뜬다. 한동안 이 두 버튼이 화면에서
+                // 빠져 있어서, 엑셀로 모델을 등록할 길이 아예 없었다 —
+                // 주차별 계획에 올려 놓고 '68줄 인식' 만 보고 된 줄 알았다.
+                '<button type="button" id="mdl-excel-tpl-btn">📄 모델 등록 양식 받기</button>' +
+                '<button type="button" id="mdl-excel-btn">📁 모델 등록 올리기</button>' +
                 '<button type="button" id="mdl-lead-btn">⏱ 단계별 표준 소요 (주)</button>' +
               '</div>' +
             '</div>' +
@@ -8745,14 +8764,25 @@ var sidebarSel = document.getElementById('v2-division-select');
     });
 
     // '주차별 계획' 탭으로 보낸다. 거기서 받고 거기서 올린다.
-    var goPlanBtn = document.getElementById('mdl-goplan-btn');
-    if (goPlanBtn) goPlanBtn.addEventListener('click', function() {
-      var menu = document.getElementById('mdl-import-menu');
-      if (menu) menu.hidden = true;
-      var tab = document.getElementById('mdl-tab-plan');
-      if (tab) tab.click();
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    });
+    //
+    // 이 버튼은 모델 표 HTML 안에 들어 있어서, 표를 다시 그릴 때마다 통째로
+    // 새로 만들어진다. 그때그때 버튼을 찾아 리스너를 붙이면 다음 그리기에서
+    // 떨어져 나가고, 반대로 표가 아직 없을 때 붙이려 하면 아예 못 붙는다.
+    // 실제로 눌러도 아무 일이 없었다. document 에 한 번만 걸어 두고,
+    // 눌린 것이 그 버튼인지 그때 확인한다.
+    if (!window._mdlGoPlanWired) {
+      window._mdlGoPlanWired = true;
+      document.addEventListener('click', function(e) {
+        var t = e.target;
+        if (!t || !t.closest) return;
+        if (!t.closest('#mdl-goplan-btn')) return;
+        var menu = document.getElementById('mdl-import-menu');
+        if (menu) menu.hidden = true;
+        var tab = document.getElementById('mdl-tab-plan');
+        if (tab) tab.click();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      });
+    }
 
     // ── 엑셀 메뉴 ──
     var importBtn = document.getElementById('mdl-import-btn');
@@ -8955,6 +8985,7 @@ if (!_currentProjectKey) { /* 프로젝트 선택 대기 중 */ return; }
   document.addEventListener('click', function(e) {
     var navItem = e.target.closest('.nav-item[data-page="models"]');
     if (navItem) {
+      window._v2Page = 'models';
       // 기존 active 해제
       document.querySelectorAll('.nav-item').forEach(function(n) { n.classList.remove('active'); });
       navItem.classList.add('active');

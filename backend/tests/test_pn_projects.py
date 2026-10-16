@@ -12,7 +12,8 @@ ok = 0
 m = re.search(r"window\.PN_PROJECTS = \[([^\]]*)\]", HTML)
 assert m, 'PN_PROJECTS 를 못 찾았다'
 keys = [k.strip().strip("'\"") for k in m.group(1).split(',') if k.strip()]
-assert keys == ['powerbox', 'major_module', 'frame', 'spacex'], keys
+assert keys == ['powerbox', 'major_module', 'frame', 'spacex',
+                'arista_pcb'], keys
 ok += 1
 
 # 목록이 다른 데 또 박혀 있으면 안 된다 (PN_PROJECTS 선언 한 줄만 허용)
@@ -41,6 +42,7 @@ ok += 1
 # 앱도 큐리를 반도체로 본다 (주차별 계획 표가 나와야 한다)
 DART = (ROOT.parent / 'mobile' / 'lib' / 'screens' / 'model_list_screen.dart').read_text(encoding='utf-8')
 assert "'frame', 'spacex'" in DART, '앱의 반도체 프로젝트 목록에 큐리가 없다'
+assert "'arista_pcb'" in DART, '앱 목록에 아리스타 PCB 가 없다 — 주차별 계획 표가 안 나온다'
 ok += 1
 
 print(f'전부 통과 ({ok}/5)')

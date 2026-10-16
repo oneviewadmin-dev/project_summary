@@ -5973,6 +5973,35 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
         if _p:
             by_pn[_p] = m
 
+    # 한 파일 안에서 같은 파트넘버가 두 번 이상 나오면, 그 파트넘버는
+    # 열쇠로 못 쓴다.
+    #
+    # 아리스타 PCB 가 그렇다. 품번 하나가 출하처(Foxconn·Jabil·Sanmina)
+    # 마다 한 줄씩, 많으면 세 줄이다. 파트넘버로만 맞추면 세 줄이 한
+    # 모델로 합쳐지고 마지막 줄만 남는다 — 조용히 사라져서 더 나쁘다.
+    # 그런 파트넘버만 모델명으로 맞춘다. 한 번만 나오는 파트넘버는
+    # 예전 그대로다(큐리처럼 모델명이 겹치는 파일이 여기 기댄다).
+    _pn_seen = {}
+    if col_map.get("part_number"):
+        for _r in range(header_row + 1, ws.max_row + 1):
+            _v = ws.cell(row=_r, column=col_map["part_number"]).value
+            _k = str(_v).strip().lower() if _v is not None else ""
+            if _k:
+                _pn_seen[_k] = _pn_seen.get(_k, 0) + 1
+    _pn_dup = {k for k, n in _pn_seen.items() if n > 1}
+    if _pn_dup:
+        print(f"[models-import] 파일 안에서 겹치는 파트넘버 {len(_pn_dup)}개 "
+              f"— 그 줄은 '파트넘버 + 모델명' 짝으로 맞춥니다")
+
+    # 겹치는 파트넘버는 모델명만으로도 못 가른다. 아리스타 양산이 그렇다 —
+    # 모델명이 출하처(Jabil Malaysia)뿐이라 품번 16개에 같은 이름이 걸린다.
+    # 그래서 '파트넘버 + 모델명' 짝을 열쇠로 쓴다.
+    by_pnname = {}
+    for _m in models:
+        _p = str(_m.get("part_number") or "").strip().lower()
+        if _p:
+            by_pnname[(_p, str(_m.get("name", "")).strip().lower())] = _m
+
     added, updated, skipped = 0, 0, 0
     skipped_rows = []
     for r in range(header_row + 1, ws.max_row + 1):
@@ -6022,8 +6051,11 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
             _note = str(ws.cell(row=r, column=col_map["note"]).value or "").strip()
 
         # 파트넘버가 있으면 그걸로 찾고, 없을 때만 모델명으로 찾는다.
-        if pn:
+        # 단, 이 파일 안에서 겹치는 파트넘버는 열쇠가 못 되니 모델명으로 찾는다.
+        if pn and pn.lower() not in _pn_dup:
             existing = by_pn.get(pn.lower())
+        elif pn:
+            existing = by_pnname.get((pn.lower(), name.lower()))
         else:
             existing = by_name.get(name.lower())
 
@@ -6045,7 +6077,8 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
             updated += 1
         else:
             entry = {
-                "id": pn or name,
+                "id": ("%s · %s" % (pn, name) if (pn and pn.lower() in _pn_dup)
+                       else (pn or name)),
                 "name": name,
                 "group": group,
                 "dev_type": dev_type,
@@ -6063,7 +6096,9 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
             models.append(entry)
             by_name.setdefault(name.lower(), entry)
             if pn:
-                by_pn[pn.lower()] = entry
+                by_pnname[(pn.lower(), name.lower())] = entry
+                if pn.lower() not in _pn_dup:
+                    by_pn[pn.lower()] = entry
             existing = entry
             added += 1
 
