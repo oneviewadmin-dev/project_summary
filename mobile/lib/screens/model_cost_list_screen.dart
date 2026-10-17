@@ -5,6 +5,7 @@ import '../config/app_config.dart';
 import '../design/typography.dart';
 import 'model_cost_detail_screen.dart';
 import '../utils/material_ratio.dart';
+import '../utils/model_name.dart';
 
 class ModelCostListScreen extends StatefulWidget {
   final String projectKey;
@@ -132,7 +133,7 @@ class _ModelCostListScreenState extends State<ModelCostListScreen> {
                                     child: Column(
                                       crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
-                                        Text(m['name'] ?? m['id'] ?? '',
+                                        Text(modelDisplayName(m),
                                             style: AppText.bodyStrong.copyWith(fontSize: 15)),
                                         const SizedBox(height: 4),
                                         Container(

@@ -7,7 +7,10 @@ import '../design/typography.dart';
 import '../utils/format.dart';
 import '../utils/issue_text.dart';
 import '../utils/status_words.dart';
+import '../utils/model_name.dart';
 import 'dev_process_screen.dart';
+
+
 
 // 개발 승인 프로세스 13단계 (표시용)
 const List<String> _devProcessStepsDefault = [
@@ -586,7 +589,7 @@ class _ModelListScreenState extends State<ModelListScreen> {
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
                 Flexible(
-                  child: Text(m['name']?.toString() ?? '',
+                  child: Text(modelDisplayName(m),
                       style: AppText.bodyStrong.copyWith(fontSize: 15),
                       overflow: TextOverflow.ellipsis),
                 ),
@@ -653,7 +656,7 @@ class _ModelListScreenState extends State<ModelListScreen> {
           builder: (_) => DevProcessScreen(
             projectKey: projectKey,
             modelId: m['id']?.toString() ?? '',
-            modelName: m['name']?.toString() ?? '',
+            modelName: modelDisplayName(m),
           ),
         ),
       ),
@@ -678,7 +681,7 @@ class _ModelListScreenState extends State<ModelListScreen> {
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
                 Flexible(
-                  child: Text(m['name']?.toString() ?? '',
+                  child: Text(modelDisplayName(m),
                       style: AppText.bodyStrong.copyWith(fontSize: 15),
                       overflow: TextOverflow.ellipsis),
                 ),
@@ -1115,7 +1118,7 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
         backgroundColor: navy,
         foregroundColor: Colors.white,
         elevation: 0,
-        title: Text('${model['name'] ?? ''}',
+        title: Text(modelDisplayName(model),
             style: const TextStyle(fontWeight: FontWeight.w700)),
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(24),
@@ -1124,7 +1127,7 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
             child: Align(
               alignment: Alignment.centerLeft,
               child: Text(
-                '목록 > $projectName > ${model['display_group'] ?? model['group'] ?? ''} > ${model['name'] ?? ''}',
+                '목록 > $projectName > ${model['display_group'] ?? model['group'] ?? ''} > ${modelDisplayName(model)}',
                 style: const TextStyle(color: Colors.white70, fontSize: 12),
               ),
             ),

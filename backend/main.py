@@ -6018,7 +6018,15 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
                     skipped_rows.append(
                         {"row": r, "why": "모델명과 파트넘버가 둘 다 비었습니다"})
             continue
-        name = str(name_v).strip() if name_v is not None else pn
+        # 모델명 칸이 비어 있으면 비어 있는 대로 둔다.
+        #
+        # 예전에는 품번을 넣어 채웠다. 그러면 표에 똑같은 글자가 두 칸
+        # 나란히 찍힌다 — 아리스타 PCB 처럼 품번만 있고 따로 부르는
+        # 이름이 없는 것이 그렇다. 화면에서는 빈 칸으로 두고, 이름이
+        # 꼭 필요한 자리(앱 목록)에서만 품번을 대신 보여준다.
+        name = str(name_v).strip() if name_v is not None else ""
+        if not name and not pn:
+            continue
         group = str(ws.cell(row=r, column=col_map.get("group", 0)).value or "").strip() if col_map.get("group") else ""
         group = "개발" if group == "개발" else "양산"
         dev_type = str(ws.cell(row=r, column=col_map.get("dev_type", 0)).value or "").strip() if col_map.get("dev_type") else ""
@@ -6056,8 +6064,10 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
             existing = by_pn.get(pn.lower())
         elif pn:
             existing = by_pnname.get((pn.lower(), name.lower()))
-        else:
+        elif name:
             existing = by_name.get(name.lower())
+        else:
+            existing = None
 
         if existing is not None:
             # 적은 칸만 바꾼다. 빈 칸은 지금 값을 지킨다.
@@ -6071,7 +6081,10 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
                 existing["material_cost"] = mcost
             if pn:
                 existing["part_number"] = pn
-                existing["name"] = name
+                # 이름 칸을 비워 올리면 비운다. 단 모델명 열 자체가 없는
+                # 양식(품번만 있는 파일)이면 지금 이름을 지키다.
+                if col_map.get("name"):
+                    existing["name"] = name
             if _note:
                 existing["note"] = _note
             updated += 1
@@ -6094,7 +6107,8 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
             if group == "개발":
                 entry["process"] = _default_process()
             models.append(entry)
-            by_name.setdefault(name.lower(), entry)
+            if name:
+                by_name.setdefault(name.lower(), entry)
             if pn:
                 by_pnname[(pn.lower(), name.lower())] = entry
                 if pn.lower() not in _pn_dup:
@@ -14449,7 +14463,13 @@ def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depe
             continue
         mid = str(m.get("id") or "").strip()
         name = str(m.get("name") or "").strip()
-        if not mid or not name:
+        # 이름이 비어 있어도 버리지 않는다.
+        #
+        # 품번만 있고 따로 부르는 이름이 없는 것들(아리스타 PCB)은 빈 칸이
+        # 맞다. 예전에는 여기서 버려서, 화면이 그 줄을 돌려보내는 순간
+        # 조용히 사라졌다 — 81종 중 13종이 그랬고, '지웁니다' 경고(409)로만
+        # 겨우 드러났다. 열쇠는 id 다. id 가 없는 줄만 버린다.
+        if not mid:
             continue
         if mid in seen_ids:
             continue

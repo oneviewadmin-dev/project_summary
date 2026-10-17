@@ -6261,9 +6261,11 @@ window.renderAdminV2ByDivision = function(){
       if (!m) return;
       const g = r.querySelector('[data-field="group"]');
       if (g) m.group = g.value;
-      // 모델명. 빈 값은 반영하지 않는다 — 서버가 이름 없는 모델을 버려서 행이 통째로 사라진다.
+      // 모델명. 비워 두는 것도 뜻이 있다 — 품번만 있고 따로 부르는 이름이
+      // 없는 것들(아리스타 PCB)은 빈 칸이 맞다. 예전에는 서버가 이름 없는
+      // 모델을 버려서 여기서 막았는데, 이제는 품번만 있어도 남는다.
       const nm = r.querySelector('[data-field="name"]');
-      if (nm && String(nm.value || '').trim()) m.name = String(nm.value).trim();
+      if (nm) m.name = String(nm.value || '').trim();
       const pn = r.querySelector('[data-field="part_number"]');
       const poq = r.querySelector('[data-field="po_qty"]');
       const shq = r.querySelector('[data-field="shipped_qty"]');
@@ -7446,6 +7448,7 @@ window.renderAdminV2ByDivision = function(){
         var fresh = (d && d.models) || [];
         if (mode === 'all') {
           window._modelsData = fresh;
+          try { window._mdlSavedSnap = JSON.stringify(fresh); } catch (e) { window._mdlSavedSnap = null; }
           window._mdlSnapBase(fresh, true);
         } else if (mode === 'one' && modelId) {
           var f = fresh.filter(function(x) { return x.id === modelId; })[0];
@@ -7909,6 +7912,8 @@ if (!projKey) { /* 프로젝트 선택 대기 중 */ return; }
     }).then(function(r) { return r.json(); })
       .then(function(d) {
         window._modelsData = (d && d.models) || [];
+        try { window._mdlSavedSnap = JSON.stringify(window._modelsData); }
+        catch (e) { window._mdlSavedSnap = null; }
         window._mdlSnapBase(window._modelsData, true);
         window._mdlDidDelete = false;
         // 지연 여부는 서버가 앱과 같은 규칙으로 계산해 따로 준다.
@@ -7986,6 +7991,22 @@ if (!projKey) { /* 프로젝트 선택 대기 중 */ return; }
       if (statusEl) { statusEl.textContent = '프로젝트를 먼저 선택하세요'; statusEl.className = 'mdl-status err'; }
       return;
     }
+    // 고친 것이 없으면 보내지 않는다.
+    //
+    // 전에는 그냥 눌러도 전체 교체 PUT 이 나갔다. 화면이 목록을 덜 들고
+    // 있으면 서버가 '이 저장은 N종을 지웁니다' 로 막는데(409), 사람 눈에는
+    // 아무것도 안 고쳤는데 빨간 실패가 뜬 것으로 보인다.
+    try {
+      if (window._mdlSavedSnap && !window._mdlDidDelete &&
+          JSON.stringify(window._modelsData || []) === window._mdlSavedSnap) {
+        if (statusEl) {
+          statusEl.textContent = '수정 사항이 없습니다';
+          statusEl.className = 'mdl-status';
+        }
+        return;
+      }
+    } catch (e) { /* 비교가 안 되면 그냥 저장한다 */ }
+
     if (statusEl) { statusEl.textContent = '저장 중...'; statusEl.className = 'mdl-status'; }
     var _url = '/admin/projects/' + encodeURIComponent(_currentProjectKey) + '/models';
     var _put = function (mode) {
@@ -8014,8 +8035,14 @@ if (!projKey) { /* 프로젝트 선택 대기 중 */ return; }
       })
       .then(function (r) {
         if (!r) return null;
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
+        if (r.ok) return r.json();
+        // 서버는 왜 막았는지 detail 에 적어 보낸다. 'HTTP 409' 만 띄우면
+        // 무엇이 몇 종 사라질 뻔했는지 알 길이 없다 — 실제로 그랬다.
+        return r.json().catch(function () { return null; }).then(function (j) {
+          var e = new Error((j && j.detail) ? j.detail : ('HTTP ' + r.status));
+          e.status = r.status;
+          throw e;
+        });
       })
     .then(function(d) {
       if (!d) return;

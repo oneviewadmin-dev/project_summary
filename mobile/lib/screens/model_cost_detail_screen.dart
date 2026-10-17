@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../design/typography.dart';
 import '../utils/format.dart';
 import '../utils/material_ratio.dart';
+import '../utils/model_name.dart';
 
 class ModelCostDetailScreen extends StatelessWidget {
   final Map<String, dynamic> model;
@@ -13,7 +14,7 @@ class ModelCostDetailScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final name = model['name'] ?? model['id'] ?? '';
+    final name = modelDisplayName(model);
     final group = model['group'] ?? '양산';
     final status = model['status'] ?? '정상';
     final price = (model['price'] as num?)?.toDouble() ?? 0;
