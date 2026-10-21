@@ -79,6 +79,8 @@ def find_columns(ws):
                 col_map["po_qty"] = c
             elif k in ("실적수량", "출하수량", "출하실적", "실적", "출하"):
                 col_map["shipped_qty"] = c
+            elif k in ("전환주차", "양산전환", "양산전환주차", "전환", "전환시점"):
+                col_map["switch_week"] = c
             elif k == "비고":
                 col_map["note"] = c
         if header_row:
@@ -222,7 +224,7 @@ ok(cm.get("material_cost") == 6,
    "재료비가 %r열로 잡혔다 (6이어야 한다 — 7은 재료비율)" % cm.get("material_cost"))
 ok(cm.get("dev_type") == 4, "유형 열을 못 찾았다: %r" % cm.get("dev_type"))
 ok(set(cm) == {"name", "group", "dev_type", "price", "material_cost",
-               "part_number", "po_qty", "shipped_qty", "note"},
+               "part_number", "po_qty", "shipped_qty", "switch_week", "note"},
    "찾은 열이 다르다: %s" % sorted(cm))
 
 after = sample()
@@ -301,13 +303,17 @@ for hdr in ("재료비율", "재료 비율", "재료비율(%)", "비율"):
 #
 # 양식의 머리글을 바꾸면 임포터가 못 읽는다. 둘이 한 몸이라는 걸
 # 여기서 못 박아 둔다 — 한쪽만 고치면 이 검사가 터진다.
+# 2026-10-21 — '전환주차' 열이 10번째로 들어왔다. 구분(양산/개발)을
+# 화면에서 못 고치게 막으면서, 개발 → 양산으로 넘어간 주차도 엑셀로만
+# 정하도록 바꿨기 때문이다.
 wsy = load_workbook(BytesIO(mt.build_model_template("엔클로저", ["413"]))).active
-ok([wsy.cell(2, i).value for i in range(1, 11)] ==
+ok([wsy.cell(2, i).value for i in range(1, 12)] ==
    ["파트넘버", "모델명", "구분", "유형", "판가($)", "재료비($)",
-    "재료비율", "PO수량", "실적수량", "비고"], "양식 머리글이 바뀌었다")
+    "재료비율", "PO수량", "실적수량", "전환주차", "비고"], "양식 머리글이 바뀌었다")
 _, cy = find_columns(wsy)
 ok(cy == {"part_number": 1, "name": 2, "group": 3, "dev_type": 4, "price": 5,
-          "material_cost": 6, "po_qty": 8, "shipped_qty": 9, "note": 10},
+          "material_cost": 6, "po_qty": 8, "shipped_qty": 9,
+          "switch_week": 10, "note": 11},
    "양식 열과 임포터가 읽는 열이 어긋난다: %s" % sorted(cy.items()))
 ok(str(wsy.cell(3, 7).value).startswith("="), "재료비율이 수식이 아니다")
 ok(wsy.cell(3, 2).value in (None, ""), "빈 양식에 값이 들어 있다")

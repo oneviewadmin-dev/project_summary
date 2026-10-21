@@ -1,8 +1,33 @@
-"""
-사업부 진행현황 보고 - 백엔드 메인
-- PPT 업로드 → 슬라이드 PNG 변환 → GPT-4o 요약 → 신호등 분류
-- 사용자 직접 차트/사진 업로드 및 부서·섹션 매핑
-- 프로젝트별 상세 API 제공
+"""OneView (사업부 진행현황) — 백엔드.
+
+사업부에서 올린 엑셀·PPT 를 읽어 JSON 파일에 적어 두고, 앱과 관리자 웹이
+물어보면 꺼내 준다. DB 는 없다 — models.json · notes.json 같은 파일이 전부다.
+
+  사업부 엑셀 → 관리자 웹에서 올림 → POST /admin/.../import
+             → models.json → GET /projects/... → 앱 화면
+
+구역 (머리말 ════ 로 감싸 둠. 아래 제목을 Ctrl+F 하면 간다)
+  환경 변수 · 분류(enrichment) · 카드 묶기 · FastAPI 앱
+  관리자 세션            로그인
+  알림 (FCM)             폰 푸시
+  PPT 업로드 · 엑셀 업로드 · 노트 첨부      ← 받기. 제일 자주 고친다
+  대시보드 / 프로젝트별 보기 / 사업부별 한 눈  ← 보여주기
+  프로젝트 모델 · 모델 데이터 백업 · phases   ← 모델
+  주차별 계획 · 개발 승인 프로세스 · 블룸 일 보드
+  매출 자동 계산 · 매입·지급 현황
+  KPI · 사장님 지시사항 · 잔업·특근
+  어드민 페이지 (옛 HTML. 지금 쓰는 건 admin_v2.html)
+  일일 백업 · 앱 배포 · 양식 내려받기 · 기동 시 1회 정리
+
+읽는 요령
+  _ 로 시작하면 이 파일 안에서만 쓰는 도우미.
+  @app.get / @app.post 붙은 것만 바깥에서 부를 수 있다 (175개).
+  /admin 으로 시작하면 로그인이 있어야 한다 (get_admin_session 이 문지기).
+
+고칠 때
+  1. ./backup.sh 먼저
+  2. 고친 뒤 tests/ 전부 (106개, 실패 0건)
+  3. flyctl deploy 는 커밋이 아니라 '지금 폴더' 를 올린다
 """
 import os
 import base64
@@ -35,34 +60,32 @@ from project_templates import (
     build_project_detail,
 )
 
-# ============================================================
-# config_loader 기반 분류 enrichment
-# - 기존 응답 필드는 절대 변경하지 않는다.
-# - division/project 정보는 "추가만" 한다.
-# - 분류 실패해도 응답이 깨지지 않게 안전 처리한다.
-# ============================================================
+# ════════════════════════════════════════════════════════════
+#  분류(enrichment) — 올라온 자료에 사업부·프로젝트를 붙인다
+# ════════════════════════════════════════════════════════════
 import config_loader as _cl
 import week_calendar as _wcal
 import revenue as _rev
 
 
 def _safe_text_for_card(card: dict) -> str:
-    """카드 텍스트 분류에 사용할 문자열 합치기."""
+    """카드 한 장에서 "분류에 쓸 글자" 만 모아 한 줄로 잇는다.
+
+    이 한 줄을 config_loader 가 보고 사업부·프로젝트를 맞춘다.
+    쓰는 곳: 카드를 만든 직후의 enrich 단계.
+    """
     parts = [
-        card.get("product") or "",
-        card.get("headline") or "",
-        card.get("project_key") or "",
+        card.get("product") or "",      # 모델/제품 이름 — 분류에 제일 결정적이다
+        card.get("headline") or "",     # 이슈 한 줄 요약 — 제품명이 없을 때의 보조
+        card.get("project_key") or "",  # 이미 프로젝트를 안다면 그 키 (가장 확실)
     ]
+    # 빈 값은 빼고 잇는다. 안 그러면 "  " 같은 공백만 남아 분류가 헛돈다.
     return " ".join([p for p in parts if p]).strip()
 
 
-
-
-# ============================================================
-# Dashboard cards 그룹핑 (모델 단위)
-# - 같은 project_id + 동일/포함 모델명 → 한 카드
-# - 그 안에 이슈(headline) 리스트
-# ============================================================
+# ════════════════════════════════════════════════════════════
+#  카드 묶기 — 이슈 여러 건을 모델 한 장으로 합친다
+# ════════════════════════════════════════════════════════════
 def _normalize_model_name(name: str) -> str:
     """모델명에서 앞 번호 prefix 제거 + 공백 정리"""
     if not isinstance(name, str):
@@ -97,9 +120,17 @@ def _model_match_key(name: str, project_id, existing) -> str:
                 return k
     return base
 
+# 신호등 등급. 숫자가 클수록 나쁘다.
+#   RED   = 문제 있음      BLUE = 지켜봐야 함      BLACK = 정상
 _STATUS_SEVERITY = {"RED": 3, "BLUE": 2, "BLACK": 1}
 
 def _worst_status(statuses):
+    """이슈 여러 개의 색 중 가장 나쁜 색 하나를 고른다.
+
+    카드 한 장 안에 이슈가 여럿일 때 카드 자체의 색을 정하는 데 쓴다.
+    빨강이 하나라도 있으면 카드는 빨강이다 — 좋은 쪽으로 묻히지 않게.
+    모르는 값은 0점이라 BLACK 보다도 아래로 친다.
+    """
     best = "BLACK"
     best_sev = -1
     for s in statuses:
@@ -110,8 +141,7 @@ def _worst_status(statuses):
     return best
 
 
-
-# ---------- headline AI 요약 (캐시 기반) ----------
+# ─── 이슈 한 줄 요약(headline) — GPT 요약, headline_cache.json 에 캐시 ───
 import hashlib as _hashlib_hl
 import json as _json_hl
 from pathlib import Path as _Path_hl
@@ -119,12 +149,17 @@ from pathlib import Path as _Path_hl
 _HEADLINE_CACHE_PATH = _Path_hl(__file__).parent / "headline_cache.json"
 
 def _load_headline_cache() -> dict:
+    """headline_cache.json 을 읽는다. 없거나 깨졌으면 빈 캐시로 시작한다.
+
+    캐시가 없다고 멈추면 안 된다 — 그냥 GPT 를 다시 부르면 되는 일이다.
+    """
     try:
         return _json_hl.loads(_HEADLINE_CACHE_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 def _save_headline_cache(cache: dict) -> None:
+    """캐시를 파일에 적는다. 실패해도 조용히 넘어간다(캐시일 뿐이라서)."""
     try:
         _HEADLINE_CACHE_PATH.write_text(
             _json_hl.dumps(cache, ensure_ascii=False, indent=2),
@@ -469,13 +504,29 @@ def enrich_project_detail(detail: dict) -> dict:
 
 from chart_extractor import extract_charts_from_pptx
 
+# 파싱 — 글자에서 뜻을 꺼내는 함수들은 parsing.py 로 뺐다.
+# 서버 상태를 안 쓰는 순수 함수만 거기 있다 (파일도 설정도 안 본다).
+from parsing import (
+    _EXCEL_MARKER_RE,
+    _parse_due_text,
+    _parse_report_filename,
+    _extract_excel_markers,
+    _parse_shipping_table_header,
+    _parse_sales_input,
+)
 
-# =========================================================
-# 환경 변수
-# =========================================================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# ════════════════════════════════════════════════════════════
+#  환경 변수 — .env(내 컴) · flyctl secrets(서버) 에서 읽는다
+# ════════════════════════════════════════════════════════════
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")   # 챗봇·요약·교정에 쓴다. 없으면 그 기능만 꺼진다
 # 챗봇 답변 모델. 환경변수로 교체 가능 (품질: gpt-4o > gpt-4o-mini, 비용은 반대)
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o")
+
+
+# ════════════════════════════════════════════════════════════
+#  챗봇 — 숫자는 코드가 계산, 말은 RAG + GPT
+# ════════════════════════════════════════════════════════════
 
 
 def _strip_useless_caveats(answer: str) -> str:
@@ -503,9 +554,13 @@ def _strip_useless_caveats(answer: str) -> str:
     return out or answer.strip()
 
 
+# 프로젝트 이름 → 키 변환표. config 를 매번 읽지 않으려고 들고 있는다.
+# stamp 는 config 파일이 바뀌었는지 보는 표시다 (바뀌면 다시 만든다).
 _CHAT_PROJ_KW_CACHE = {"stamp": None, "map": None}
 
 # 하바플레이트 음성 오인식/오타 (config 에 넣기 애매한 것만 남긴다)
+# — 사장님이 앱에서 말로 물어보실 때 "하바플레이트" 가 이렇게 잘못 들린다.
+#   새로 발견되면 여기에 한 줄 추가하면 된다.
 _CHAT_KW_EXTRA = {
     "하바플레잍": "hrva_plate", "하바 플레잍": "hrva_plate",
     "하버": "hrva_plate", "하바플": "hrva_plate", "하바프": "hrva_plate",
@@ -514,6 +569,8 @@ _CHAT_KW_EXTRA = {
 }
 
 
+# 벡터 인덱스를 다시 만드는 중인지 표시. 동시에 두 번 만들면
+# 파일이 꼬이므로 building 이 True 면 다른 요청은 그냥 지나간다.
 _RAG_STATE = {"checked": 0.0, "building": False}
 
 
@@ -960,16 +1017,17 @@ try:
 except Exception as _e:
     print(f"[seed] notes.json seed failed: {_e}")
 
-RETENTION_DAYS = 180
+RETENTION_DAYS = 180   # 오래된 업로드 자료를 며칠까지 들고 있을지
 
 
-# =========================================================
-# FastAPI 앱
-# =========================================================
+# ════════════════════════════════════════════════════════════
+#  FastAPI 앱 — 여기서부터 엔드포인트(바깥 창구)
+# ════════════════════════════════════════════════════════════
 
-# ─── FCM (Firebase Cloud Messaging) ───
-# 대표님 폰으로 상태 변화(RED/ORANGE 신규 전이) 시 푸시 알람 전송
-DEVICE_TOKENS_FILE = DATA_DIR / "device_tokens.json"
+# ════════════════════════════════════════════════════════════
+#  알림 (FCM) — 폰으로 푸시
+# ════════════════════════════════════════════════════════════
+DEVICE_TOKENS_FILE = DATA_DIR / "device_tokens.json"   # 기기 토큰이 쌓이는 파일
 _fcm_initialized = False
 _fcm_lock = None
 
@@ -1000,6 +1058,10 @@ def _init_fcm():
 
 
 def _load_device_tokens() -> list:
+    """등록된 기기 토큰 목록을 읽는다. 없으면 빈 목록.
+
+    쓰는 곳: 알림을 보낼 때(받는 사람 명단) · 토큰을 새로 등록할 때.
+    """
     try:
         with open(DEVICE_TOKENS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1016,6 +1078,14 @@ def _save_device_tokens(tokens: list) -> None:
 
 
 def _add_device_token(token: str, platform: str = "android", debug: bool = True) -> None:
+    """앱이 보내온 기기 토큰을 명단에 넣는다. 이미 있으면 시각만 갱신.
+
+    앱은 켜질 때마다 토큰을 보낸다. 그래서 같은 토큰이 몇 번이고 온다 —
+    중복으로 쌓지 않고 last_seen 만 고쳐 준다. 그 시각을 보면
+    "이 폰이 마지막으로 앱을 켠 때" 를 알 수 있다.
+
+    쓰는 곳: POST /fcm/register (앱이 부른다)
+    """
     from datetime import datetime
     tokens = _load_device_tokens()
     for t in tokens:
@@ -1303,7 +1373,6 @@ def _save_fcm_history(hist: list) -> None:
         print(f"[FCM history] save error: {e}")
 
 
-
 # ─── FCM 편집 세션 관리 (알람 억제용) ───
 EDIT_SESSION_FILE = Path("/tmp/fcm_edit_session.json")
 
@@ -1479,9 +1548,9 @@ _STATIC_DIR = BASE_DIR / "static"
 _STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
-# ============================================================
-# 관리자 세션 (8시간)
-# ============================================================
+# ════════════════════════════════════════════════════════════
+#  관리자 세션 — 로그인 유지 (쿠키 하나, 8시간)
+# ════════════════════════════════════════════════════════════
 ADMIN_SESSION_COOKIE = "admin_auth"
 ADMIN_SESSION_MAX_LIFETIME_SEC = int(os.getenv("ADMIN_SESSION_MAX_LIFETIME_SEC", str(24 * 3600)))  # 발급 후 최대 24시간
 ADMIN_SESSION_TTL_SEC = 8 * 60 * 60
@@ -1491,18 +1560,31 @@ if not ADMIN_SESSION_SECRET:
     ADMIN_SESSION_SECRET = hashlib.sha256(("session::" + UPLOAD_PASSWORD).encode()).hexdigest()
 
 def _b64u(b: bytes) -> str:
+    """바이트 → 쿠키에 담아도 안전한 글자."""
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 def _b64u_decode(s: str) -> bytes:
+    """_b64u 의 반대. 잘라냈던 '=' 를 채워서 되돌린다."""
     pad = "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s + pad)
 
 def _sign_session(exp_ts: int, issued_at: int) -> str:
+    """쿠키 값을 만든다 — "발급시각.만료시각.서명".
+
+    DB 가 없어 세션을 서버에 저장하지 않는다. 대신 시각을 쿠키에 적고
+    서버 비밀값으로 서명한다. 값을 고치면 서명이 안 맞아 들통난다.
+    쓰는 곳: _issue_session_cookie
+    """
     msg = f"{issued_at}.{exp_ts}".encode()
     sig = hmac.new(ADMIN_SESSION_SECRET.encode(), msg, hashlib.sha256).digest()
     return f"{issued_at}.{exp_ts}.{_b64u(sig)}"
 
 def _verify_session(token: Optional[str]) -> Optional[int]:
+    """쿠키를 검사한다. 통과하면 만료시각, 아니면 None.
+
+    ① 서명이 맞나 ② 8시간 안 지났나 ③ 발급 후 24시간 안 넘었나.
+    쓰는 곳: get_admin_session — 모든 /admin 요청이 여기를 거친다.
+    """
     if not token:
         return None
     try:
@@ -1528,6 +1610,11 @@ def _verify_session(token: Optional[str]) -> Optional[int]:
         return None
 
 def _issue_session_cookie(response: Response, issued_at: Optional[int] = None):
+    """로그인에 성공했을 때 쿠키를 구워서 응답에 붙인다.
+
+    issued_at 을 넘기면 "연장" 이다 — 최초 발급 시각을 그대로 들고 가서
+    24시간 상한을 넘기지 못하게 한다.
+    """
     now = int(time.time())
     if issued_at is None:
         issued_at = now  # 새 발급
@@ -1549,6 +1636,10 @@ def _issue_session_cookie(response: Response, issued_at: Optional[int] = None):
     return exp_ts
 
 def get_admin_session(admin_auth: Optional[str] = Cookie(default=None)) -> int:
+    """문지기. /admin 엔드포인트에 Depends(get_admin_session) 으로 붙인다.
+
+    쿠키가 없거나 썩었으면 401 을 던져 거기서 요청이 끝난다.
+    """
     exp = _verify_session(admin_auth)
     if not exp:
         raise HTTPException(status_code=401, detail="인증이 필요합니다.")
@@ -1667,11 +1758,15 @@ def admin_session_info(_exp: int = Depends(get_admin_session)):
     return {"ok": True, "expires_at": _exp, "ttl_sec": ADMIN_SESSION_TTL_SEC}
 
 
-
-# =========================================================
-# 유틸
-# =========================================================
+# ════════════════════════════════════════════════════════════
+#  유틸 — JSON 파일 읽고 쓰기 · 문서 id · PPT 변환
+# ════════════════════════════════════════════════════════════
 def _read_json(path: Path, default):
+    """JSON 파일을 읽는다. 없거나 깨졌으면 default 를 돌려준다.
+
+    이 시스템의 자료는 전부 JSON 파일이라 이 함수가 사실상 "DB 읽기" 다.
+    절대 예외를 던지지 않는다 — 파일 하나 깨졌다고 서버가 서면 안 된다.
+    """
     if not path.exists():
         return default
     try:
@@ -1681,6 +1776,11 @@ def _read_json(path: Path, default):
 
 
 def _write_json(path: Path, data):
+    """JSON 파일에 적는다. 이 시스템의 "DB 쓰기".
+
+    통째로 덮어쓴다. 그래서 쓰기 전에 백업이 필요하다 (./backup.sh).
+    indent=2 · ensure_ascii=False — 사람이 열어 봐야 할 때가 많아서다.
+    """
     path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -1688,6 +1788,11 @@ def _write_json(path: Path, data):
 
 
 def _make_doc_id(filename: str) -> str:
+    """올라온 파일에 붙일 짧은 id 를 만든다 (12자리).
+
+    파일명 + 올린 시각을 섞어 해시한다. 같은 이름을 또 올려도 다른 id 가
+    나와야 앞 자료를 덮어쓰지 않는다.
+    """
     short = hashlib.md5(
         f"{filename}_{datetime.now().isoformat()}".encode("utf-8")
     ).hexdigest()[:12]
@@ -1868,11 +1973,16 @@ def _update_latest(summary):
 
     _write_json(LATEST_FILE, latest)
 
-# =========================================================
-# 1. 헬스체크
-# =========================================================
+# ════════════════════════════════════════════════════════════
+#  헬스체크 — fly.io 가 서버가 살아 있는지 물어보는 곳
+# ════════════════════════════════════════════════════════════
 @app.get("/health")
 def health():
+    """서버가 살아 있는지만 답한다.
+
+    fly.io 가 주기적으로 부른다. 여기가 안 되면 서버를 죽이고 다시 띄운다.
+    그래서 무거운 일을 하면 안 된다 — 파일도 읽지 않는다.
+    """
     return {"status": "ok", "time": datetime.now().isoformat()}
 
 
@@ -1922,12 +2032,14 @@ def data_version():
     )
 
 
-# =========================================================
-# 2. PPT 업로드
-# =========================================================
+# ════════════════════════════════════════════════════════════
+#  PPT 업로드 — 주간보고 PPT 를 받아 슬라이드별로 읽는다
+# ════════════════════════════════════════════════════════════
 
-
+# 같은 파일을 두 번 올리는 걸 막으려고 파일 내용의 해시를 적어 둔다.
+# 파일명이 달라도 내용이 같으면 같은 해시가 나온다.
 def _load_upload_hash_index():
+    """올라왔던 파일들의 해시 장부를 읽는다."""
     try:
         if not UPLOAD_HASHES_PATH.exists():
             return {}
@@ -1936,6 +2048,7 @@ def _load_upload_hash_index():
         return {}
 
 def _save_upload_hash_index(data):
+    """해시 장부를 적는다. 실패해도 넘어간다(중복 검사가 느슨해질 뿐)."""
     try:
         UPLOAD_HASHES_PATH.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
@@ -1945,10 +2058,16 @@ def _save_upload_hash_index(data):
         pass
 
 def _find_duplicate_upload_by_hash(file_hash: str):
+    """전에 올라온 적 있는 파일인가? 있으면 그때의 파일명·doc_id 를 준다.
+
+    /upload 가 이걸 보고 "이미 올린 파일입니다" 를 띄운다.
+    정말 다시 올리려면 allow_duplicate=True 로 넘긴다.
+    """
     idx = _load_upload_hash_index()
     return idx.get(file_hash)
 
 def _record_upload_hash(file_hash: str, saved_name: str, doc_id: str):
+    """방금 받은 파일을 해시 장부에 적는다."""
     idx = _load_upload_hash_index()
     idx[file_hash] = {
         "filename": saved_name,
@@ -1966,6 +2085,19 @@ async def upload_ppt(
     project_id: Optional[str] = Form(None),   # 5-2b: 프로젝트 사전 매핑 (선택)
     allow_duplicate: bool = Form(False),  # 중복 업로드 허용
 ):
+    """주간보고 PPT 를 받는다. 이 구역에서 제일 중요한 창구.
+
+    하는 일 순서
+      ① 비밀번호(또는 로그인 쿠키) 확인
+      ② 같은 파일 또 올린 건지 해시로 확인
+      ③ PPT → PDF → 슬라이드 PNG 로 변환 (soffice + poppler)
+      ④ 슬라이드 그림을 GPT 에게 보여 주고 이슈·신호등 색을 받아 온다
+      ⑤ 사업부·프로젝트를 붙여(enrichment) 카드로 묶는다
+      ⑥ notes.json / reports_latest.json 에 적는다
+
+    division_id · project_id 를 같이 넘기면 ⑤ 의 추측을 건너뛰고
+    그 값을 그대로 쓴다 (사장님이 미리 지정한 경우).
+    """
     _has_session = bool(_verify_session(admin_auth))
     if not _has_session and password != UPLOAD_PASSWORD:
         raise HTTPException(status_code=401, detail="비밀번호가 틀립니다.")
@@ -2140,25 +2272,6 @@ def _calc_card_status(card: dict) -> str:
     return best
 
 
-
-def _parse_due_text(t: str):
-    """due_text '8월 24일' -> 'YYYY-MM-DD' (올해 기준, 지났으면 내년)"""
-    import re as _re
-    from datetime import date as _date, datetime as _dt
-    m = _re.search(r"(\d{1,2})월\s*(\d{1,2})일", t or "")
-    if not m:
-        return None
-    mo, d = int(m.group(1)), int(m.group(2))
-    today = _dt.utcnow().date()
-    for y in (today.year, today.year + 1):
-        try:
-            cand = _date(y, mo, d)
-            if cand >= today:
-                return cand.isoformat()
-        except ValueError:
-            return None
-    return None
-
 @app.get("/dashboard")
 def dashboard():
     """신호등 카드 - 각 카드에 project_key 포함 → Flutter에서 상세 이동에 사용"""
@@ -2193,7 +2306,6 @@ def dashboard():
                 "report_family": report_family,
                 "project_key": project_key,  # ← 추가
             })
-
 
 
     # 🟢 카드별로 division/project 분류 정보 enrichment (기존 필드 변경 없음)
@@ -2406,85 +2518,6 @@ def dashboard():
     grouped_cards = _group_dashboard_cards(cards)
 
     return {"cards": cards, "grouped_cards": grouped_cards}
-
-
-def _parse_report_filename(file_name: str, fallback_date: str = "") -> dict:
-    """
-    파일명에서 프로젝트명 / 날짜 / 주차 추출.
-
-    Examples:
-        "260703_파워박스 진행현황.pptx"
-            -> {"projects": ["파워박스"], "date": "2026-07-03", "week": 27, "display_title": "파워박스 · W27 주간보고"}
-        "260528_내재화프레임, 메이져모듈 진행현황.pptx"
-            -> {"projects": ["내재화프레임", "메이져모듈"], "date": "2026-05-28", "week": 22, "display_title": "내재화프레임, 메이져모듈 · W22 주간보고"}
-        "Chamber_W26_20260706.pptx"
-            -> {"projects": ["Chamber"], "date": "2026-07-06", "week": 26, "display_title": "Chamber · W26 주간보고"}
-    """
-    import re as _re
-    import unicodedata as _ud
-    from datetime import datetime as _dt, date as _date
-
-    # macOS 파일명은 NFD(자모 분리) 로 저장되어 있을 수 있음 → NFC 로 정규화
-    file_name = _ud.normalize("NFC", file_name or "")
-    name = file_name.rsplit(".", 1)[0]  # 확장자 제거
-
-    projects: list = []
-    date_str = ""
-    week_num: int = 0
-
-    # 패턴 A: YYMMDD_프로젝트명(,프로젝트명) 진행현황
-    m = _re.match(r"^(\d{6})[_\s]+(.+)$", name)
-    if m:
-        yymmdd = m.group(1)
-        rest = m.group(2).strip()
-        # " 진행현황", "_진행현황", "진행 현황" 등 trailing 제거
-        rest = _re.sub(r"[\s_]*진행\s*현황.*$", "", rest).strip()
-        rest = rest.rstrip("_ .").strip()
-        try:
-            dt = _dt.strptime(yymmdd, "%y%m%d").date()
-            date_str = dt.isoformat()
-            week_num = dt.isocalendar()[1]
-        except Exception:
-            pass
-        # 콤마 분리
-        projects = [x.strip() for x in _re.split(r"[,、/]", rest) if x.strip()]
-
-    # 패턴 B: 프로젝트명_W##_YYYYMMDD
-    if not projects:
-        m2 = _re.match(r"^(.+?)_W(\d{1,2})_(\d{8})$", name)
-        if m2:
-            projects = [m2.group(1).strip()]
-            try:
-                week_num = int(m2.group(2))
-                dt = _dt.strptime(m2.group(3), "%Y%m%d").date()
-                date_str = dt.isoformat()
-            except Exception:
-                pass
-
-    # fallback: 파일명 전체를 프로젝트명 취급
-    if not projects:
-        projects = [name]
-
-    # fallback date
-    if not date_str and fallback_date:
-        try:
-            dt = _dt.strptime(fallback_date, "%Y-%m-%d").date()
-            date_str = fallback_date
-            if not week_num:
-                week_num = dt.isocalendar()[1]
-        except Exception:
-            pass
-
-    display_title = ", ".join(projects)
-    if week_num:
-        display_title += " · W" + str(week_num) + " 주간보고"
-
-    return {
-        "projects": projects,
-        "date": date_str,
-        "week": week_num,
-        "display_title": display_title,
-    }
 
 
 def _normalize_project_name(name) -> str:
@@ -3722,40 +3755,7 @@ def notes_by_project(project_key: str = ""):
     }
 
 
-
-
-
-
 # ─── 노트 엑셀(표) 마커 전/후처리 (ai_parse 용) ───
-_EXCEL_MARKER_RE = re.compile(
-    "\U0001F4CA" r"\s*([^\n\r]+?)\s*@@table_ref=([^\s\n\r]+)",
-    re.IGNORECASE,
-)
-
-def _extract_excel_markers(text: str):
-    """텍스트에서 엑셀 마커 추출.
-    반환: (clean_text, [{filename, table_ref, anchor}])
-    """
-    lines = text.split("\n")
-    out_lines = []
-    tables = []
-    last_nonempty = ""
-    for ln in lines:
-        m = _EXCEL_MARKER_RE.search(ln)
-        if m:
-            fname = (m.group(1) or "").strip()
-            ref = (m.group(2) or "").strip()
-            if fname and ref:
-                tables.append({
-                    "filename": fname,
-                    "table_ref": ref,
-                    "anchor": last_nonempty,
-                })
-            continue
-        out_lines.append(ln)
-        if ln.strip():
-            last_nonempty = ln.strip()
-    return ("\n".join(out_lines), tables)
 
 
 def _inject_tables_into_cards(cards, tables):
@@ -4081,7 +4081,6 @@ def _extract_due_date_from_text(txt: str) -> str:
         return min(future).isoformat()  # 가장 임박한 미래
     # 전부 과거 → 가장 최근 과거 (지연 표시용)
     return max(candidates).isoformat()
-
 
 
 def _normalize_note_item(it: dict, section_title: str = "") -> dict:
@@ -4842,7 +4841,6 @@ def admin_delete_note(division_id: str, _admin: int = Depends(get_admin_session)
     raise HTTPException(status_code=404, detail="해당 사업부 노트 없음")
 
 
-
 # ─── 노트 표/사진 첨부 API ───
 
 # ─── 노트 표/사진 첨부 API ───
@@ -4916,16 +4914,7 @@ async def admin_upload_note_photo(
     return {"photo_ref": photo_ref, "url": f"/note_photos/{photo_ref}"}
 
 
-
-
 # ─── 엑셀 업로드 (드래그&드롭) ───
-
-
-
-
-
-
-
 
 
 def _norm_label(t):
@@ -4966,7 +4955,6 @@ def _as_int(v, default=0):
 # 엑셀의 '키스톤 (556B)' 처럼 이름 뒤 괄호에 품번이 붙은 표기.
 # 큐리는 모델명과 품번을 따로 관리하므로 갈라서 넣는다.
 _PN_IN_LABEL = __import__("re").compile(r"^(.*?)\s*[(（]\s*([^()（）]{2,20})\s*[)）]\s*$")
-
 
 
 def _split_pn(label):
@@ -5624,8 +5612,6 @@ def _excel_sheet_to_preview_data_url(ws):
     return "data:image/png;base64," + base64.b64encode(bio.getvalue()).decode("ascii")
 
 
-
-
 @app.post("/admin/notes/excel")
 async def admin_upload_note_excel(
     division_id: str = Form(...),
@@ -5929,6 +5915,11 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
                 col_map["po_qty"] = c
             elif k in ("실적수량", "출하수량", "출하실적", "실적", "출하"):
                 col_map["shipped_qty"] = c
+            elif k in ("전환주차", "양산전환", "양산전환주차", "전환", "전환시점"):
+                # 2026-10-21 추가 — 개발 → 양산으로 넘어간 주차.
+                # 이 칸이 생기기 전에는 화면에서 손으로 넣었는데, 엑셀과
+                # 어긋나면 어느 쪽이 맞는지 알 길이 없었다. 이제 엑셀이 기준이다.
+                col_map["switch_week"] = c
             elif t == "비고":
                 col_map["note"] = c
         if header_row:
@@ -6054,6 +6045,35 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
 
         price = _num(col_map.get("price"))
         mcost = _num(col_map.get("material_cost"))
+
+        # ── 전환주차 ────────────────────────────────────────────────
+        # 엑셀에 '2026-W36' 처럼 적어 두면 그 주차부터 양산으로 본다.
+        # 빈 칸이면 지금 이력을 그대로 둔다. '-' 나 '없음' 이면 이력을 지운다
+        # (처음부터 끝까지 한 구분이라는 뜻).
+        _sw_raw = ""
+        if col_map.get("switch_week"):
+            _sw_raw = str(ws.cell(row=r, column=col_map["switch_week"]).value or "").strip()
+        _sw_ord = _phase_ord(_sw_raw) if _sw_raw else None
+        if _sw_raw and _sw_ord is None and _sw_raw not in ("-", "없음", "N/A", "n/a"):
+            if len(skipped_rows) < 20:
+                skipped_rows.append(
+                    {"row": r, "why": "전환주차를 못 읽었습니다: %s (예: 2026-W36)" % _sw_raw})
+
+        def _phases_from_switch(old_entry):
+            """전환주차 한 칸을 '개발 → 양산' 두 구간으로 펴 준다.
+
+            전환 전 판가는 이미 쌓아 둔 이력의 첫 구간을 쓴다. 없으면 지금
+            판가를 쓴다 — 없는 값을 지어내면 지난달 매출이 흔들린다.
+            """
+            prev = _norm_phases((old_entry or {}).get("phases"))
+            dev_price = prev[0]["price"] if prev else _as_money((old_entry or {}).get("price"))
+            dev_mcost = prev[0]["material_cost"] if prev else _as_money((old_entry or {}).get("material_cost"))
+            return [
+                {"from": _PHASE_EPOCH, "group": "개발",
+                 "price": dev_price, "material_cost": dev_mcost},
+                {"from": "%04d-W%02d" % (_sw_ord // 100, _sw_ord % 100), "group": "양산",
+                 "price": price, "material_cost": mcost},
+            ]
         _note = ""
         if col_map.get("note"):
             _note = str(ws.cell(row=r, column=col_map["note"]).value or "").strip()
@@ -6087,6 +6107,11 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
                     existing["name"] = name
             if _note:
                 existing["note"] = _note
+            # 전환주차가 적혀 있으면 구분 이력을 엑셀에 맞춘다.
+            if _sw_ord:
+                existing["phases"] = _phases_from_switch(existing)
+            elif _sw_raw in ("-", "없음", "N/A", "n/a"):
+                existing.pop("phases", None)
             updated += 1
         else:
             entry = {
@@ -6106,6 +6131,8 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
                 entry["note"] = _note
             if group == "개발":
                 entry["process"] = _default_process()
+            if _sw_ord:
+                entry["phases"] = _phases_from_switch(None)
             models.append(entry)
             if name:
                 by_name.setdefault(name.lower(), entry)
@@ -13384,7 +13411,6 @@ def admin_delete_manual_report(doc_id: str, _admin: int = Depends(get_admin_sess
     return {"ok": True, "doc_id": doc_id}
 
 
-
 # ─── reports → notes.json 자동 동기화 (수기 doc용) ───
 
 
@@ -14634,7 +14660,6 @@ def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depe
     return {"ok": True, "project_key": _key, "count": len(normalized),
             "removed": _gone,
             "price_mode": _price_mode, "price_changes": _price_changes}
-
 
 
 # ─── 프로젝트별 유형(types) 관리 ───
@@ -16072,8 +16097,6 @@ def admin_update_report(doc_id: str, payload: dict, _admin: int = Depends(get_ad
     return {"ok": True, "doc_id": doc_id, "edit_mode": edit_mode}
 
 
-
-
 @app.post("/admin/reports/{doc_id}/edit_done")
 def admin_report_edit_done(doc_id: str, _admin: int = Depends(get_admin_session)):
     """편집 완료: 저장된 before snapshot과 현재 상태 비교 → 알람 1회 발송"""
@@ -16155,7 +16178,6 @@ async def admin_upload_section_file(
         "url": "/admin/manual-files/" + doc_id + "/" + safe_name,
         "photo_ref": photo_ref,
     }
-
 
 
 @app.post("/admin/reports/{doc_id}/section-parse-xlsx")
@@ -16403,7 +16425,6 @@ def admin_xlsx_preview(
         raise HTTPException(status_code=500, detail=f"excel parse error: {e}")
 
 
-
 @app.post("/admin/reports/{doc_id}/polish-text")
 def admin_polish_text(
     doc_id: str,
@@ -16623,7 +16644,6 @@ def admin_toggle_hide(doc_id: str, _admin: int = Depends(get_admin_session)):
     _write_json(LATEST_FILE, items)
     _resync_notes_from_latest()
     return {"ok": True, "doc_id": doc_id, "hidden": new_state}
-
 
 
 def _resync_notes_from_latest() -> None:
@@ -17458,7 +17478,6 @@ _ADMIN_UPLOAD_HTML = """
   }
 
 
-
   // ============================================================
   // 관리자 세션 UI
   // ============================================================
@@ -17938,8 +17957,6 @@ _ADMIN_UPLOAD_HTML = """
   });
 
 
-
-
   // PPT 탭 진입 시 dropdown 초기 채우기
   loadDivisionsForPpt();
 
@@ -18312,8 +18329,6 @@ function renderNotePreview(cards) {
   card.style.display = 'block';
 }
   window.renderNotePreview = renderNotePreview;
-
-
 
 
   async function loadTableDataForItem(it, cb) {
@@ -19110,7 +19125,6 @@ function renderNotePreview(cards) {
 
 <!-- 숨김 사진 업로드 input -->
 <input type="file" id="notePhotoFileInput" accept="image/*" style="display:none;" />
-
 
 
 <script src="/static/note_loader.js"></script>
@@ -20569,7 +20583,6 @@ async def chat(payload: dict):
         return {"answer": "", "sources": [], "error": f"chat_failed: {e}"}
 
 
-
 @app.get("/admin/rag/status")
 def rag_status(_admin: int = Depends(get_admin_session)):
     """벡터 인덱스 상태 (몇 조각이 언제 만들어졌는지)."""
@@ -20762,124 +20775,6 @@ def _pick_primary_shipping_table(tables: list, project_key: str) -> dict | None:
     # 여러 개면 데이터 행이 가장 많은 것 선택
     candidates.sort(key=lambda x: len(x.get("rows") or []), reverse=True)
     return candidates[0]
-
-
-def _parse_shipping_table_header(rows: list) -> dict:
-    """헤더 3행(R1, R2, R3)을 분석해 각 컬럼의 의미를 매핑.
-
-    처리 규칙:
-    - R1: 대분류 (월/누적합계) - forward-fill (병합 셀)
-    - R2: 서브그룹 (W27/W28.../합계) - forward-fill (계획/실적 쌍의 왼쪽 셀에만 값 있음)
-    - R3: 세부 (계획/실적/PO/출하)
-    """
-    if len(rows) < 3:
-        return {"columns": [], "detected_months": [], "current_month": None}
-
-    r1 = rows[0]
-    r2 = rows[1]
-    r3 = rows[2]
-    n_cols = max(len(r1), len(r2), len(r3))
-
-    def _fill(row, n):
-        """forward-fill: 빈 셀은 왼쪽 값으로 채움"""
-        out = []
-        last = ""
-        for i in range(n):
-            v = (row[i] if i < len(row) else "").strip()
-            if v:
-                last = v
-            out.append(last)
-        return out
-
-    r1_filled = _fill(r1, n_cols)
-    # R2는 forward-fill 하되, 다음 대분류가 바뀌면 리셋
-    r2_filled = []
-    last_r1 = ""
-    last_r2 = ""
-    for i in range(n_cols):
-        cur_r1 = r1_filled[i]
-        cur_r2 = (r2[i] if i < len(r2) else "").strip()
-        if cur_r1 != last_r1:
-            # 대분류가 바뀌면 R2 리셋
-            last_r2 = ""
-            last_r1 = cur_r1
-        if cur_r2:
-            last_r2 = cur_r2
-        r2_filled.append(last_r2)
-
-    columns = []
-    detected_months = []
-    months_with_weeks = []
-
-    for i in range(1, n_cols):  # 0번은 '구분' 열
-        top = r1_filled[i]
-        mid = r2_filled[i]
-        sub = (r3[i] if i < len(r3) else "").strip()
-
-        if not top:
-            continue
-
-        top_norm = top.replace(" ", "").replace("\n", "")
-        is_month = top.endswith("월") and "누적" not in top and top_norm not in ("PO수량", "출하실적", "잔량")
-        is_cumulative = "누적" in top_norm
-        is_direct_po = top_norm in ("PO수량", "PO",)
-        is_direct_shipped = top_norm in ("출하실적", "출하",)
-        is_direct_remaining = top_norm in ("잔량",)
-        is_yearly = ("년실적" in top_norm) or ("년도실적" in top_norm)
-
-        if is_month and top not in detected_months:
-            detected_months.append(top)
-
-        if is_direct_po:
-            columns.append({"index": i, "kind": "cumulative_po"})
-            continue
-        if is_direct_shipped:
-            columns.append({"index": i, "kind": "cumulative_shipped"})
-            continue
-        if is_direct_remaining:
-            columns.append({"index": i, "kind": "cumulative_remaining"})
-            continue
-        if is_yearly:
-            columns.append({"index": i, "kind": "yearly_actual", "label": top})
-            continue
-
-        if is_cumulative:
-            if "PO" in sub.upper():
-                columns.append({"index": i, "kind": "cumulative_po"})
-            elif "출하" in sub:
-                columns.append({"index": i, "kind": "cumulative_shipped"})
-            else:
-                columns.append({"index": i, "kind": "cumulative_other"})
-            continue
-
-        if is_month:
-            # W##이 있으면 주차별
-            if mid.startswith("W") and mid[1:].isdigit():
-                if top not in months_with_weeks:
-                    months_with_weeks.append(top)
-                if sub == "계획":
-                    columns.append({"index": i, "kind": "week_plan", "month": top, "week": mid})
-                elif sub == "실적":
-                    columns.append({"index": i, "kind": "week_actual", "month": top, "week": mid})
-            elif mid == "합계":
-                if sub == "계획":
-                    columns.append({"index": i, "kind": "month_total_plan", "month": top})
-                elif sub == "실적":
-                    columns.append({"index": i, "kind": "month_total_actual", "month": top})
-            else:
-                # 완료 월 또는 다음 월 계획만
-                if sub == "계획":
-                    columns.append({"index": i, "kind": "month_plan", "month": top})
-                elif sub == "실적":
-                    columns.append({"index": i, "kind": "month_actual", "month": top})
-
-    current_month = months_with_weeks[0] if months_with_weeks else None
-
-    return {
-        "columns": columns,
-        "detected_months": detected_months,
-        "current_month": current_month,
-    }
 
 
 def _shipping_table_to_kpi_data(table: dict, project_key: str, file_name: str = "") -> dict:
@@ -21123,7 +21018,6 @@ def _save_project_profiles(data: dict) -> None:
             prof["updated_at"] = now
     with open(PROJECT_PROFILES_FILE, "w", encoding="utf-8") as f:
         _json.dump(data, f, ensure_ascii=False, indent=2)
-
 
 
 def _auto_extract_kpi_from_pptx(
@@ -21971,66 +21865,6 @@ import re
 from datetime import date, datetime
 from typing import Optional
 
-def _parse_sales_input(text: str) -> dict:
-    """
-    [모델/판가]
-    EFEM=65
-    VTM=24
-    
-    [주차별]
-    W27: EFEM 2/2, VTM 2/2
-    W30: EFEM 5/0, VTM 1/0
-    
-    → {"prices": {"EFEM": 65.0}, "weeks": {"W27": {"EFEM": {"plan":2,"actual":2}}}}
-    """
-    prices = {}
-    weeks = {}
-    section = None
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        # 섹션 헤더
-        m = re.match(r'^\[(.+?)\]\s*$', line)
-        if m:
-            tag = m.group(1).strip().lower()
-            if '판가' in tag or 'price' in tag or '모델' in tag:
-                section = 'prices'
-            elif '주차' in tag or 'week' in tag:
-                section = 'weeks'
-            else:
-                section = None
-            continue
-        if section == 'prices':
-            # EFEM=65  또는  EFEM = 65.0
-            m = re.match(r'^([^\s=]+)\s*=\s*([\d.]+)\s*$', line)
-            if m:
-                prices[m.group(1).strip()] = float(m.group(2))
-            continue
-        if section == 'weeks':
-            # W30: EFEM 5/0, VTM 1/0
-            m = re.match(r'^(W\d+)\s*[:：]?\s*(.+)$', line, re.IGNORECASE)
-            if not m:
-                continue
-            wk = m.group(1).upper()
-            payload = m.group(2)
-            models = {}
-            # "EFEM 5/0, VTM 1/0" → 콤마/공백 mix 처리
-            for part in re.split(r'\s*,\s*', payload):
-                part = part.strip()
-                if not part:
-                    continue
-                # "EFEM 5/0"
-                mm = re.match(r'^(\S+)\s+([\d]+)\s*/\s*([\d]+)\s*$', part)
-                if mm:
-                    models[mm.group(1)] = {
-                        "plan": int(mm.group(2)),
-                        "actual": int(mm.group(3)),
-                    }
-            if models:
-                weeks[wk] = models
-    return {"prices": prices, "weeks": weeks}
-
 
 def _iso_week_number(d: date) -> int:
     return d.isocalendar()[1]
@@ -22105,7 +21939,6 @@ def _compute_sales_summary(parsed: dict, today: Optional[date] = None) -> str:
         parts.append(f"W{cur_week} {week_sales[cur_week]:.1f}만불")
     
     return " · ".join(parts)
-
 
 
 # ============================================================
@@ -22335,7 +22168,6 @@ def compute_sales_from_input(sales_input: str, today: Optional[date] = None) -> 
     }
 
 
-
 # ============================================================
 # 매출 자동 계산 API
 # ============================================================
@@ -22468,9 +22300,6 @@ def register_device_token(payload: dict):
     return {"ok": True}
 
 
-
-
-
 @app.post("/admin/fcm-test")
 def admin_fcm_test(_admin: int = Depends(get_admin_session)):
     """알람 시스템 동작 테스트용 엔드포인트."""
@@ -22480,7 +22309,6 @@ def admin_fcm_test(_admin: int = Depends(get_admin_session)):
         data={"type": "test"},
     )
     return result
-
 
 
 # ─── 개발 승인 프로세스 (13단계 고정 템플릿) ───
@@ -22760,7 +22588,6 @@ def _process_progress(proc: list) -> int:
     rolled = _process_rolled(proc)
     done = sum(1 for s in rolled if (s or {}).get("status") == "완료")
     return round(done / len(rolled) * 100)
-
 
 
 def _model_progress(m: dict) -> int:
@@ -24868,7 +24695,6 @@ def put_board_rows(project_key: str, payload: dict,
     return {"ok": True, "project_key": _key, "rows": len(store)}
 
 
-
 # ── 블룸 일 보드 ──────────────────────────────────────────────────────
 #
 # 반도체와 코드를 공유하지 않는다. 반도체는 '주차 x 모델' 한 겹인데
@@ -26356,9 +26182,6 @@ async def admin_price_import_xlsx(project_key: str, file: UploadFile = File(...)
 
     _save_models(data)
     return {"ok": True, "updated": updated, "added": added, "skipped": skipped}
-
-
-
 
 
 # 일정표 칸에 들어오는 값은 세 가지다.
