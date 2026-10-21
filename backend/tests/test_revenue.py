@@ -501,18 +501,19 @@ assert '/admin/revenue/import' in A and "'preview'" in A
 assert 'data-rv-grp' in A, '큰 틀에서 세부로 펴지지 않는다'
 assert '세부 합' in A, '세부와 합계가 어긋나도 화면에 말이 없다'
 assert '/admin/revenue/estimate' in A, 'admin 에서 예상을 넣을 데가 없다'
-assert 'rv-est-save' in A and 'rv-est-pick' in A, '예상 넣는 단추가 없다'
+
+# 2026-10-21 — Commodity 를 손으로 적던 표를 뺐다.
+#   사람이 적다 보니 이름이 제각각이 되고(Sheet metal / Sheet Metal)
+#   그 이름으로 묶음을 가르다 보니 엉뚱한 묶음에 들어갔다.
+#   이제 예상은 Estimate 파일로만 넣는다.
+assert 'rv-est-pick' in A, '예상 파일을 고르는 단추가 없다'
+assert '/admin/revenue/estimate/import' in A, '예상 파일을 보내는 곳이 없다'
+assert 'function estTable' not in A, '손으로 적는 표가 되살아났다'
+for _gone in ('rv-est-save', 'rv-est-add', 'rv-est-amt', 'rv-est-total'):
+    assert _gone not in A, '표의 잔재가 남아 있다: %s' % _gone
+
 assert 'rv-tg-save' in A and '/admin/revenue/target' in A, 'admin 에 타겟 칸이 없다'
 assert '이번 달 타겟' in A and '타겟 달성' in A, 'KPI 에 타겟이 없다'
-assert 'function estTable' in A, 'Commodity 별로 적을 표가 없다'
-assert 'rv-est-add' in A and 'rv-est-amt' in A, '줄을 더하거나 금액을 적을 데가 없다'
-assert 'rv-est-total' in A, '적는 동안 합계가 안 보인다'
-assert "fd.append('items'" in A, '화면이 항목을 안 보낸다'
-# 예상은 항목으로만 보낸다 — 합계를 같이 보내면 어긋나도 모른다.
-# (타겟은 금액 하나라서 total 을 보내는 게 맞다)
-_estsave = A.split("post('/admin/revenue/estimate', fd)")[0]
-_estsave = _estsave[_estsave.rindex('rv-est-save'):]
-assert "fd.append('total'" not in _estsave, '예상이 아직 합계를 보낸다'
 _rv = A.split('renderRevenuePage')[1]
 assert '실행계획' not in _rv and '사업계획' not in _rv, \
     'admin 매출 화면에 아직 계획이 남아 있다'
