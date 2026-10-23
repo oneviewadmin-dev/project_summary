@@ -90,8 +90,11 @@ while NF < 14:
     if not t or t == "월 합계" or t.upper().startswith("W"):
         break
     NF += 1
-ok(NF == len(wt.FIXED) - 1 + len(wt.VALUE),
-   "왼쪽 칸 수가 예상과 다르다: %d" % NF)
+# 2026-10-21 — 왼쪽 칸은 프로젝트와 상관없이 FIXED 네 칸 그대로다.
+#   전에는 안 쓰는 칸을 빼서(-1) 프로젝트마다 자리가 달랐다.
+ok(NF == len(wt.FIXED) + len(wt.VALUE),
+   "왼쪽 칸 수가 예상과 다르다: %d (FIXED %d + VALUE %d 여야 한다)"
+   % (NF, len(wt.FIXED), len(wt.VALUE)))
 
 COL = {}
 for c in range(1, NF + 1):
@@ -103,7 +106,8 @@ R = wt.FIRST_ROW
 def row_of(name):
     """양식은 유형끼리 모아 놓으므로 적은 순서와 줄 순서가 다르다."""
     for r in range(R, R + len(MODELS) + 2):
-        if str(ws.cell(r, COL["모델명"]).value or "").strip() == name:
+        # 품번은 파트넘버 칸에 들어간다 (2026-10-22)
+        if str(ws.cell(r, COL["파트넘버"]).value or "").strip() == name:
             return r
     raise AssertionError("%s 줄을 못 찾았다" % name)
 

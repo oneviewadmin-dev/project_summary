@@ -5577,6 +5577,14 @@ window.renderAdminV2ByDivision = function(){
     '.mdl-pane { padding-top: 16px; }',
     '.mdl-actions { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }',
     '.mdl-save-msg { font-size: 13px; font-weight: 600; }',
+    // 잠긴 칸 — 색은 그대로 둔다. 2026-10-22 에 흐린 회색으로 덮었더니
+    // 표가 통째로 죽은 화면이 됐다. 구분·유형 칩 색이 사라지면 한눈에
+    // 읽히던 것이 안 읽힌다. 못 고치게만 하고 보이는 것은 건드리지 않는다.
+    '.mdl-locked { cursor: default; }',
+    // select 는 disabled 를 걸면 브라우저가 제멋대로 회색을 입힌다.
+    // 그래서 살려 두고 손이 닿지 않게만 한다.
+    '.mdl-locked-sel { pointer-events: none; }',
+    '.mdl-xl-only { margin:0 0 10px; padding:9px 12px; border-radius:8px; background:#FFFBEB; border:1px solid #FDE68A; color:#92400E; font-size:13px; font-weight:600; }',
     '.mdl-hint { font-size: 12px; color: #9CA3AF; margin-top: 10px; }',
     '.mdl-input { width: 110px; padding: 6px 8px; border: 1px solid #D1D5DB; border-radius: 6px; font-size: 13px; text-align: right; }',
     '.mdl-td-name { font-weight: 600; color: #111827; }',
@@ -6252,6 +6260,77 @@ window.renderAdminV2ByDivision = function(){
     return n === Math.trunc(n) ? Math.trunc(n) : n;
   }
 
+  // ====================================================================
+  //  모델 표는 보기만 한다 — 고치는 것은 엑셀뿐이다 (2026-10-22)
+  // ====================================================================
+  //
+  // 같은 모델이 화면과 엑셀에서 따로 놀았다. 엑셀에는 개발인데 화면에서
+  // 양산으로 바꿔 두면 다음 엑셀을 올릴 때 도로 개발이 된다. 어느 쪽이
+  // 맞는지 아무도 모르게 되고, 매출 숫자까지 어긋난다. 구분 하나만
+  // 막아 뒀더니 같은 일이 판가·수량에서 또 났다. 기준을 하나로 모은다.
+  //
+  // 화면 코드는 지우지 않는다. 지우면 되살릴 자리를 잊는다 — 입력 칸을
+  // 그대로 두고 잠그기만 한다.
+  var MODELS_READONLY = true;
+  // 다른 <script> 덩어리(주차별 보드 등)에서도 봐야 한다. 이 덩어리는
+  // 제 안에서만 사는 범위라, 창에 한 번 걸어 둔다.
+  window.MODELS_READONLY = MODELS_READONLY;
+
+  // 엑셀 양식이 싣고 오는 칸. 이 칸들은 올리면 그대로 바뀐다.
+  var EXCEL_FIELDS = ['part_number', 'name', 'dev_type', 'group', 'price',
+                      'material_cost', 'po_qty', 'shipped_qty', 'note'];
+
+  // 프로젝트 현황(글 + 진행/보류/드롭예정 + 저장)도 같이 잠근다.
+  // 이 글은 프로젝트 **전체**를 보류 · 드롭으로 돌리는 근거라서
+  // (서버 _project_hold) 모델 정보와 같은 기준을 따라야 한다.
+  function lockStatusNote() {
+    if (!MODELS_READONLY) return;
+    var ta = document.getElementById('mdl-status-note');
+    if (ta) {
+      ta.readOnly = true;
+      ta.classList.add('mdl-locked');
+      ta.title = '프로젝트 현황은 화면에서 고치지 않습니다';
+      ta.placeholder = '모델 비고에 적으신 말로 보류 · 드롭예정이 정해집니다';
+    }
+    var sel = document.getElementById('mdl-proj-hold');
+    if (sel) {
+      sel.classList.add('mdl-locked', 'mdl-locked-sel');
+      sel.tabIndex = -1;
+      sel.title = '화면에서 고치지 않습니다';
+    }
+    var b = document.getElementById('mdl-note-save');
+    if (b) { b.disabled = true; b.title = '화면에서 고치지 않습니다'; }
+  }
+
+  function lockModelTable(container) {
+    if (!MODELS_READONLY || !container) return;
+    lockStatusNote();
+    container.querySelectorAll('[data-field]').forEach(function (el) {
+      var tag = (el.tagName || '').toLowerCase();
+      if (tag === 'select') {
+        // disabled 를 걸면 브라우저가 회색으로 덮어 버린다. 구분(파랑) ·
+        // 유형 칩 색이 사라지면 표가 한눈에 안 읽힌다. 색은 살리고 손만
+        // 못 대게 한다 — 마우스는 pointer-events, 키보드는 tabIndex.
+        el.classList.add('mdl-locked-sel');
+        el.tabIndex = -1;
+      } else if (tag === 'input' || tag === 'textarea') {
+        el.readOnly = true;     // readonly 는 색을 안 바꾼다
+      } else {
+        return;                 // 자동 계산 칸(div)은 원래 못 고친다
+      }
+      el.classList.add('mdl-locked');
+      if (!el.title) {
+        el.title = EXCEL_FIELDS.indexOf(el.dataset.field) >= 0
+          ? '엑셀로만 바꿉니다 — 주차별 계획 탭에서 양식을 받아 올리세요'
+          : '화면에서는 고치지 않습니다';
+      }
+    });
+    // 저장 버튼도 같이 잠근다. 눌러 봐야 아무 일도 안 일어나는 버튼이
+    // 살아 있으면 "저장했는데 안 됐다" 가 된다.
+    var sb = document.getElementById('mdl-save-btn');
+    if (sb) { sb.disabled = true; sb.title = '엑셀로만 바꿉니다'; }
+  }
+
   function syncDomToData(container) {
     container.querySelectorAll('tr[data-model-id]').forEach(function(r) {
       const m = window._modelsData.find(function(x) { return x.id === r.dataset.modelId; });
@@ -6562,6 +6641,13 @@ window.renderAdminV2ByDivision = function(){
   // 목록을 덜 들고 저장해서 나머지가 통째로 사라진 적이 있다.
   window._mdlDidDelete = false;
   window.mdlDeleteModels = function(ids, container) {
+    // 저장이 안 나가는데 화면에서만 지우면, 새로고침 때 되살아난다.
+    // 지운 줄 알고 넘어가는 것이 제일 나쁘다. 아예 막는다. (2026-10-22)
+    if (MODELS_READONLY) {
+      alert('모델은 엑셀로만 바꿉니다.\n\n'
+            + "'주차별 계획' 탭에서 양식을 받아 그 줄을 지우고 올리세요.");
+      return;
+    }
     if (!ids || !ids.length) return;
     window._mdlDidDelete = true;
     var removed = (window._modelsData || []).filter(function(m) { return ids.indexOf(m.id) >= 0; });
@@ -7004,6 +7090,11 @@ window.renderAdminV2ByDivision = function(){
       var _tc = document.getElementById('mdl-tab-count');
       if (_tc) _tc.textContent = (window._modelsData || []).length;
       container.querySelectorAll('.mdl-row-del').forEach(function(b) {
+        if (MODELS_READONLY) {
+          b.disabled = true;
+          b.title = '엑셀로만 바꿉니다';
+          return;
+        }
         b.onclick = function() {
           var id = b.closest('tr').dataset.modelId;
           if (!confirm('이 제품을 지울까요?')) return;
@@ -7091,12 +7182,19 @@ window.renderAdminV2ByDivision = function(){
       (_projIsEss
         ? 'PO 수량과 출하 완료가 사업부 집계로 들어갑니다. '
         : '판가와 수량이 매출 집계로, 상태와 공정이 앱의 \'일정 지연 · 집중관리\'로 들어갑니다. ') +
-      '고친 뒤 오른쪽 위 <b>저장</b>을 눌러야 반영됩니다.</p>' +
+      '</p>' +
+      '<div class="mdl-xl-only">이 표는 <b>보기 전용</b>입니다. 모델 정보는 ' +
+      '<b>엑셀로만</b> 바꿉니다 — \'주차별 계획\' 탭에서 양식을 받아 고친 뒤 ' +
+      '올리시면 그대로 들어갑니다. 화면과 엑셀이 서로 다른 값을 들고 있던 ' +
+      '문제를 없애려고 기준을 엑셀 하나로 모았습니다. ' +
+      '<b>상태</b>는 따로 고르지 않습니다 — 개발은 공정 완료예정일로, ' +
+      '보류 · 드롭예정 · 지연은 <b>비고</b>에 적으신 말로 저절로 정해집니다.</div>' +
       '<div class="lg">' +
-        '<span><i class="mdl-sw mdl-sw-in"></i> 회색 칸 = 직접 입력</span>' +
-        '<span><i class="mdl-sw mdl-sw-auto"></i> 점선 칸 = 자동 계산 (못 고침)</span>' +
+        '<span><i class="mdl-sw mdl-sw-in"></i> 회색 칸 = 엑셀이 채우는 값</span>' +
+        '<span><i class="mdl-sw mdl-sw-auto"></i> 점선 칸 = 자동 계산</span>' +
         '<span><i class="mdl-sw mdl-sw-late"></i> 왼쪽 빨간 띠 = 일정 지연</span>' +
-        '<span>모델명 옆 칩을 눌러 상태(정상 · 주의 · 지연 · 보류 · 드롭예정)를 바꿉니다</span>' +
+        '<span>상태는 저절로 정해집니다 — 개발은 완료예정일, ' +
+        '보류 · 드롭예정 · 지연은 <b>비고</b>에 적으면 알아봅니다</span>' +
       '</div>' +
       // 올리는 자리는 한 곳이다. 여기서 찾다가 못 찾고 헤매지 않게 길을 적는다.
       '<div class="mdl-goplan">' +
@@ -7309,6 +7407,10 @@ window.renderAdminV2ByDivision = function(){
         if (rem) rem.textContent = Math.max(0, po - sh);
       });
     });
+    // 표를 다시 그릴 때마다 잠근다. 리스너를 붙이는 이 자리가 모든
+    // 그리기가 지나가는 길목이라 여기 한 줄이면 빠지는 칸이 없다.
+    lockModelTable(container);
+
     // 모든 입력 변경 시 window._modelsData 실시간 동기화
     container.querySelectorAll('[data-field]').forEach(function(el){
       el.addEventListener('input', function(){
@@ -8017,6 +8119,16 @@ if (!projKey) { /* 프로젝트 선택 대기 중 */ return; }
 
   // 모델 저장
   function saveModels(statusEl) {
+    // 화면에서 고치는 길을 닫았으니 보내는 길도 닫는다. 칸만 잠그면
+    // 다른 경로(엔터·단축키·되살린 코드)로 PUT 이 나갈 수 있다.
+    if (MODELS_READONLY) {
+      if (statusEl) {
+        statusEl.textContent =
+          '모델 정보는 엑셀로만 바꿉니다 — 주차별 계획 탭에서 양식을 받아 올리세요';
+        statusEl.className = 'mdl-status';
+      }
+      return;
+    }
     if (!_currentProjectKey) {
       if (statusEl) { statusEl.textContent = '프로젝트를 먼저 선택하세요'; statusEl.className = 'mdl-status err'; }
       return;
@@ -8502,6 +8614,18 @@ var sidebarSel = document.getElementById('v2-division-select');
     const saveBtn = document.getElementById('mdl-save-btn');
     const saveMsg = document.getElementById('mdl-save-msg');
     const addBtn = document.getElementById('mdl-add-btn');
+    // 모델 추가 · 저장은 엑셀로 넘어갔다 (2026-10-22)
+    lockStatusNote();      // 모델이 한 종도 없는 프로젝트도 잠겨 있어야 한다
+    if (MODELS_READONLY) {
+      if (addBtn) {
+        addBtn.disabled = true;
+        addBtn.title = "'주차별 계획' 탭에서 양식을 받아 빈 줄에 적고 올리세요";
+      }
+      if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.title = '모델 정보는 엑셀로만 바꿉니다';
+      }
+    }
 
     function loadStatusNote(projectKey) {
       if (!projectKey) return;
@@ -8934,6 +9058,15 @@ var sidebarSel = document.getElementById('v2-division-select');
     const noteSaveBtn = document.getElementById('mdl-note-save');
     if (noteSaveBtn) {
       noteSaveBtn.addEventListener('click', function() {
+        // 버튼만 잠그면 다른 길(엔터·되살린 코드)로 요청이 나간다.
+        if (MODELS_READONLY) {
+          var _m = document.getElementById('mdl-note-msg');
+          if (_m) {
+            _m.textContent = '프로젝트 현황은 화면에서 고치지 않습니다';
+            _m.style.color = '#92400E';
+          }
+          return;
+        }
         _currentProjectKey = _currentProjectKey || (function(){var s=document.querySelector('#mdl-proj-select')||document.querySelector('select[id*="proj"]');return (s&&s.value)||'';})();
 if (!_currentProjectKey) { /* 프로젝트 선택 대기 중 */ return; }
         const noteEl = document.getElementById('mdl-status-note');
@@ -10612,22 +10745,37 @@ window._ovProjectKey = function() {
             ' (' + e.short + '대 부족 · ' + e.rate + '%)</div>';
         }).join('');
       html += '<div style="display:flex;gap:6px;margin-top:8px;align-items:center;">' +
-        '<select data-role="wbr-kind" style="font-size:12px;padding:4px 6px;">' +
+        '<select data-role="wbr-kind" class="mdl-locked mdl-locked-sel" tabindex="-1" ' +
+        'title="미달 사유는 엑셀로만 적습니다" style="font-size:12px;padding:4px 6px;">' +
         '<option value="문제"' + (note ? '' : ' selected') + '>문제</option>' +
         '<option value="참고"' + (note ? ' selected' : '') + '>참고 (일부러 덜 출하 등)</option>' +
         '</select>' +
         '<input data-role="wbr-text" value="' + _esc(reason) + '" placeholder="사유" ' +
+        'readonly class="mdl-locked" title="미달 사유는 엑셀로만 적습니다" ' +
         'style="flex:1;font-size:12px;padding:5px 8px;border:1px solid #D1D5DB;border-radius:6px;">' +
-        '<button class="btn" style="font-size:12px;padding:5px 12px;" ' +
+        '<button class="btn" style="font-size:12px;padding:5px 12px;" disabled ' +
+        'title="미달 사유는 엑셀로만 적습니다" ' +
         'onclick="saveWeekReason(this)" data-pk="' + _esc(pk) + '" ' +
         'data-month="' + _esc(month) + '" data-week="' + _esc(w) + '">저장</button>' +
         '</div></div>';
     });
-    return html + '<p class="mdl-hint">‘참고’ 로 적으면 앱에서 문제로 세지 않습니다. ' +
-      '비워 두고 저장하면 사유가 지워집니다.</p></div>';
+    return html + '<p class="mdl-hint">미달 사유는 <b>엑셀로만</b> 적습니다 — ' +
+      '‘주차별 계획’ 탭에서 양식을 받아 맨 아래 <b>미달 사유</b> 줄에 ' +
+      '그 주 칸으로 적어 올리세요. ' +
+      '‘참고:’ 로 시작하면 문제로 세지 않고, ' +
+      '‘-’ 한 글자만 적으면 그 주 사유를 지웁니다.</p></div>';
   }
 
   window.saveWeekReason = function(btn) {
+    // 버튼만 잠그면 다른 길로 요청이 나간다. 2026-10-22 — 미달 사유는
+    // 엑셀의 '미달 사유' 줄과 같은 자리를 쓴다. 두 군데서 적으면 올릴
+    // 때마다 서로 덮어쓴다.
+    if (window.MODELS_READONLY) {
+      alert('미달 사유는 엑셀로만 적습니다.\n\n'
+            + "'주차별 계획' 탭에서 양식을 받아 맨 아래 '미달 사유' 줄에 "
+            + '그 주 칸으로 적어 올려 주세요.');
+      return;
+    }
     var pk = btn.getAttribute('data-pk');
     var month = btn.getAttribute('data-month');
     var week = btn.getAttribute('data-week');

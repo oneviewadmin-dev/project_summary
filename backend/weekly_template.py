@@ -61,7 +61,15 @@ VALUE = [
     ("재료비($)", 12, "material_cost", '#,##0.00'),
     ("PO수량", 10, "po_qty", '#,##0'),
     ("실적수량", 10, "shipped_qty", '#,##0'),
+    # 2026-10-21 — 모델 등록 양식에만 있던 두 칸을 가져왔다.
+    #   이 둘까지 들어오면 '모델 등록 양식' 과 '주차별 계획 양식' 을
+    #   따로 받을 이유가 없어진다. 한 장으로 끝난다.
+    # 2026-10-22 — '전환주차' 만 적어 두니 무엇이 무엇으로 넘어가는
+    # 주차인지 묻는 사람이 많았다. 머리글에 방향을 적는다.
+    ("개발→양산 전환주차", 16, "switch_week", None),
+    ("비고", 26, "note", None),
 ]
+# 2026-10-22 — 불량을 넣었다가 뺐다. 불량률은 나중에 따로 정한다.
 WEEK_SUB = ("계획", "실적")
 WEEK_W = 9
 WEEK_N = len(WEEK_SUB)
@@ -81,32 +89,62 @@ ALWAYS = ("name", "group")
 
 
 def fixed_cols(models: list) -> list:
-    """그 프로젝트가 실제로 쓰는 왼쪽 칸만.
+    """왼쪽 고정 칸 — 어느 프로젝트든 네 칸 그대로.
 
-    파트넘버가 하나도 없는 프로젝트에 파트넘버 칸을 두면, 사람들이 거기
-    뭔가 적는다. 적힌 건 어느 모델에도 안 붙어 조용히 사라진다. 모델
-    목록이 아예 없는 빈 양식은 네 칸을 다 둔다 — 무엇을 쓸지 모르니까.
+    2026-10-21 — 프로젝트마다 열을 빼던 것을 그만둔다.
+
+    전에는 '그 프로젝트가 실제로 쓰는 칸만' 두었다. 파트넘버가 하나도
+    없는 프로젝트에서 파트넘버 칸을 빼는 식이다. 적을 데가 없으면
+    엉뚱한 데 안 적을 테니까.
+
+    그런데 그 바람에 프로젝트마다 열 자리가 달라졌다. 챔버는 파트넘버가
+    A열인데 어떤 프로젝트는 모델명이 A열이다. 사람이 보기에도 헷갈리고,
+    "엑셀을 열었을 때 늘 같은 자리에 같은 것이 있다" 가 안 된다. 사업부
+    여덟 곳에서 올라오는 양식을 하나로 맞추려면 자리가 고정이어야 한다.
+
+    빈 칸에 엉뚱하게 적는 문제는 열을 빼서 막을 일이 아니다. 「작성 안내」
+    에 적고, 파트넘버로 못 찾은 줄은 올릴 때 '못 읽은 줄' 로 돌려준다.
+
+    인자 models 는 쓰지 않는다. 부르는 쪽을 전부 고치지 않으려고 남겨 둔다.
     """
-    ms = [m for m in (models or []) if isinstance(m, dict)]
-    if not ms:
-        return list(FIXED)
-    out = []
-    for col in FIXED:
-        key = col[2]
-        if key in ALWAYS or any(str(m.get(key) or "").strip() for m in ms):
-            out.append(col)
-    return out
+    return list(FIXED)
+
+
+def _pn_and_name(m: dict) -> tuple:
+    """(파트넘버, 모델명) — 파트넘버가 먼저다.
+
+    2026-10-22 — 등록된 자료가 세 모양으로 섞여 있다.
+      · 두 칸이 제대로 나뉨            853-800575-413 / AETHER GDX
+      · 두 칸에 같은 값               853-268706-003 / 853-268706-003
+      · 파트넘버가 비고 품번이 모델명에  (빈 칸)      / 715-A39794-613
+
+    품번은 늘 파트넘버 칸에 넣는다. 모델명은 **품번과 다를 때만** 적는다 —
+    같은 글자를 두 칸에 찍어 두면 사람이 '왜 두 번 적었나' 를 묻게 되고,
+    읽는 쪽도 어느 칸이 이름인지 헷갈린다.
+    """
+    pn = str(m.get("part_number") or "").strip()
+    nm = str(m.get("name") or "").strip() or str(m.get("id") or "").strip()
+    if not pn:
+        pn, nm = nm, ""
+    elif pn.lower() == nm.lower():
+        nm = ""
+    return pn, nm
 
 
 def _model_row(m: dict, cols=None) -> list:
+    pn, nm = _pn_and_name(m)
     out = []
     for _h, _w, key in (cols or FIXED):
+        if key == "part_number":
+            out.append(pn)
+            continue
+        if key == "name":
+            out.append(nm)
+            continue
         v = m.get(key)
         s = "" if v is None else str(v).strip()
         if key == "group":
             s = "개발" if s == "개발" else "양산"
-        if key == "name" and not s:
-            s = str(m.get("id") or "").strip()
         out.append(s)
     return out
 
@@ -118,8 +156,15 @@ def _value_row(m: dict) -> list:
     빈 칸으로 두면 임포터가 '그대로 둬라' 로 읽으니 손해도 없다.
     """
     out = []
-    for _h, _w, key, _f in VALUE:
+    for _h, _w, key, fmt in VALUE:
         v = m.get(key)
+        # 2026-10-21 — 글자 칸(전환주차·비고)이 들어오면서 숫자로만 보던
+        # 것을 갈랐다. 숫자서식이 없는 칸은 글자 그대로 둔다. 전에는
+        # float() 에 걸려 전부 None 이 됐다 — 적어 둔 비고가 사라졌다.
+        if fmt is None:
+            t = "" if v is None else str(v).strip()
+            out.append(t or None)
+            continue
         try:
             x = float(v)
         except (TypeError, ValueError):
@@ -293,7 +338,8 @@ def _sheet(wb, month: str, weeks: list, models: list, label: str, first: bool,
             c = ws.cell(r, nid + 1 + j)
             c.font = body
             c.border = BORDER
-            c.number_format = fmt
+            if fmt:                 # 글자 칸(전환주차·비고)은 서식이 없다
+                c.number_format = fmt
             c.alignment = Alignment(horizontal="right", vertical="center")
             if vvals and vvals[j] is not None:
                 c.value = vvals[j]

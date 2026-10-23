@@ -17,6 +17,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'notifications_screen.dart';
 
+import '../config/app_config.dart';
 import '../components/components.dart';
 import '../design/design.dart';
 import '../models/division.dart';
@@ -367,6 +368,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   /// 진행률이 없는 사업부에 무엇이 있는지 한 마디로 적는다.
   String? _divisionNote(String divisionId) {
+    // 2026-10-23 — 블룸과 자동차만 카드에 한 줄을 더 달고 있었다.
+    // 사업부 카드는 어디나 같은 모양이어야 한다.
+    if (kSameFrameForAll) return null;
     if (divisionId == 'bloom') {
       final b = _bloom;
       if (b == null || !b.hasData) return null;
@@ -473,6 +477,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   DivisionStatus _divisionStatus(String divisionId, List<DashboardCard> cards) {
     final s = computeDivisionStatus(divisionId, cards);
+    // 2026-10-23 — 블룸·자동차만 '진행 데이터 없음' 을 면하게 해 주던
+    // 예외를 거둔다. 주차 자료가 없으면 어느 사업부든 똑같이 보인다.
+    if (kSameFrameForAll) return s;
     // 블룸은 주차 보고도 모델도 없다. 오늘 계획이 잡혀 있으면 진행 중이다.
     if (s == DivisionStatus.empty &&
         divisionId == 'bloom' &&

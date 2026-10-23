@@ -49,7 +49,9 @@ def n_fixed(ws):
 
 
 def names_in(ws):
-    c = head_cols(ws).get("모델명")
+    # 2026-10-22 — 품번은 파트넘버 칸이 가져간다. 모델명 칸은 품번과 다른
+    # 이름이 따로 있을 때만 찬다. 그래서 '그 줄이 누구인가' 는 파트넘버로 본다.
+    c = head_cols(ws).get("파트넘버")
     if not c:
         return []
     out = []
@@ -97,7 +99,8 @@ for label, ms in SHAPES.items():
         FAIL.append("%s · 양식이 안 만들어졌다: %s" % (label, e))
         continue
     ws = load_workbook(BytesIO(raw))["2026-10"]
-    want = sorted(str(m.get("name") or m.get("id")).strip() for m in ms)
+    # 양식이 '그 줄이 누구인가' 로 적는 값 — 파트넘버가 먼저다 (2026-10-22)
+    want = sorted(wt._pn_and_name(m)[0] for m in ms)
     got = sorted(names_in(ws))
     ok(got == want, "%s · 모델 %d종 중 %d종만 들어갔다" % (label, len(want), len(got)))
     ok(ws.max_row >= wt.FIRST_ROW + len(ms),
@@ -210,22 +213,21 @@ def cols_of(ms):
     return list(head_cols(ws))
 
 
-V = ["판가($)", "재료비($)", "PO수량", "실적수량"]   # 값 칸은 늘 붙는다
-ok(cols_of(mk(5, dev_type=True, part=True)) == ["파트넘버", "모델명", "유형", "구분"] + V,
-   "둘 다 있는데 칸이 빠졌다: %s" % cols_of(mk(5, dev_type=True, part=True)))
-ok(cols_of(mk(5, dev_type=True, part=False)) == ["모델명", "유형", "구분"] + V,
-   "파트넘버가 하나도 없는데 칸이 남아 있다: %s" % cols_of(mk(5, dev_type=True, part=False)))
-ok(cols_of(mk(5, dev_type=False, part=True)) == ["파트넘버", "모델명", "구분"] + V,
-   "유형이 하나도 없는데 칸이 남아 있다: %s" % cols_of(mk(5, dev_type=False, part=True)))
-ok(cols_of(mk(5, dev_type=False, part=False)) == ["모델명", "구분"] + V,
-   "둘 다 없는데 칸이 남아 있다: %s" % cols_of(mk(5, dev_type=False, part=False)))
-# 모델이 하나라도 가지고 있으면 칸을 둔다 — 나머지는 빈 채로 둬도 된다
-one = mk(5, dev_type=False, part=False)
-one[2]["part_number"] = "PN-1"
-ok("파트넘버" in cols_of(one), "한 모델만 파트넘버가 있어도 칸은 있어야 한다")
-# 빈 양식은 네 칸을 다 둔다 — 무엇을 쓸지 모르니까
-ok(cols_of([]) == ["파트넘버", "모델명", "유형", "구분"] + V,
-   "빈 양식에서 칸이 빠졌다: %s" % cols_of([]))
+# 2026-10-21 — 모델 등록 양식과 합치면서 전환주차 · 비고가 들어왔다.
+V = ["판가($)", "재료비($)", "PO수량", "실적수량", "개발→양산 전환주차", "비고"]
+
+# 2026-10-21 — 프로젝트마다 열을 빼던 것을 그만뒀다.
+#   전에는 파트넘버가 하나도 없는 프로젝트에서 그 칸을 뺐다. 그러면
+#   챔버는 파트넘버가 A열인데 다른 데는 모델명이 A열이 된다. 사업부
+#   여덟 곳 양식을 하나로 맞추려면 자리가 고정이어야 한다.
+FIXED4 = ["파트넘버", "모델명", "유형", "구분"]
+for _why, _ms in [
+        ("둘 다 있음",      mk(5, dev_type=True, part=True)),
+        ("파트넘버 없음",   mk(5, dev_type=True, part=False)),
+        ("유형 없음",       mk(5, dev_type=False, part=True)),
+        ("둘 다 없음",      mk(5, dev_type=False, part=False))]:
+    ok(cols_of(_ms) == FIXED4 + V,
+       "%s — 열 자리가 달라졌다: %s" % (_why, cols_of(_ms)))
 
 # 모델명·구분은 절대 안 빠진다 (줄을 알아보는 칸, 새 모델을 고르는 칸)
 for shape in SHAPES.values():

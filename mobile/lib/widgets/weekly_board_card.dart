@@ -43,10 +43,30 @@ class _BCell {
 }
 
 class WeeklyBoardCard extends StatefulWidget {
-  final String projectKey;
+  /// 프로젝트 하나의 보드를 서버에서 받아 그린다.
+  /// [loader] 를 주면 이 값은 쓰지 않는다.
+  final String? projectKey;
   final String? month;
 
-  const WeeklyBoardCard({super.key, required this.projectKey, this.month});
+  /// 카드 머리글. 안 주면 '주차 현황 보드'.
+  final String? title;
+
+  /// 표를 그릴 자료를 직접 만들어 넘기는 길.
+  ///
+  /// 사업부 화면은 프로젝트 하나가 아니라 '프로젝트들' 을 한 표에 세운다
+  /// (구분 열 = YFP · Corva KPE · 외 5종). 서버에 그런 API 가 아직 없어서
+  /// 앱이 프로젝트별 보드를 받아 합쳐 만든다 — 그 결과를 여기로 넣는다.
+  /// 표를 그리는 코드는 하나뿐이라 모양은 프로젝트 보드와 똑같다.
+  final Future<Map<String, dynamic>?> Function()? loader;
+
+  const WeeklyBoardCard({
+    super.key,
+    this.projectKey,
+    this.month,
+    this.title,
+    this.loader,
+  }) : assert(projectKey != null || loader != null,
+            'projectKey 나 loader 중 하나는 있어야 한다');
 
   @override
   State<WeeklyBoardCard> createState() => _WeeklyBoardCardState();
@@ -62,12 +82,14 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
   }
 
   Future<Map<String, dynamic>?> _fetch() async {
+    // 사업부 보드처럼 자료를 직접 만들어 넣는 경우
+    if (widget.loader != null) return widget.loader!();
     try {
       final q = (widget.month == null || widget.month!.isEmpty)
           ? ''
           : '?month=${Uri.encodeComponent(widget.month!)}';
       final res = await http
-          .get(Uri.parse('$kApiBaseUrl/projects/${Uri.encodeComponent(widget.projectKey)}/weekly-board$q'))
+          .get(Uri.parse('$kApiBaseUrl/projects/${Uri.encodeComponent(widget.projectKey!)}/weekly-board$q'))
           .timeout(const Duration(seconds: 10));
       if (res.statusCode != 200) return null;
       final d = jsonDecode(utf8.decode(res.bodyBytes));
@@ -132,8 +154,18 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
           return _shell(const Text('주차 현황을 불러오지 못했습니다',
               style: TextStyle(fontSize: 12, color: Color(0xFF9CA3AF))));
         }
+        final demo = d['demo'] == true;
         return _shell(
-          Column(
+          _boardBody(d),
+          demo: demo,
+        );
+      },
+    );
+  }
+
+  /// 카드 안에 들어가는 표와 그 밑 설명. (예시 딱지는 _shell 이 붙인다)
+  Widget _boardBody(Map<String, dynamic> d) {
+    return Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               // 표 폭이 화면보다 훨씬 넓다(약 980px). 가로 스크롤만으로는
@@ -191,9 +223,6 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
                 ),
               ),
             ],
-          ),
-        );
-      },
     );
   }
 
@@ -360,7 +389,7 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
     );
   }
 
-  Widget _shell(Widget child) {
+  Widget _shell(Widget child, {bool demo = false}) {
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(16),
@@ -372,8 +401,34 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('주차 현황 보드',
-              style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+          Row(children: [
+            Text(widget.title ?? '주차 현황 보드',
+                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700)),
+            // 지어낸 숫자로 그린 표라는 걸 표에 붙여 둔다. 이 딱지가 없으면
+            // 회의실에서 진짜 실적으로 읽힌다 — 떼면 안 된다.
+            if (demo) ...[
+              const SizedBox(width: 7),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFFF7ED),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFFFDBA74)),
+                ),
+                child: const Text('예시',
+                    style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w800,
+                        color: Color(0xFF9A3412))),
+              ),
+            ],
+          ]),
+          if (demo)
+            const Padding(
+              padding: EdgeInsets.only(top: 4),
+              child: Text('지어낸 숫자입니다. 실제 실적이 아닙니다 — 엑셀이 올라오면 바뀝니다.',
+                  style: TextStyle(fontSize: 11, color: Color(0xFF9A3412))),
+            ),
           const SizedBox(height: 10),
           child,
         ],

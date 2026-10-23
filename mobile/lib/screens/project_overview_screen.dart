@@ -69,7 +69,8 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
   @override
   void initState() {
     super.initState();
-    if (_isBloomItem) _loadBloom();
+    // 2026-10-23 — 블룸 보드는 안 그린다. 받아 올 까닭도 없다.
+    if (_bloomFrame) _loadBloom();
     _modelsFuture = _fetchModels();
     _planFuture = _fetchWeeklyPlan();
     _summaryFuture = _fetchIssuesSummary();
@@ -164,9 +165,9 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
           ),
         ),
       ),
-      // 자동차사업부는 주차·진행률로 움직이지 않는다. 모델 목록 대신
-      // 계약 화면(요약 → 연도별 매출 → 제품)만 그린다.
-      body: _isAutomotive
+      // 2026-10-23 — 전에는 자동차사업부만 계약 화면을 그리고 모델 목록을
+      // 아예 안 보여 줬다. 지금은 어느 사업부든 같은 본문을 쓴다.
+      body: _autoFrame
           ? RefreshIndicator(
               onRefresh: () async {
                 setState(() => _autoReload++);
@@ -274,7 +275,7 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
                 _planFuture = _fetchWeeklyPlan();
                 _summaryFuture = _fetchIssuesSummary();
               });
-              if (_isBloomItem) await _loadBloom();
+              if (_bloomFrame) await _loadBloom();
             },
             child: ListView(
               padding: const EdgeInsets.all(16),
@@ -303,7 +304,9 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
                       ]),
                     ),
                   ),
-                if (_isBloomItem && _bloom.hasBoard) ...[
+                // 2026-10-23 — 블룸 일일 보드가 맨 위를 차지해서, 같은 앱인데
+                // 프로젝트를 열 때마다 첫 화면이 달랐다. 숨긴다.
+                if (_bloomFrame && _bloom.hasBoard) ...[
                   BloomPlanActualCard(board: _bloom),
                   const SizedBox(height: 12),
                   BloomTodayCard(board: _bloom),
@@ -372,10 +375,8 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
                 _buildStatusNote((data['status_note'] ?? '').toString()),
                 // ── 주차별 계획 (엑셀 → PNG, 탭하면 확대)
                 _buildWeeklyPlanSection(),
-                // ── 주차별 매출 현황
-                // 자동차사업부는 주차로 움직이지 않는다. 연도별 계약이 기준이라
-                // 위의 제품 화면이 그 자리를 대신한다.
-                if (!_isAutomotive) FutureBuilder<WeeklyRevenue?>(
+                // ── 주차별 매출 현황 (어느 사업부든 같은 자리)
+                if (!_autoFrame) FutureBuilder<WeeklyRevenue?>(
                   future: fetchWeeklyRevenue(widget.projectKey),
                   builder: (context, snap) {
                     if (snap.connectionState == ConnectionState.waiting) {
@@ -1079,11 +1080,19 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
   bool get _isAutomotive =>
       widget.projectKey.toLowerCase().startsWith('auto_');
 
+  /// '그 사업부만 다른 화면을 쓴다' 는 뜻. 틀을 하나로 모은 뒤로는 false 다.
+  bool get _autoFrame => _isAutomotive && !kSameFrameForAll;
+  bool get _bloomFrame => _isBloomItem && !kSameFrameForAll;
+
   Widget _buildWeeklyPlanSection() {
-    // 자동차사업부는 주차 계획이 아니라 연도별 계약으로 움직인다.
-    // 계약 화면은 본문이 직접 그리므로 여기서는 아무것도 두지 않는다.
-    if (_isAutomotive) return const SizedBox.shrink();
-    if (_boardProjects.contains(widget.projectKey.toLowerCase())) {
+    // 2026-10-23 — 전에는 자동차사업부에서 이 자리를 통째로 비웠다.
+    // 이제는 어느 사업부든 주차 계획을 같은 자리에 둔다.
+    if (_autoFrame) return const SizedBox.shrink();
+    // 블룸은 사업부 화면에서도 같은 보드를 띄운다. 프로젝트에 들어왔을 때
+    // 다른 표가 뜨면 같은 주차 계획이 두 모양이 된다 — 보드로 통일한다.
+    final boardHere = _boardProjects.contains(widget.projectKey.toLowerCase()) ||
+        (kDivisionBoardOn.contains('bloom') && _isBloomItem);
+    if (boardHere) {
       return WeeklyBoardCard(projectKey: widget.projectKey);
     }
     return FutureBuilder<Map<String, dynamic>>(

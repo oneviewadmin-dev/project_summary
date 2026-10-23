@@ -991,6 +991,29 @@ NOTE_PHOTOS_DIR = NOTE_ASSETS_DIR / "photos"
 for d in [UPLOAD_DIR, SLIDES_DIR, SLIDE_IMAGES_DIR, CROPPED_DIR, NOTE_ASSETS_DIR, NOTE_TABLES_DIR, NOTE_PHOTOS_DIR]:
     d.mkdir(exist_ok=True)
 
+# ── 올라온 엑셀 원본 보관 ──────────────────────────────────────────
+#
+# 엑셀은 열어서 읽고 버려 왔다. 그래서 숫자가 이상할 때 "엑셀이 원래
+# 그랬나, 우리가 잘못 읽었나" 를 가릴 수가 없었다. 이제 올라온 파일을
+# 손대지 않은 그대로 한 벌 남긴다 — 자세한 규칙은 upload_store.py.
+#
+# 읽기와 보관을 한 줄로 묶어 두는 이유는, 업로드 경로가 스무 곳이 넘어서
+# 각자 보관을 따로 부르면 한 곳만 빼먹어도 그 파일이 영원히 안 남기
+# 때문이다. 파일을 읽는 통로를 하나로 둔다.
+import upload_store
+
+
+async def _keep_upload(file, where: str = "", project: str = "") -> bytes:
+    """업로드 파일을 읽으면서 원본을 보관함에 한 벌 남긴다."""
+    raw = await file.read()
+    try:
+        upload_store.keep(raw, getattr(file, "filename", "") or "",
+                          where=where, project=project)
+    except Exception as _e:
+        # 보관 실패가 업로드를 막지 않는다
+        print(f"[보관함] 호출 실패(무시) — {_e}")
+    return raw
+
 # DATA_DIR이 git 경로와 다르면(Railway), git에 포함된 시드 자산을 영구 볼륨에 복사
 try:
     import shutil
@@ -5628,7 +5651,7 @@ async def admin_upload_note_excel(
     if not (lower.endswith(".xlsx") or lower.endswith(".xlsm")):
         raise HTTPException(status_code=400, detail="xlsx/xlsm 파일만 허용")
 
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/notes/excel", "")
     if not raw:
         raise HTTPException(status_code=400, detail="빈 파일")
 
@@ -5849,7 +5872,7 @@ def admin_models_template(project_key: str = "", _admin: int = Depends(get_admin
 async def admin_models_import(project_key: str, file: UploadFile = File(...), _admin: int = Depends(get_admin_session)):
     from io import BytesIO
     from openpyxl import load_workbook
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/projects/{project_key}/models/import", project_key)
     if not raw:
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
     try:
@@ -5915,7 +5938,9 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
                 col_map["po_qty"] = c
             elif k in ("실적수량", "출하수량", "출하실적", "실적", "출하"):
                 col_map["shipped_qty"] = c
-            elif k in ("전환주차", "양산전환", "양산전환주차", "전환", "전환시점"):
+            elif k in ("전환주차", "양산전환", "양산전환주차", "전환", "전환시점",
+                       "개발→양산전환주차", "개발->양산전환주차",
+                       "개발→양산", "개발->양산"):
                 # 2026-10-21 추가 — 개발 → 양산으로 넘어간 주차.
                 # 이 칸이 생기기 전에는 화면에서 손으로 넣었는데, 엑셀과
                 # 어긋나면 어느 쪽이 맞는지 알 길이 없었다. 이제 엑셀이 기준이다.
@@ -6962,6 +6987,79 @@ def admin_v2_page(admin_auth: Optional[str] = Cookie(default=None)):
         return RedirectResponse(url="/admin/login?next=/admin/v2", status_code=302)
     """OneView Admin v2 — 시안 기반 새 관리자 페이지."""
     return HTMLResponse(open(_ADMIN_V2_HTML_PATH, encoding='utf-8').read())
+
+
+# ══════════════════════════════════════════════════════════════════
+#  원본 보관함 — 올라온 엑셀을 브라우저로 꺼내는 길 (2026-10-23)
+# ══════════════════════════════════════════════════════════════════
+#
+# 보기 전용이다. 여기서는 운영 데이터를 바꾸지 않는다. admin_v2.html 은
+# '수정 금지' 상태라 일부러 건드리지 않고 별도 페이지로 둔다.
+#
+# 주소
+#   /admin/uploads               화면
+#   /admin/uploads/summary       몇 건 · 몇 바이트 · 어느 달이 있나
+#   /admin/uploads/list?month=   그 달의 기록
+#   /admin/uploads/file/{id}     한 건 내려받기
+#   /admin/uploads/zip?month=    한 달치 통째로
+
+
+@app.get("/admin/uploads", response_class=HTMLResponse)
+def admin_uploads_page(admin_auth: Optional[str] = Cookie(default=None)):
+    if not _verify_session(admin_auth):
+        return RedirectResponse(url="/admin/login?next=/admin/uploads",
+                                status_code=302)
+    import upload_vault_page
+    return HTMLResponse(upload_vault_page.HTML)
+
+
+@app.get("/admin/uploads/summary")
+def admin_uploads_summary(_admin: int = Depends(get_admin_session)):
+    st = upload_store.stats()
+    st["months"] = upload_store.months()
+    return st
+
+
+@app.get("/admin/uploads/list")
+def admin_uploads_list(month: str = "", project: str = "",
+                       _admin: int = Depends(get_admin_session)):
+    return {"month": month,
+            "entries": upload_store.entries(month=month, project=project,
+                                            limit=2000)}
+
+
+@app.get("/admin/uploads/file/{entry_id}")
+def admin_uploads_file(entry_id: str,
+                       _admin: int = Depends(get_admin_session)):
+    """한 건 내려받기.
+
+    경로를 바깥에서 받지 않는다 — 기록에 있는 id 로만 찾는다.
+    '../' 같은 값으로 보관함 밖 파일을 읽히지 않게 하기 위해서다.
+    """
+    from fastapi.responses import FileResponse
+    p = upload_store.path_of(entry_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="그 파일을 찾지 못했습니다")
+    # 원래 올린 이름으로 받게 한다 (보관 파일명에는 시각·경로가 붙어 있다)
+    name = p.name.split("__")[-1] or p.name
+    return FileResponse(str(p), filename=name,
+                        media_type="application/octet-stream")
+
+
+@app.get("/admin/uploads/zip")
+def admin_uploads_zip(month: str,
+                      _admin: int = Depends(get_admin_session)):
+    """한 달치를 zip 으로. 인수인계 때 통째로 넘기는 길."""
+    import re as _re
+    if not _re.fullmatch(r"\d{4}-\d{2}", month or ""):
+        raise HTTPException(status_code=400, detail="연-월 형식이 아닙니다")
+    data = upload_store.zip_bytes(month)
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition":
+                 f'attachment; filename="uploads_{month}.zip"'},
+    )
 
 
 import os
@@ -14449,9 +14547,45 @@ def _save_untouched(f, sent, base) -> bool:
     return str(sent or "").strip() == str(base or "").strip()
 
 
+# ══════════════════════════════════════════════════════════════════
+#  화면에서 고치는 길을 닫는다 — 기준은 엑셀 하나다 (2026-10-22)
+# ══════════════════════════════════════════════════════════════════
+#
+# 화면 쪽(admin_v2.html)만 잠그면 반쪽이다. 브라우저 콘솔 한 줄, 열어 둔
+# 옛 탭, 북마크해 둔 주소로 여전히 같은 요청이 나간다. 그렇게 들어온
+# 저장은 엑셀이 들고 온 값을 조용히 덮어쓴다 — 아무도 못 본다.
+# 들어오는 자리에서 막는다.
+#
+# 되돌리려면 이 한 줄을 False 로 둔다. 화면 쪽 MODELS_READONLY 와 짝이다.
+ADMIN_WRITE_OFF = True
+
+#: 막는 자리와, 사람에게 대신 알려줄 길
+_WRITE_OFF_WHERE = {
+    "models": "모델 정보(판가 · 재료비 · PO · 실적 · 구분 · 유형)",
+    "status-note": "프로젝트 현황",
+    "week-reason": "주차 미달 사유",
+}
+
+
+def _write_off(what: str):
+    """막혀 있으면 403 으로 돌려보낸다. 안 막혀 있으면 아무 일도 안 한다."""
+    if not ADMIN_WRITE_OFF:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(_WRITE_OFF_WHERE.get(what, what)
+                + " — 화면에서 고치지 않습니다. "
+                  "'주차별 계획' 탭에서 양식을 받아 고친 뒤 올려 주세요."))
+
+
 @app.put("/admin/projects/{project_key}/models")
 def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depends(get_admin_session)):
-    """admin용 모델 목록 저장 (전체 교체) - dev_type/process/weekly_plan/status_note 보존"""
+    """admin용 모델 목록 저장 (전체 교체) - dev_type/process/weekly_plan/status_note 보존
+
+    2026-10-22 — 막혀 있다. 모델 정보는 엑셀로만 바꾼다. 함수는 지우지
+    않는다 — 지우면 되살릴 자리를 잊는다.
+    """
+    _write_off("models")
     _alias = {
         "havaplate": "hrva_plate",
         "hrvaplate": "hrva_plate",
@@ -14733,7 +14867,12 @@ def get_project_status_note(project_key: str):
 @app.put("/admin/projects/{project_key}/status-note")
 def put_project_status_note(project_key: str, payload: dict,
                             _admin: int = Depends(get_admin_session)):
-    """프로젝트 현황 메모 저장 (앱 프로젝트 화면에 표시)."""
+    """프로젝트 현황 메모 저장 (앱 프로젝트 화면에 표시).
+
+    2026-10-22 — 막혀 있다. 현황 글은 프로젝트 전체를 보류 · 드롭으로
+    돌리는 근거라서(_project_hold), 모델 정보와 같은 기준을 따라야 한다.
+    """
+    _write_off("status-note")
     note = str((payload or {}).get("note") or "").strip()
     _key = _model_key_alias(project_key)
     data = _load_models()
@@ -14807,7 +14946,7 @@ async def admin_upload_weekly_plan(
     lower = orig_name.lower()
     if not (lower.endswith(".xlsx") or lower.endswith(".xlsm")):
         raise HTTPException(status_code=400, detail="xlsx/xlsm 파일만 허용")
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/projects/{project_key}/weekly-plan", project_key)
     if not raw:
         raise HTTPException(status_code=400, detail="빈 파일")
 
@@ -14896,6 +15035,11 @@ _PLAN_MODEL_COLS = {
     "재료비": "material_cost", "재료비($)": "material_cost",
     "po수량": "po_qty", "po": "po_qty",
     "실적수량": "shipped_qty",
+    # 2026-10-21 — 모델 등록 양식과 합치면서 들어온 두 칸
+    "전환주차": "switch_week", "양산전환": "switch_week",
+    "개발→양산전환주차": "switch_week", "개발->양산전환주차": "switch_week",
+    "개발→양산": "switch_week", "개발->양산": "switch_week",
+    "비고": "note",
 }
 #: 목록이 여기서 끝난다
 _PLAN_STOP = ("합계", "미달사유", "총합계", "소계")
@@ -14916,33 +15060,59 @@ def _plan_sheet_models(ws) -> list:
     for r in range(1, min(ws.max_row, 10) + 1):
         got = {}
         for c in range(1, min(ws.max_column, 16) + 1):
-            k = _s2(ws.cell(r, c).value).replace(" ", "").lower()
+            # 2026-10-22 — 양식이 머리글 앞에 '✎' · '=' 표를 붙여 내보낸다
+            # (적는 칸인지 자동 계산인지 글자로 보이게). 떼고 본다.
+            k = _s2(ws.cell(r, c).value).strip("✎=＝*※·•-–— \t")
+            k = k.replace(" ", "").lower()
             if not k or k.startswith("w"):
                 continue
             f = _PLAN_MODEL_COLS.get(k)
             if f and f not in got:
                 got[f] = c
-        if "name" in got:
+        if "name" in got or "part_number" in got:
             hdr, col = r, got
             break
     if not hdr or len(col) < 2:
         return []
 
+    # 2026-10-22 — 그 줄이 누구인가는 **파트넘버가 먼저**다.
+    #
+    # 양식이 바뀌었다. 품번은 늘 파트넘버 칸에 들어가고, 모델명 칸은 품번과
+    # 다른 이름이 따로 있을 때만 찬다 (챔버·CUP·하바플레이트는 품번이 곧
+    # 이름이라 모델명 칸이 비어 있다). 전처럼 모델명 칸만 보면 그런 줄은
+    # 이름이 없다고 통째로 건너뛰어, 판가·재료비·PO·실적이 하나도 안 들어간다.
     out = []
+    _idc = col.get("part_number") or col.get("name") or 1
     for r in range(hdr + 1, ws.max_row + 1):
         head = "".join(_s2(ws.cell(r, c).value)
-                       for c in range(1, min(col.get("name", 1) + 1, 5) + 1))
+                       for c in range(1, min(_idc + 1, 5) + 1))
         if head.replace(" ", "") in _PLAN_STOP:
             break
-        name = _s2(ws.cell(r, col["name"]).value)
+        name = (_s2(ws.cell(r, col["part_number"]).value)
+                if "part_number" in col else "")
+        if not name and "name" in col:
+            name = _s2(ws.cell(r, col["name"]).value)
         if not name:
             continue
+        # 빈 양식에 얹어 둔 예시 줄은 모델로 만들지 않는다 (2026-10-22)
+        try:
+            import pbx_plan_import as _pbxe
+            if _pbxe._is_example(name):
+                continue
+        except Exception:
+            pass
         row = {"row": r, "name": name}
         for f, c in col.items():
+            # name 은 위에서 정한 '그 줄이 누구인가' 다. 덮어쓰지 않는다 —
+            # 모델명 칸이 비어 있으면 숫자로 읽혀 None 이 돼 버린다.
             if f == "name":
                 continue
             v = ws.cell(r, c).value
-            if f in ("part_number", "dev_type", "group"):
+            # 글자 칸은 글자로 둔다. 2026-10-22 — 전환주차('2026-W36')와
+            # 비고가 숫자 변환에 걸려 통째로 None 이 됐다. 양식에 적어
+            # 올려도 서버에 안 들어갔다.
+            if f in ("part_number", "dev_type", "group", "switch_week",
+                     "note"):
                 row[f] = _s2(v)
             else:
                 # 빈 칸은 '그대로 둬라' 다. 0 으로 바꾸면 매주 여는 파일에서
@@ -14998,7 +15168,7 @@ def _plan_process_peek(wb):
 
 #: 엑셀이 건드릴 수 있는 모델 칸
 _PLAN_FIELDS = ("dev_type", "group", "price", "material_cost",
-                "po_qty", "shipped_qty")
+                "po_qty", "shipped_qty", "switch_week", "note")
 
 
 def _plan_over(v) -> bool:
@@ -15114,8 +15284,22 @@ def _plan_apply_models(proj, mrows, overwrite=False):
             "filled": n_fill, "over": n_over}
 
 
+#: 미달 사유를 '참고' 로 적는 말머리. 앞에 붙이면 문제로 세지 않는다.
+_NOTE_FYI_HEADS = ("참고:", "참고 :", "[참고]", "참고)", "fyi:")
+
+
 def _plan_apply_week_notes(proj, month, notes):
-    """'미달 사유' 줄 → 화면의 주차 미달 사유와 같은 자리에 넣는다."""
+    """'미달 사유' 줄 → 화면의 주차 미달 사유와 같은 자리에 넣는다.
+
+    2026-10-22 — 화면에서 하던 두 가지를 글자 규칙으로 옮겼다. 사유를
+    적는 자리가 화면과 엑셀 두 군데라 서로 덮어쓰고 있었는데, 화면 쪽을
+    닫으려면 화면에서만 되던 일이 엑셀에서도 돼야 한다.
+      · 종류 — '참고:' 로 시작하면 참고, 아니면 문제.
+               ('참고' 는 일부러 덜 출하한 주라 지연으로 안 센다)
+      · 지우기 — '-' 한 글자면 그 주 사유를 지운다.
+                 빈 칸은 '그대로 둬라' 이므로 지우는 뜻이 될 수 없다.
+                 (전환주차 칸이 쓰는 규칙과 같다)
+    """
     if not notes:
         return 0
     import datetime as _dtn
@@ -15130,12 +15314,27 @@ def _plan_apply_week_notes(proj, month, notes):
     for w, text in (notes or {}).items():
         text = str(text or "").strip()
         if not text:
+            continue                      # 빈 칸 = 그대로 둬라
+        if text in ("-", "–", "—", "없음"):
+            if mon.pop(str(w), None) is not None:
+                n_set += 1
             continue
-        was = mon.get(w) if isinstance(mon.get(w), dict) else {}
-        # 화면에서 '참고' 로 적어 둔 주는 구분을 그대로 둔다
-        kind = was.get("kind") if was.get("kind") in _WEEK_REASON_KINDS else "문제"
-        mon[str(w)] = {"kind": kind, "text": text, "at": now}
+        low = text.lower().replace(" ", "")
+        kind, body = "문제", text
+        for head in _NOTE_FYI_HEADS:
+            if low.startswith(head.replace(" ", "")):
+                kind = "참고"
+                body = text[len(head):].strip() or text
+                break
+        if kind == "문제":
+            was = mon.get(w) if isinstance(mon.get(w), dict) else {}
+            # 전에 '참고' 로 적어 둔 주는 말머리를 안 붙였어도 그대로 둔다
+            if was.get("kind") in _WEEK_REASON_KINDS:
+                kind = was["kind"]
+        mon[str(w)] = {"kind": kind, "text": body, "at": now}
         n_set += 1
+    if not mon:
+        store.pop(str(month), None)
     return n_set
 
 
@@ -15252,12 +15451,16 @@ def _pbx_apply_sheet_months(proj: dict, ws) -> list:
     return out
 
 
-async def _pbx_open_upload(file):
-    """업로드된 엑셀을 연다 → (원본 파일명, 워크북)"""
+async def _pbx_open_upload(file, where: str = "주차별 계획 엑셀",
+                           project: str = ""):
+    """업로드된 엑셀을 연다 → (원본 파일명, 워크북)
+
+    여는 길에 원본을 보관함에 한 벌 남긴다(upload_store).
+    """
     orig = file.filename or "plan.xlsx"
     if not orig.lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(status_code=400, detail="xlsx/xlsm 파일만 올릴 수 있습니다")
-    raw = await file.read()
+    raw = await _keep_upload(file, where, project)
     if not raw:
         raise HTTPException(status_code=400, detail="빈 파일입니다")
 
@@ -15529,11 +15732,14 @@ def _auto_projects():
 
 
 async def _auto_read_upload(file, sheet):
-    """업로드된 엑셀을 열어 제품표를 읽는다 → (파일명, parsed, 시트목록)"""
+    """업로드된 엑셀을 열어 제품표를 읽는다 → (파일명, parsed, 시트목록)
+
+    여는 길에 원본을 보관함에 한 벌 남긴다(upload_store).
+    """
     orig = file.filename or "products.xlsx"
     if not orig.lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(status_code=400, detail="xlsx/xlsm 파일만 올릴 수 있습니다")
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/automotive/product-import", "automotive")
     if not raw:
         raise HTTPException(status_code=400, detail="빈 파일입니다")
 
@@ -15748,7 +15954,8 @@ async def admin_plan_file_preview(
 ):
     """올린 파일이 무엇을 바꾸는지 먼저 보여준다. 저장하지 않는다."""
     key = project_key.strip()
-    orig, wb = await _pbx_open_upload(file)
+    orig, wb = await _pbx_open_upload(
+        file, "/admin/projects/{project_key}/plan-file/preview", key)
 
     # 업로드 버튼이 하나라서 어느 쪽 파일인지 여기서 가른다.
     # 하바플레이트 주간 현황 엑셀은 시트 이름이 'W35' 처럼 주차 하나뿐이고,
@@ -15846,7 +16053,8 @@ async def admin_plan_file_apply(
     overwrite 를 보내지 않으면 모델 칸은 **비어 있던 것만** 채운다.
     """
     key = project_key.strip()
-    orig, wb = await _pbx_open_upload(file)
+    orig, wb = await _pbx_open_upload(
+        file, "/admin/projects/{project_key}/plan-file/apply", key)
     try:
         parsed_all = _pbx_pick_months(wb, month)
         parsed = parsed_all[0]
@@ -15923,6 +16131,43 @@ async def admin_plan_file_apply(
             un_all.append(u)
         applied += hit
         done.append({"month": mon, "applied": hit, "weeks": diff["weeks"]})
+
+    # 프로젝트 현황 — 양식 아래 '프로젝트 현황' 두 줄 (2026-10-22)
+    #
+    # 모델 줄의 비고와 **다른 층**이다. 비고는 그 모델 하나만 멈춘 것이고
+    # 여기는 프로젝트 전체가 멈춘 것이다. 섞으면 모델 하나 드롭이 프로젝트
+    # 전체 드롭으로 읽혀서, 그 프로젝트 모델 전부가 지연 집계에서 빠진다.
+    _pstat = None
+    try:
+        _ws2 = wb[parsed["sheet"]] if parsed.get("sheet") in wb.sheetnames else None
+        if _ws2 is not None:
+            import pbx_plan_import as _pbxm
+            _pstat = _pbxm.read_project_status(_ws2)
+    except Exception as _e:
+        print(f"[plan-file] 프로젝트 현황 읽기 실패(무시): {_e}")
+    if _pstat is not None:
+        proj["status_note"] = _pstat["note"]
+        _h = _pstat["hold"]
+        # 빈 칸은 '그대로 둬라' 다 — 이 양식의 다른 칸과 같은 규칙이다.
+        # 비었다고 '진행' 으로 읽으면, 상태 칸을 안 건드린 사람이 올릴
+        # 때마다 멈춰 세운 프로젝트가 조용히 풀린다.
+        if _pstat["blank"]:
+            print(f"[plan-file] {key}: 프로젝트 현황 글만 "
+                  f"{len(_pstat['note'])}자 (상태 칸은 비어 있어 그대로 둠)")
+        elif _h:
+            proj["hold"] = _h
+            proj["hold_source"] = "excel"
+            proj["hold_reason"] = (_hold_from_note(_pstat["note"])[1]
+                                   or _pstat["note"] or "")
+            print(f"[plan-file] {key}: 프로젝트 현황 {_h} "
+                  f"· {len(_pstat['note'])}자")
+        else:
+            # '진행' 을 골랐다 — 문구에서 다시 살아나지 않게 사실을 남긴다
+            proj["hold"] = "진행"
+            proj["hold_source"] = "excel"
+            proj.pop("hold_reason", None)
+            print(f"[plan-file] {key}: 프로젝트 현황 진행 "
+                  f"· {len(_pstat['note'])}자")
 
     diff = _pbx_diff(proj, parsed)      # 맨 앞 달 — 응답의 대표 값
     mon = diff["month"]
@@ -21662,7 +21907,7 @@ async def admin_kpi_upload_excel(
     from io import BytesIO
     from datetime import datetime as _dt
 
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/kpi/{project_key}/upload_excel", project_key)
     if not raw:
         raise HTTPException(status_code=400, detail="빈 파일")
 
@@ -23152,9 +23397,14 @@ def _stamp_project_hold(proj: dict, note: str) -> bool:
     한 번 읽어낸 보류는 필드로 남기고, 풀 때는 현황에 '홀딩 해제' 라고
     적거나 admin 에서 상태를 '진행' 으로 바꾸면 된다.
     """
-    # 손으로 푼 건 손으로만 되돌린다. 여기서 문구를 다시 읽어 덮으면
-    # admin 에서 '진행' 으로 바꿔놔도 서버가 뜰 때마다 보류가 되살아난다.
-    if str((proj or {}).get("hold_source") or "") == "manual":
+    # 사람이 골라 둔 건 사람만 되돌린다. 여기서 문구를 다시 읽어 덮으면
+    # '진행' 으로 바꿔놔도 서버가 뜰 때마다 보류가 되살아난다.
+    #
+    # 2026-10-22 — 'excel' 도 같이 막는다. 이 함수는 서버가 뜰 때마다
+    # 한 번씩 도는데(_stamp_hold_on_boot), 엑셀에서 상태를 '진행' 으로
+    # 바꿔 올려도 현황 글에 '홀딩' 이라는 말이 남아 있으면 다음 배포에서
+    # 조용히 보류로 되돌아갔다.
+    if str((proj or {}).get("hold_source") or "") in ("manual", "excel"):
         return False
 
     kind, why = _hold_from_note(note)
@@ -23261,9 +23511,15 @@ def _model_alert(m: dict, disp_group: str = "", expected: str = "",
     _proc = (m or {}).get("process")
     if isinstance(_proc, list) and _proc and _process_step_done(_proc[-1]):
         return "정상"          # 최종 승인이 끝났으면 늦고 말고가 없다
-    # 사람이 이슈 칸에 '지연' 이라고 적었으면 그것도 판정이다.
+    # 사람이 '지연' 이라고 적었으면 그것도 판정이다.
     # 양산품은 이것 말고 늦었는지 볼 근거가 없다.
-    if _issue_says_delay((m or {}).get("issues")):
+    #
+    # 2026-10-22 — 이슈 칸만 보던 것을 비고까지 넓혔다. 모델 정보를 엑셀로만
+    # 고치게 바꾸면서 화면의 이슈 칸이 잠겼는데, 엑셀이 싣고 오는 글자 칸은
+    # 비고 하나다. 비고에 적은 '지연' 을 안 읽으면 양산품은 늦었는지 볼
+    # 근거가 아예 없어진다. _model_hold 는 이미 두 칸을 같이 읽고 있었다.
+    if _issue_says_delay(" ".join(str((m or {}).get(f) or "")
+                                  for f in ("issues", "note"))):
         return "지연"
     g = disp_group or _display_group(m)
     if g != "개발":
@@ -23979,7 +24235,7 @@ async def admin_import_status_excel(project_key: str,
     import hrva_status_import as _hs
 
     _key = _model_key_alias(project_key)
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/projects/{project_key}/status-excel", project_key)
     try:
         wb = _xl.load_workbook(_io.BytesIO(raw), data_only=True)
     except Exception as e:
@@ -24578,7 +24834,11 @@ def admin_put_week_reason(project_key: str, payload: dict,
 
     body: {month, week, kind: '문제'|'참고', text}
     text 가 비면 그 주의 사유를 지운다 (미입력으로 되돌린다).
+
+    2026-10-22 — 막혀 있다. 같은 자리를 엑셀의 '미달 사유' 줄도 쓴다.
+    두 군데서 적으면 올릴 때마다 서로 덮어쓴다. 엑셀 하나로 모았다.
     """
+    _write_off("week-reason")
     import datetime as _dt, re as _re
     _key = _model_key_alias(project_key)
     month = str(payload.get("month") or "").strip()
@@ -25318,7 +25578,7 @@ async def admin_bloom_daily_preview(project_key: str, file: UploadFile = File(..
     # 엑셀은 품목 전체가 한 장이다. 어느 품목 화면에서 올리든 원본은 한 곳에.
     _key = _BLOOM_STORE if _bloom_item_of(_model_key_alias(project_key)) \
         else _model_key_alias(project_key)
-    months_in = _bloom_parse_months(await file.read())
+    months_in = _bloom_parse_months(await _keep_upload(file, "/admin/projects/{project_key}/bloom-daily/preview", project_key))
     proj = (_load_models().get("projects") or {}).get(_key) or {}
     store, diffs, newest = _bloom_apply_months(proj, months_in)
     board = store.get(newest) or {}
@@ -25340,7 +25600,7 @@ async def admin_bloom_daily_apply(project_key: str, file: UploadFile = File(...)
     """합쳐서 저장한다."""
     _key = _BLOOM_STORE if _bloom_item_of(_model_key_alias(project_key)) \
         else _model_key_alias(project_key)
-    months_in = _bloom_parse_months(await file.read())
+    months_in = _bloom_parse_months(await _keep_upload(file, "/admin/projects/{project_key}/bloom-daily", project_key))
     data = _load_models()
     proj = data.setdefault("projects", {}).setdefault(_key, {"models": []})
     store, diffs, newest = _bloom_apply_months(proj, months_in)
@@ -26083,7 +26343,7 @@ async def admin_price_import_xlsx(project_key: str, file: UploadFile = File(...)
     import io
     import openpyxl
     try:
-        raw = await file.read()
+        raw = await _keep_upload(file, "/admin/projects/{project_key}/price-import-xlsx", project_key)
         wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"엑셀 읽기 실패: {e}")
@@ -26234,7 +26494,7 @@ async def admin_import_unified(project_key: str, file: UploadFile = File(...),
     import io, openpyxl, re as _re
     data = _load_models()
     applied, skipped = [], []
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/projects/{project_key}/process/import-xlsx", project_key)
     wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
     
     # 시트 이름 → 프로젝트. 단계는 엑셀 1행 머리글에서 읽는다.
@@ -26392,7 +26652,7 @@ async def admin_import_weekly_summary(project_key: str, file: UploadFile = File(
     proj = data.get("projects", {}).get(project_key)
     if not proj:
         raise HTTPException(status_code=404, detail="프로젝트 없음")
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/projects/{project_key}/weekly-summary-import", project_key)
     wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
     ws = wb.worksheets[0]
 
@@ -26431,7 +26691,7 @@ async def admin_restore_process(
     """백업 models.json 에서 개발 공정(process) 입력만 골라 현재 데이터에 되살린다.
     모델 ID 로 매칭하며, 계획일/실적일/상태가 하나라도 채워진 공정만 복구한다.
     다른 필드(판가·PO·주차 등)는 건드리지 않는다."""
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/projects/{project_key}/process-restore", project_key)
     try:
         backup = json.loads(raw.decode("utf-8"))
     except Exception as e:
@@ -26504,7 +26764,7 @@ async def admin_import_weekly_report(
     import openpyxl
     import hrva_import as _imp
 
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/projects/{project_key}/report-import", project_key)
     try:
         wb = openpyxl.load_workbook(_io.BytesIO(raw), data_only=True)
     except Exception as e:
@@ -27681,7 +27941,7 @@ async def admin_revenue_import(mode: str = Form("preview"),
     mode=preview 면 읽기만 하고 무엇이 달라지는지 돌려준다. mode=commit
     이어야 저장한다. 파일 한 장이 한 해 전체라 그 해를 통째로 갈아 끼운다.
     """
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/revenue/import", "")
     if not raw:
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
     name = file.filename or ""
@@ -27789,7 +28049,7 @@ async def admin_revenue_estimate_import(month: str = Form(...),
     주간보고와 달리 한 달짜리라서, 어느 달인지는 화면에서 받는다.
     """
     month = _check_month(month)
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/revenue/estimate/import", "")
     if not raw:
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
     name = file.filename or ""
@@ -27889,7 +28149,7 @@ async def admin_division_purchase_import(
     name = file.filename or ""
     if not name.lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(status_code=400, detail="xlsx 파일을 올려 주세요.")
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/division/purchase/import-xlsx", "")
     try:
         parsed = _purim.parse_workbook(raw, year=year, sheet=sheet)
     except Exception as e:
@@ -28182,7 +28442,7 @@ async def admin_overtime_import(
     name = file.filename or ""
     if not name.lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(status_code=400, detail="xlsx 파일을 올려 주세요.")
-    raw = await file.read()
+    raw = await _keep_upload(file, "/admin/overtime/import-xlsx", "")
     try:
         parsed = _otim.parse_workbook(raw, year=year, week=week)
     except Exception as e:
@@ -28471,7 +28731,11 @@ def admin_plan_form(project_key: str, month: str = "",
         if _got:
             notes[_ym] = _got
 
-    data = _pfm.build_year_form(label, y, mon, models, notes=notes)
+    # 프로젝트 현황도 같이 싣는다. 받는 사람이 지금 뭐라고 적혀 있는지
+    # 보고 고칠 수 있어야 한다 (2026-10-22)
+    data = _pfm.build_year_form(label, y, mon, models, notes=notes,
+                                status_note=str(proj.get("status_note") or ""),
+                                hold=_project_hold(proj))
     fname = "%s_작성용_%s.xlsx" % (label or key, mon)
     return Response(
         content=data,

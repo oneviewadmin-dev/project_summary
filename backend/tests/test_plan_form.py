@@ -26,6 +26,13 @@ import week_calendar as wcal                # noqa: E402
 
 FAIL = []
 
+# 2026-10-22 — 머리글 앞에 '✎'(적는 칸) · '='(자동 계산) 표가 붙는다.
+# 비교할 때는 떼고 본다. 읽는 쪽(_head_key · _plan_sheet_models)도 같다.
+def _hk(v):
+    return str(v or "").strip().strip("✎=＝*※·•-–— \t").strip()
+
+
+
 
 def ok(c, m):
     if not c:
@@ -84,45 +91,52 @@ ok(weeks_seen == want,
 ok(any(w in weeks_seen for w in wcal.get_month_weeks("2026-06")), "6월 주차가 없다")
 
 n_tot = sum(1 for c in range(1, ws.max_column + 1)
-            if str(ws.cell(pf.HDR_WEEK, c).value or "") == "월 합계")
+            if _hk(ws.cell(pf.HDR_WEEK, c).value) == "월 합계")
 ok(n_tot == 12, "월 합계가 달마다 하나씩 있어야 한다: %d개" % n_tot)
 
 
-# ── 3. 접힘 — 적는 달만 펼쳐져 있다 ─────────────────────────────────
+# ── 3. 접지 않는다 — 열두 달이 다 펼쳐져 있다 ──────────────────────
+#
+# 2026-10-21 — 전에는 '적는 달' 하나만 펼치고 나머지를 접었다. 적는 달은
+# 매주 바뀌어서 표시해 둬 봐야 다음 주면 틀린 표시가 되고, 지난 달을
+# 보려면 매번 [+] 를 눌러야 했다. 그래서 접는 것을 그만뒀다.
 from openpyxl.utils import get_column_letter as _L      # noqa: E402
 
 blocks = {int(b["month"][5:7]): b for b in pf.layout(YEAR, MON)}
-c = None
-hidden, shown = [], []
+hidden = []
 for mi, b in sorted(blocks.items()):
-    col = _L(tops[mi])
-    d = ws.column_dimensions.get(col)
-    (hidden if (d is not None and d.hidden) else shown).append(mi)
-ok(shown == [10], "펼쳐진 달이 10월 하나여야 한다: 펼침 %s · 접힘 %s" % (shown, hidden))
-# 월 합계 두 칸은 접힌 달도 보여야 한다
-c9 = tops[9]
-while str(ws.cell(pf.HDR_WEEK, c9).value or "") != "월 합계":
-    c9 += 1
-d9 = ws.column_dimensions.get(_L(c9))
-ok(d9 is None or not d9.hidden, "접힌 달의 월 합계까지 숨으면 그 달이 안 보인다")
+    d = ws.column_dimensions.get(_L(tops[mi]))
+    if d is not None and d.hidden:
+        hidden.append(mi)
+ok(not hidden, "접힌 달이 있다: %s (이제 접지 않는다)" % hidden)
 
 
 # ── 4. 줄 ───────────────────────────────────────────────────────────
+# 2026-10-21 — 왼쪽 칸이 프로젝트마다 달라지지 않게 고정됐다.
+#   A열은 늘 파트넘버다. 그래서 모델명은 머리글로 찾아서 읽는다.
+# 2026-10-22 — 품번은 파트넘버 칸이 가져가고, 모델명 칸은 품번과 다른
+# 이름이 있을 때만 찬다. 줄을 찾는 기준은 파트넘버다.
+_NAME_COL = next(i for i in range(1, 10)
+                 if _hk(ws.cell(pf.HDR_TOP, i).value) == "파트넘버")
 rows, r_sum = {}, None
 for r in range(pf.FIRST_ROW, ws.max_row + 1):
-    nm = str(ws.cell(r, 1).value or "").strip()
-    if nm == "합계":
+    nm = str(ws.cell(r, _NAME_COL).value or "").strip()
+    if str(ws.cell(r, 1).value or "").strip() == "합계" or nm == "합계":
         r_sum = r
         break
     if nm:
         rows[nm] = r
 ok(set(rows) == {"A-413", "B-009", "C-301"}, "모델 줄이 다 안 나왔다: %s" % list(rows))
 ok(r_sum is not None, "합계 줄이 없다")
+# 적는 칸 안에서만 센다. 2026-10-21 부터 그 아래로 세 줄 띄우고
+# '지금 쓰시던 모양' 표가 붙는데, 그 표에도 제 합계 줄이 있다. 읽는 쪽은
+# 위쪽 합계에서 이미 멈추므로 아래 것은 상관이 없다.
 labels = [str(ws.cell(r, 1).value or "").strip()
-          for r in range(pf.FIRST_ROW, ws.max_row + 1)]
+          or str(ws.cell(r, _NAME_COL).value or "").strip()
+          for r in range(pf.FIRST_ROW, r_sum + 1)]
 ok(labels.count("합계") == 1,
-   "'합계' 줄이 하나여야 한다 (묶음 합계를 두면 읽기가 거기서 끊긴다): %d개"
-   % labels.count("합계"))
+   "적는 칸 안에 '합계' 줄이 하나여야 한다 (묶음 합계를 두면 읽기가 "
+   "거기서 끊긴다): %d개" % labels.count("합계"))
 
 
 # ── 5. 값 ───────────────────────────────────────────────────────────
@@ -132,45 +146,54 @@ ok(ws.cell(r413, c10).value == 82, "적는 달 계획이 안 들어갔다: %r"
    % ws.cell(r413, c10).value)
 ok(ws.cell(r413, c10 + 1).value is None,
    "0 은 빈 칸이어야 한다 ('아직 안 정함' 과 구분): %r" % ws.cell(r413, c10 + 1).value)
-# 접힌 달도 숫자가 들어 있어야 한다 — 펴서 보려는 것이니까
+# 다른 달 주차도 그대로 들어 있어야 한다
 c9w = tops[9]
 ok(ws.cell(r413, c9w).value == 200,
-   "접힌 달 주차가 비었다 — 접은 것이지 빼는 게 아니다: %r" % ws.cell(r413, c9w).value)
-ok(ws.cell(r413, c9w + 2).value == 238, "접힌 달 둘째 주가 비었다")
+   "다른 달 주차가 비었다: %r" % ws.cell(r413, c9w).value)
+# 2026-10-22 — 주차마다 칸이 둘(계획·실적)에서 셋(+불량)으로 늘었다.
+# 자리를 더해 찾지 말고 머리글로 찾는다 — 또 늘어도 안 깨진다.
+_w2 = next(c for c in range(c9w + 1, ws.max_column + 1)
+           if str(ws.cell(pf.HDR_WEEK, c).value or "").strip().startswith("W"))
+ok(ws.cell(r413, _w2).value == 238, "다른 달 둘째 주가 비었다")
 
 # 월 합계는 그 달 주차를 더하는 수식
+# (c9 는 접힘 검사에서 잡던 것인데 그 검사가 없어져서 여기서 찾는다)
+c9 = tops[9]
+# 머리글이 '= 월 합계' 로 바뀌었다(= 는 자동 계산 표). 떼고 본다.
+# 안 그러면 영영 못 찾고 빈 칸을 계속 만들어 메모리가 터진다.
+while _hk(ws.cell(pf.HDR_WEEK, c9).value) != "월 합계":
+    c9 += 1
+    assert c9 <= ws.max_column, "월 합계 칸을 못 찾았다"
 f9 = ws.cell(r413, c9).value
 ok(isinstance(f9, str) and f9.startswith("=") and "COUNT(" in f9,
    "월 합계가 수식이 아니다: %r" % f9)
 
-heads = {str(ws.cell(pf.HDR_TOP, c).value or ""): c for c in range(1, 12)}
+heads = {_hk(ws.cell(pf.HDR_TOP, c).value): c for c in range(1, 12)}
 for h, v in (("판가($)", 2931.15), ("PO수량", 3226), ("실적수량", 2670)):
     ok(ws.cell(r413, heads[h]).value == v,
        "%s 가 안 채워졌다: %r" % (h, ws.cell(r413, heads[h]).value))
 
 
 # ── 6. 적는 달은 칠하지 않고 테두리로 ───────────────────────────────
+# ── 적는 달을 따로 표시하지 않는다 ──────────────────────────────────
 #
-# 보드에서 빨강은 '계획에 못 미쳤다' 다. 칸을 칠하면 '여기가 문제' 로 읽힌다.
-def red(side):
-    return (side.style in ("medium", "thick") and side.color is not None
-            and (side.color.rgb or "")[-6:].upper() == pf.RED)
-
-
+# 매주 바뀌는 표시라 틀린 표시가 되기 쉬웠다. RED 와 _box 도 같이 뺐다.
+ok(not hasattr(pf, "RED"), "적는 달 표시 색이 아직 남아 있다")
+ok(not hasattr(pf, "_box"), "적는 달 테두리 함수가 아직 남아 있다")
 hd = ws.cell(pf.HDR_WEEK, c10)
-ok((hd.fill.fgColor.rgb or "")[-6:].upper() != pf.RED,
-   "적는 달 머리글을 빨갛게 칠했다 — 테두리로만 표시해야 한다")
-# 테두리는 블록 바깥쪽에만 — 위는 월 이름 줄, 왼쪽은 첫 주차 열
-ok(red(ws.cell(pf.HDR_TOP, c10).border.top), "적는 달 위쪽에 빨간 테두리가 없다")
-ok(red(ws.cell(r413, c10).border.left), "적는 달 왼쪽에 빨간 테두리가 없다")
-c10e = tops[11] - 1          # 11월 바로 앞 = 10월 블록 마지막 열
-ok(red(ws.cell(r413, c10e).border.right), "적는 달 오른쪽에 빨간 테두리가 없다")
-ok(not red(ws.cell(r413, c10 + 1).border.left),
-   "안쪽 줄까지 빨개졌다 — 바깥 테두리만이어야 한다")
-# 접힌 달에는 빨간 테두리가 없어야 한다
-l9 = ws.cell(r413, c9w).border.left
-ok(not (l9.color and (l9.color.rgb or "")[-6:].upper() == pf.RED),
-   "접힌 달에도 빨간 테두리가 갔다")
+ok((hd.fill.fgColor.rgb or "")[-6:].upper() != "C00000",
+   "머리글을 빨갛게 칠했다")
+
+# 어느 달에도 굵은 빨간 테두리가 없다
+def _is_red(side):
+    return (side is not None and side.color is not None
+            and (side.color.rgb or "")[-6:].upper() == "C00000")
+
+
+for _c in (c10, c10 + 1, c9w):
+    b = ws.cell(r413, _c).border
+    ok(not any(_is_red(x) for x in (b.left, b.right, b.top, b.bottom)),
+       "%d열에 빨간 테두리가 남아 있다" % _c)
 
 
 # ── 7. 되읽기 — 열두 달이 다 올라가는가 ─────────────────────────────

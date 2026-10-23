@@ -936,7 +936,13 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
   }
 
   Widget _buildWeeklyTable() {
-    if (!_isSemiconductor) return const SizedBox.shrink();
+    // 2026-10-23 — 전에는 프로젝트 키가 반도체 목록에 있을 때만 이 표를
+    // 그렸다. 그래서 같은 주차 자료를 올려도 사업부가 다르면 표가 안 떴다.
+    // 이제는 주차 자료가 있으면 어느 사업부든 그린다 — 아래 줄이
+    // '자료가 없으면 안 그린다' 를 이미 맡고 있다.
+    if (!kSameFrameForAll && !_isSemiconductor) {
+      return const SizedBox.shrink();
+    }
     final wp = model['weekly_plan'];
     if (wp is! Map || wp.isEmpty) return const SizedBox.shrink();
     final months = wp.keys.map((e) => e.toString()).toList()..sort();

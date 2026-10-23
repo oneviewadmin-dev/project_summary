@@ -15,6 +15,7 @@
 
 import 'package:flutter/material.dart';
 
+import '../config/app_config.dart';
 import '../design/design.dart';
 import '../models/division.dart';
 import '../models/dashboard.dart';
@@ -29,6 +30,8 @@ import '../services/bloom_service.dart';
 import '../widgets/bloom_plan_actual_card.dart';
 import '../widgets/bloom_today_card.dart';
 import '../widgets/purchase_status_card.dart';
+import '../widgets/weekly_board_card.dart';
+import '../services/division_board_service.dart';
 import '../services/purchase_service.dart';
 import '../models/purchase_status.dart';
 import '../components/division/division_immediate_check.dart'
@@ -125,6 +128,16 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
   /// (다시 보여줄 때는 이 한 줄을 false 로)
   bool get _onlyPurchase => _purchase.hasData;
 
+  // 아래 셋은 '그 사업부만 다른 틀을 쓴다' 는 뜻이다. 틀을 하나로 모은
+  // 뒤로는 전부 false 가 되고, 전용 카드는 공통 틀 아래에서 따로 그린다.
+  bool get _autoFrame => _isAuto && !kSameFrameForAll;
+  bool get _bloomFrame => _isBloom && !kSameFrameForAll;
+  bool get _purchaseFrame => _onlyPurchase && !kSameFrameForAll;
+
+  /// 프로젝트 안에 있던 주차별 계획(주차 현황 보드)을 사업부 화면
+  /// 위쪽으로 끌어올리는 사업부인가. 지금은 블룸·자동차.
+  bool get _divisionBoard => kDivisionBoardOn.contains(widget.division.id);
+
   Future<void> _loadPurchase() async {
     final p = await PurchaseService.fetch(widget.division.id);
     if (mounted) setState(() => _purchase = p);
@@ -149,10 +162,11 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
     _loadFavorites();
     _loadProgress();
     _loadOverview();
-    if (_isAuto) _loadAuto();
-    if (_isBloom) _loadBloom();
+    // 2026-10-23 — 안 그리는 카드의 자료는 받지 않는다.
+    if (_autoFrame) _loadAuto();
+    if (_bloomFrame) _loadBloom();
     if (_isSemi) _loadSheetRevenue();
-    _loadPurchase();
+    if (!kSameFrameForAll) _loadPurchase();
   }
 
   Future<void> _loadAuto() async {
@@ -292,9 +306,9 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
       _future,
       _loadProgress(),
       _loadOverview(),
-      if (_isAuto) _loadAuto(),
-      if (_isBloom) _loadBloom(),
-      _loadPurchase(),
+      if (_autoFrame) _loadAuto(),
+      if (_bloomFrame) _loadBloom(),
+      if (!kSameFrameForAll) _loadPurchase(),
     ]);
   }
 
@@ -565,7 +579,8 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
       final bFav = _favoriteProjects.contains(b.id);
       if (aFav != bFav) return aFav ? -1 : 1;
       // 자동차는 월 매출이 없다. /overview 값으로 줄을 세우면 순서가 무작위가 된다.
-      if (_isAuto) {
+      // 2026-10-23 — 틀을 하나로 모으면서 줄 세우는 법도 같이 쓴다.
+      if (_autoFrame) {
         final ar = _autoOf(a.id).revenue;
         final br = _autoOf(b.id).revenue;
         if (ar != br) return br.compareTo(ar);
@@ -909,23 +924,26 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
               child: ListView(
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
                 children: [
-                  if (_isBloom && _bloom.hasBoard) ...[
+                  // 2026-10-23 — 사업부 전용 카드는 안 그린다.
+                  // 반도체사업부 화면에 없는 것은 어느 사업부에도 없다.
+                  // (블룸 일일 보드 · 매입 현황 · 자동차 계약 카드)
+                  if (_bloomFrame && _bloom.hasBoard) ...[
                     BloomPlanActualCard(board: _bloom),
                     const SizedBox(height: 12),
                     BloomTodayCard(board: _bloom),
                     const SizedBox(height: 12),
                   ],
-                  if (_purchase.hasData) ...[
+                  if (_purchaseFrame) ...[
                     PurchaseStatusCard(status: _purchase),
                     const SizedBox(height: 12),
                   ],
-                  if (_isAuto)
+                  if (_autoFrame)
                     _autoHero()
                   // 블룸은 '계획 대비 실적' 카드에 매출이 이미 있다. 매출 계획이
                   // 따로 등록된 적도 없어서 '계획이 없습니다' 만 떴다 — 뺀다.
                   // (보드가 없고 매출이 등록돼 있을 때만 보여준다)
-                  else if (!_onlyPurchase &&
-                      (!_isBloom ||
+                  else if (!_purchaseFrame &&
+                      (!_bloomFrame ||
                           (!_bloom.hasBoard &&
                               (_overview.planRevenue > 0 ||
                                   _overview.revenue > 0))))
@@ -955,7 +973,7 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                       );
                     },
                   ),
-                  if (!_isAuto && !_onlyPurchase &&
+                  if (!_autoFrame && !_purchaseFrame &&
                       data.delayed + data.warning > 0) ...[
                     const SizedBox(height: 10),
                     DivisionAttentionBanner(
@@ -975,8 +993,31 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                       },
                     ),
                   ],
-                  // 블룸은 품목이 곧 프로젝트라 위 '계획 대비 실적' 카드가 목록을 대신한다
-                  if (!_isBloom && !_onlyPurchase) ...[
+                  // ── 사업부 주차 현황 보드 (블룸 · 자동차) ────────
+                  // 프로젝트 화면과 같은 표인데 '구분' 열이 프로젝트다.
+                  // (YFP · Corva KPE · 외 N종 · 합계)
+                  // 어느 프로젝트를 이름으로 세울지는 kDivisionBoardPicks.
+                  if (_divisionBoard && data.projects.isNotEmpty) ...[
+                    const SizedBox(height: 14),
+                    WeeklyBoardCard(
+                      key: ValueKey('division-board-${widget.division.id}'),
+                      loader: () => DivisionBoardService.fetch(
+                        divisionId: widget.division.id,
+                        projects: [
+                          for (final p in data.projects)
+                            BoardProject(
+                              p.id,
+                              p.koreanName.isEmpty ? p.englishName : p.koreanName,
+                            ),
+                        ],
+                        picked: kDivisionBoardPicks[widget.division.id] ??
+                            const <String>[],
+                      ),
+                    ),
+                  ],
+                  // 프로젝트 목록은 어느 사업부에나 있다. 전에는 블룸과
+                  // 매입 사업부에서 통째로 빠져 있었다.
+                  if (!_bloomFrame && !_purchaseFrame) ...[
                   const SizedBox(height: 18),
 
                   // ── 프로젝트 (매출 기여순)
@@ -991,7 +1032,7 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                       ),
                       const SizedBox(width: 8),
                       Text(
-                        '${_isAuto ? '계약 매출순' : _sort.label} · ${visibleProjects.length}건',
+                        '${_autoFrame ? '계약 매출순' : _sort.label} · ${visibleProjects.length}건',
                         style: AppText.caption.copyWith(
                           fontSize: 11.5,
                           color: AppColors.textHint,
@@ -1046,7 +1087,7 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                         ),
                       ),
                     )
-                  else if (_isAuto) ...[
+                  else if (_autoFrame) ...[
                     for (final p in visibleProjects) ...[
                       _autoRow(p),
                       const SizedBox(height: 8),
@@ -1133,6 +1174,7 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                     ],
                   ],
                   ],
+
                 ],
               ),
             ),
