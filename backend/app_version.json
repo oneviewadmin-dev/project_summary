@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.53",
-  "latest_version_code": 76,
+  "latest_version": "2.3.54",
+  "latest_version_code": 77,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "사업부 화면을 하나로 맞췄습니다.\n\n· 어느 사업부나 같은 자리에 같은 것\n· 블룸은 매출 밑에 주차 현황 보드\n· 자동차·매입에도 프로젝트 목록",
+  "release_notes": "주차별 계획에 예시 숫자를 띄웠습니다.\n\n· 자동차도 매출 밑에 주차 현황 보드\n· 숫자 없는 사업부는 '예시' 표가 뜸\n· 엑셀이 올라오면 진짜 숫자로 바뀜",
   "force_update": false
 }
