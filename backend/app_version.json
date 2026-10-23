@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.54",
-  "latest_version_code": 77,
+  "latest_version": "2.3.55",
+  "latest_version_code": 78,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "주차별 계획에 예시 숫자를 띄웠습니다.\n\n· 자동차도 매출 밑에 주차 현황 보드\n· 숫자 없는 사업부는 '예시' 표가 뜸\n· 엑셀이 올라오면 진짜 숫자로 바뀜",
+  "release_notes": "자동차 예시를 매출 목록으로 바꿨습니다.\n\n· 주차 보드는 블룸 사업부에만\n· 자동차는 프로젝트별 매출 예시\n· 들어가면 반도체와 같은 주차 표",
   "force_update": false
 }
