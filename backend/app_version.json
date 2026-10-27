@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.55",
-  "latest_version_code": 78,
+  "latest_version": "2.3.56",
+  "latest_version_code": 79,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "자동차 예시를 매출 목록으로 바꿨습니다.\n\n· 주차 보드는 블룸 사업부에만\n· 자동차는 프로젝트별 매출 예시\n· 들어가면 반도체와 같은 주차 표",
+  "release_notes": "ESS·블룸 주차 현황을 공정별로 봅니다.\n\n· 프로젝트에 들어가면 공정별 주차 표\n· 블룸 사업부는 일 보고도 날짜별로\n· 사업부 양식 엑셀을 그대로 올림",
   "force_update": false
 }
