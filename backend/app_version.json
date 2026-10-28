@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.56",
-  "latest_version_code": 79,
+  "latest_version": "2.3.57",
+  "latest_version_code": 80,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "ESS·블룸 주차 현황을 공정별로 봅니다.\n\n· 프로젝트에 들어가면 공정별 주차 표\n· 블룸 사업부는 일 보고도 날짜별로\n· 사업부 양식 엑셀을 그대로 올림",
+  "release_notes": "양식에 적은 칸이 화면에 다 뜹니다.\n\n· PO 수량이 바뀌면 ▲▼ 로 표시\n· 연간수량 칸 추가 (반도체 양식)\n· 전사 · 사업부 메뉴를 갈라 놨습니다",
   "force_update": false
 }
