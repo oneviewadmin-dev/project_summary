@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.57",
-  "latest_version_code": 80,
+  "latest_version": "2.3.58",
+  "latest_version_code": 81,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "양식에 적은 칸이 화면에 다 뜹니다.\n\n· PO 수량이 바뀌면 ▲▼ 로 표시\n· 연간수량 칸 추가 (반도체 양식)\n· 전사 · 사업부 메뉴를 갈라 놨습니다",
+  "release_notes": "홈 숫자가 전 사업부 기준입니다.\n\n· 전체 현황 · 매출 카드 전사 합산\n· 프로젝트 목록을 한 줄로 폈습니다\n· 아리스타 개발은 양산과 같은 틀",
   "force_update": false
 }
