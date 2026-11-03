@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.63",
-  "latest_version_code": 86,
+  "latest_version": "2.3.64",
+  "latest_version_code": 87,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "사업부 카드와 잔·특근이 제 상태로 뜹니다.\n\n· 모델이 있으면 '진행 중' 으로 표시\n· 잔·특근이 최신 주차로 따라옵니다",
+  "release_notes": "ESS 프로젝트가 한 벌로 정리됐습니다.\n\n· 똑같은 SDI · 플루언스 · EPC POWER 중복 제거\n· 일 보고가 붙는 쪽만 남깁니다",
   "force_update": false
 }
