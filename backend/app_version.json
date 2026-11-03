@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.58",
-  "latest_version_code": 81,
+  "latest_version": "2.3.59",
+  "latest_version_code": 82,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "홈 숫자가 전 사업부 기준입니다.\n\n· 전체 현황 · 매출 카드 전사 합산\n· 프로젝트 목록을 한 줄로 폈습니다\n· 아리스타 개발은 양산과 같은 틀",
+  "release_notes": "개발 단계를 고객사 양식대로 보여줍니다.\n\n· 자동차 · 블룸 단계가 이제 뜹니다\n· 단계 차례는 양식에 적은 그대로",
   "force_update": false
 }
