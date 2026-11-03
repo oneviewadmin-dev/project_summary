@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.62",
-  "latest_version_code": 85,
+  "latest_version": "2.3.63",
+  "latest_version_code": 86,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "홈과 매출이 사업부별로 보입니다.\n\n· 전체 현황 목록이 121곳 → 사업부별로\n· 매출 상세도 사업부 목록 · 눌러서 상세\n· 줄을 누르면 그 사업부 화면으로",
+  "release_notes": "사업부 카드와 잔·특근이 제 상태로 뜹니다.\n\n· 모델이 있으면 '진행 중' 으로 표시\n· 잔·특근이 최신 주차로 따라옵니다",
   "force_update": false
 }
