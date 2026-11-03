@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.65",
-  "latest_version_code": 88,
+  "latest_version": "2.3.66",
+  "latest_version_code": 89,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "목록 카드가 홈과 같은 상태로 뜹니다.\n\n· 목록도 모델 있으면 '진행 중'\n· 자동차 수주 자료를 품목에 합침\n· 중복 Schaefller 프로젝트 제거",
+  "release_notes": "전체 현황 목록도 사업부로 묶여서 보입니다.\n\n· 정상 목록 125줄 → 사업부 7줄\n· 양식 고객사 이름 오타도 연결",
   "force_update": false
 }
