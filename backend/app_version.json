@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.61",
-  "latest_version_code": 84,
+  "latest_version": "2.3.62",
+  "latest_version_code": 85,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "개발 단계에 고객사별 소요기간이 붙습니다.\n\n· 매출 상세는 보는 범위대로 (전 사업부)\n· 자동차 소요는 고객사별 개월 수로\n· 유형 없는 품목의 빈 배지 제거",
+  "release_notes": "홈과 매출이 사업부별로 보입니다.\n\n· 전체 현황 목록이 121곳 → 사업부별로\n· 매출 상세도 사업부 목록 · 눌러서 상세\n· 줄을 누르면 그 사업부 화면으로",
   "force_update": false
 }
