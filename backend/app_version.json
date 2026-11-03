@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.59",
-  "latest_version_code": 82,
+  "latest_version": "2.3.61",
+  "latest_version_code": 84,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "개발 단계를 고객사 양식대로 보여줍니다.\n\n· 자동차 · 블룸 단계가 이제 뜹니다\n· 단계 차례는 양식에 적은 그대로",
+  "release_notes": "개발 단계에 고객사별 소요기간이 붙습니다.\n\n· 매출 상세는 보는 범위대로 (전 사업부)\n· 자동차 소요는 고객사별 개월 수로\n· 유형 없는 품목의 빈 배지 제거",
   "force_update": false
 }
