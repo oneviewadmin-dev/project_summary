@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.67",
-  "latest_version_code": 90,
+  "latest_version": "2.3.68",
+  "latest_version_code": 91,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "전체 현황 탭이 다섯 개로 줄었습니다.\n\n· 정상 · 일정 지연 · 집중관리\n· 특이사항 · PO 대기\n· 겹쳐 세던 '문제'·'전체' 제거",
+  "release_notes": "홈 사업부 카드가 목록과 같은 상태로 뜹니다.\n\n· 처음 열 때도 '진행 중' 이 바로 보임\n· 당겨서 새로고침해도 다시 셉니다",
   "force_update": false
 }
