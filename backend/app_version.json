@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.69",
-  "latest_version_code": 92,
+  "latest_version": "2.3.70",
+  "latest_version_code": 93,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "오프라인에서도 마지막으로 본 내용이 바로 뜹니다.\n\n· 전체 현황: 사업부를 누르면 프로젝트가 펼쳐짐\n· 고객사 국내/해외 · 큰 고객별 묶음 보기\n· 주차 보드 · 매출 달 선택, 계획/실적 색 구분",
+  "release_notes": "처음 여는 프로젝트도 오프라인에서 보입니다.\n\n· 온라인일 때 프로젝트 자료를 미리 받아 둠\n· 저장본이 없으면 알아보기 쉬운 안내로",
   "force_update": false
 }
