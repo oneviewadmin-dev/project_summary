@@ -84,9 +84,9 @@ class ExecRevenueCard extends StatelessWidget {
                     style: AppText.h2),
               ),
               const SizedBox(width: 5),
-              // 임시. 주간보고가 반도체사업부 것뿐이라 그렇다고 적어 둔다.
+              // 2026-11-02 부터 전 사업부 합계다 (/revenue?division=).
               Flexible(
-                child: Text('(반도체 기준)',
+                child: Text('(전 사업부)',
                     maxLines: 1, overflow: TextOverflow.ellipsis,
                     style: AppText.caption.copyWith(color: AppColors.textHint)),
               ),

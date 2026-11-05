@@ -1,19 +1,6 @@
-"""'Plan and Actual' 형태의 출하계획 엑셀에서 주차별 계획/실적을 읽는다.
-
-파워박스팀이 매주 쓰는 'PBX 9월 출하계획' 파일이 대상이다. 시트 구조는
-
-        (4행)          W36        W37        W38   ...   TOTAL
-        (5행)  No. Customer Model  Plan Actual Plan Actual ...
-        (6행~)  1  Lam  AETHER GDX 925-800083-394  40  41  50  0 ...
-        (합계행) Total                              49  52  77  0 ...
-
-열 위치를 고정하지 않는다. 'W##' 이 2개 이상 있는 행을 찾아 주차 머리글로 잡고,
-그 아래 행에서 Plan/Actual 짝을 찾는다. 시트 이름('..._Sep')도 믿지 않는다.
-주차 번호를 week_calendar 에 물어서 어느 달 자료인지 스스로 판단한다.
-
-TOTAL 열은 읽지 않는다. 실제 파일에서 이 열의 수식이 깨져
-계획 합계가 400 대신 333 으로 나오는 걸 확인했다. 합계는 주차 값을 더해서 만든다.
-"""
+# ============================================================
+#  'Plan and Actual' 형태의 출하계획 엑셀에서 주차별 계획/실적을 읽는다
+# ============================================================
 
 from __future__ import annotations
 
@@ -61,20 +48,15 @@ def _num(v):
         return None
 
 
+# 비교용 정규화 — 영숫자만 남기고 대문자로.
 def _norm(v):
-    """비교용 정규화 — 영숫자만 남기고 대문자로."""
     return re.sub(r"[^0-9A-Z]", "", _s(v).upper())
 
 
 # ────────────────────────────────────────────────────────── 시트 읽기
 
+# 'W##' 이 2개 이상 있는 행 → (행번호, {열: 주차번호})
 def _find_week_header(ws, max_scan=400):
-    """'W##' 이 2개 이상 있는 행 → (행번호, {열: 주차번호})
-
-    예전에는 위에서 30줄까지만 봤다. 하바플레이트 현황 파일은 주차표가
-    84행에 있어서 통째로 못 읽었다. 시트 끝까지 보되 가장 많이 걸리는
-    줄 하나만 고른다 — 같은 수면 위쪽을 쓴다(아래는 보통 합계·메모다).
-    """
     best = None
     for r in range(1, min(ws.max_row, max_scan) + 1):
         hits = {}
@@ -89,13 +71,8 @@ def _find_week_header(ws, max_scan=400):
     return best
 
 
+# 주차 머리글 아래 줄 → (행번호, {주차번호: (계획열, 실적열)}, {주차번호: 사유열})
 def _find_sub_header(ws, week_row, week_cols):
-    """주차 머리글 아래 줄 → (행번호, {주차번호: (계획열, 실적열)}, {주차번호: 사유열})
-
-    OneView 양식은 주차 한 칸이 '계획 · 실적 · 미달 사유' 세 칸이다.
-    계획을 못 채운 주에 왜 그런지 바로 옆에 적게 하려는 것이라, 숫자와
-    같이 읽어야 쓸모가 있다.
-    """
     for r in (week_row + 1, week_row):
         pairs, notes = {}, {}
         for c, n in sorted(week_cols.items()):
@@ -111,8 +88,16 @@ def _find_sub_header(ws, week_row, week_cols):
                 pairs[n] = (kind["plan"], kind.get("actual"))
         if len(pairs) >= 2:
             return r, pairs, notes
-    # Plan/Actual 글자가 없으면 '주차열 = 계획, 그 옆 = 실적' 으로 본다
-    pairs = {n: (c, c + 1) for c, n in week_cols.items()}
+    # -----------------------------------------------------------
+    # 마지막 수단: Plan/Actual 글자가 아예 없는 양식
+    # -----------------------------------------------------------
+    # 글자로 못 가렸으면 자리로 본다 — '주차 열이 계획, 바로 오른쪽이 실적'.
+    # 양식이 전부 그 모양이라 이 가정이 맞는다. 틀리면 계획과 실적이
+    # 뒤바뀌어 들어가므로, 글자로 찾는 위쪽 길이 먼저다.
+    pairs = {}
+    for plan_col, week_no in week_cols.items():
+        actual_col = plan_col + 1
+        pairs[week_no] = (plan_col, actual_col)
     return week_row + 1, pairs, {}
 
 
@@ -126,91 +111,147 @@ PN_WORDS = ("파트넘버", "파트번호", "품번", "part no.", "part no", "pa
 _HEAD_MARKS = "✎=＝*※·•-–— \t"
 
 
+# 머리글 글자 → 비교용 글자. 앞뒤의 표와 공백을 떼고 소문자로.
 def _head_key(v) -> str:
-    """머리글 글자 → 비교용 글자. 앞뒤의 표와 공백을 떼고 소문자로."""
     t = _s(v).strip().strip(_HEAD_MARKS).strip()
     return t.lower()
 
 
+# 모델 열을 머리글로 찾는다
 def _find_model_col(ws, sub_row, first_week_col):
-    """모델 열을 머리글로 찾는다.
+    # -----------------------------------------------------------
+    # 1. 머리글을 어느 줄에서 찾을 것인가
+    # -----------------------------------------------------------
+    # sub_row(계획/실적이 적힌 줄) 한 줄만 보면 안 된다
+    first_head_row = max(1, sub_row - 3)
+    rows = []
+    for r in range(first_head_row, sub_row + 1):
+        rows.append(r)
 
-    2026-10-21 — 머리글을 sub_row 한 줄만 보던 것을 위 세 줄까지 넓혔다.
-
-    양식의 왼쪽 머리글(파트넘버 · 모델명 · 유형 · 구분)은 2~4행을 세로로
-    합쳐 쓴다. 합친 칸은 맨 위(2행)에만 글자가 있고 4행은 비어 있다.
-    그래서 4행만 보면 머리글을 못 찾고, '글자가 제일 많은 열' 로 떨어졌다.
-    그 셈에 맨 아래 '합계' · '미달 사유' 줄까지 끼어서, 비어 있는 파트넘버
-    열이 뽑히고 모든 줄의 라벨이 빈 글자가 됐다 — 한 줄도 안 읽힌다.
-
-    머리글로 찾으면 열 자리가 어디든 상관없다. 사업부마다 다른 양식을
-    하나로 맞추는 동안에도 읽는 쪽은 안 흔들린다.
-    """
-    rows = [r for r in range(max(1, sub_row - 3), sub_row + 1)]
-
+    # words 에 들어 있는 머리글이 적힌 열 번호.
     def _hit(words):
         for c in range(1, first_week_col):
             for r in rows:
+                # 앞에 붙은 표(✎ · * 같은 것)와 공백을 떼고 소문자로
                 t = _head_key(ws.cell(r, c).value)
-                if t in words or t.replace(" ", "") in words:
+                if t in words:
+                    return c
+                # '파트 넘버' 처럼 사이에 띄어쓰기를 넣은 경우도 같이 본다
+                if t.replace(" ", "") in words:
                     return c
         return None
 
-    # 파트넘버가 먼저다 — 이 시스템에서 모델을 가르는 열쇠이기 때문이다.
-    # 다만 '값이 하나라도 있으면 그 열' 로 고르면 안 된다.
-    #
-    # 2026-10-22 — 챔버가 그랬다. 24종 중 파트넘버가 적힌 모델이 하나뿐인데
-    # 그 하나 때문에 파트넘버 열이 뽑혔고, 나머지 23줄은 라벨이 빈 글자라
-    # 통째로 버려졌다. 올려도 한 줄만 들어갔고 아무 말도 안 나왔다.
-    # 그래서 '어느 쪽이 더 많이 차 있나' 로 고른다. 같으면 파트넘버다.
-    pn = _hit(PN_WORDS)
-    nm = _hit(NAME_WORDS)
-    n_pn = _count_values(ws, sub_row, pn) if pn else 0
-    n_nm = _count_values(ws, sub_row, nm) if nm else 0
+    # 파트넘버가 먼저다 — 이 시스템에서 모델을 가르는 열쇠이기 때문이다
+    pn = _hit(PN_WORDS)      # 파트넘버 열 (없으면 None)
+    nm = _hit(NAME_WORDS)    # 모델명 열   (없으면 None)
+    # -----------------------------------------------------------
+    # 3. 각 열에 값이 실제로 몇 줄 들어 있는지 센다
+    # -----------------------------------------------------------
+    #    머리글이 있다고 값이 있는 건 아니다. 열은 있는데 칸이 다 비어
+    #    있으면 그 열을 골라 봐야 모든 줄의 라벨이 빈 글자가 된다.
+    n_pn = 0
+    if pn:
+        n_pn = _count_values(ws, sub_row, pn)
+    n_nm = 0
+    if nm:
+        n_nm = _count_values(ws, sub_row, nm)
+    # -----------------------------------------------------------
+    # 4. 더 많이 차 있는 열을 쓴다. 같으면 파트넘버
+    # -----------------------------------------------------------
+    #    파트넘버가 모델을 가르는 열쇠라 같은 수면 파트넘버를 쓴다.
     if n_pn or n_nm:
-        return pn if n_pn >= n_nm else nm
-    return pn or nm or _fallback_model_col(ws, sub_row, first_week_col)
+        if n_pn >= n_nm:
+            return pn
+        return nm
+    # -----------------------------------------------------------
+    # 5. 둘 다 비어 있으면
+    # -----------------------------------------------------------
+    #    머리글이라도 있는 열을 쓰고(파트넘버 우선), 그것도 없으면
+    #    '글자가 제일 많은 열' 로 떨어진다 (남의 양식용 마지막 수단).
+    if pn:
+        return pn
+    if nm:
+        return nm
+    return _fallback_model_col(ws, sub_row, first_week_col)
 
 
+# 그 열에 실제로 적힌 줄이 몇 줄인가.
 def _count_values(ws, sub_row, col):
-    """그 열에 실제로 적힌 줄이 몇 줄인가.
+    # -----------------------------------------------------------
+    # 1. 어디부터 어디까지 볼 것인가
+    # -----------------------------------------------------------
+    # 머리글 바로 아래 줄부터 본다. 끝은 둘 중 먼저 오는 쪽이다
+    first_row = sub_row + 1
+    last_row = min(ws.max_row, sub_row + 400)
 
-    세는 범위는 실제로 읽을 범위와 같아야 한다 — 읽기를 멈추는 자리에서
-    세기도 멈춘다. '합계' 글자는 그 열이 아니라 **왼쪽 어딘가**에 있을 수
-    있어서(양식은 1열에 있다), 줄 왼쪽을 통째로 보고 판단한다.
-
-    범위가 어긋나면 엉뚱한 열을 고른다. 세기만 아래로 더 내려가면 적는 칸
-    밑에 붙은 'PPT 붙이는 표' 까지 세어, 모델명 열이 두 배로 보였다.
-    """
-    n = 0
-    for r in range(sub_row + 1, min(ws.max_row, sub_row + 400) + 1):
-        line = " ".join(_s(ws.cell(r, c).value)
-                        for c in range(1, col + 1)).lower()
-        if any(w in line for w in STOP_WORDS):
+    n = 0                                   # 지금까지 센 줄 수
+    for r in range(first_row, last_row + 1):
+        # -----------------------------------------------------------
+        # 2. 이 줄의 왼쪽을 통째로 한 문장으로 잇는다
+        # -----------------------------------------------------------
+        #    1열부터 지금 보는 열까지의 칸을 모아 한 줄로 만든다.
+        #    '합계'가 이 열이 아니라 왼쪽 1열에 적혀 있을 수 있어서다.
+        #      예) 1열 '합계' · 2열 빈칸 · 3열 '120'  →  "합계  120"
+        left_cells = []
+        for c in range(1, col + 1):
+            left_cells.append(_s(ws.cell(r, c).value))
+        line = " ".join(left_cells).lower()
+        # -----------------------------------------------------------
+        # 3. 표가 끝나는 줄인가
+        # -----------------------------------------------------------
+        #    STOP_WORDS('합계' · '소계' 같은 말)가 하나라도 보이면
+        #    표가 거기서 끝난 것으로 보고 멈춘다.
+        hit_stop = False
+        for word in STOP_WORDS:
+            if word in line:
+                hit_stop = True
+                break
+        if hit_stop:
             break
+        # -----------------------------------------------------------
+        # 4. 이 줄의 그 칸에 진짜 값이 있는가
+        # -----------------------------------------------------------
         v = _s(ws.cell(r, col).value)
-        if v and not _is_example(v):
-            n += 1
+        if not v:
+            continue              # 빈 칸 — 안 센다
+        if _is_example(v):
+            continue              # '(예시)' 로 적힌 줄 — 안 센다
+        n += 1                    # 여기까지 왔으면 진짜 값이다
+
     return n
 
 
+# 머리글이 아예 없는 남의 파일용 — 글자가 제일 많은 열.
 def _fallback_model_col(ws, sub_row, first_week_col):
-    """머리글이 아예 없는 남의 파일용 — 글자가 제일 많은 열."""
-    best, best_n = None, 0
+    # 머리글로 못 찾았을 때만 여기 온다. 왼쪽 열들을 하나씩 보면서
+    # '숫자가 아닌 글자'가 가장 많이 들어 있는 열을 모델 열로 본다.
+    # 모델명·파트넘버는 글자이고, 수량·단가는 숫자이기 때문이다.
+    best = None       # 지금까지 가장 좋은 열
+    best_n = 0        # 그 열에 들어 있던 글자 칸 수
+
     for c in range(1, first_week_col):
-        n = sum(1 for r in range(sub_row + 1, min(ws.max_row, sub_row + 40) + 1)
-                if _s(ws.cell(r, c).value) and _num(ws.cell(r, c).value) is None)
+        # -----------------------------------------------------------
+        # 이 열에 글자 칸이 몇 개인가 (머리글 아래 40줄만 본다)
+        # -----------------------------------------------------------
+        last_row = min(ws.max_row, sub_row + 40)
+        n = 0
+        for r in range(sub_row + 1, last_row + 1):
+            cell = ws.cell(r, c).value
+            if not _s(cell):
+                continue              # 빈 칸
+            if _num(cell) is not None:
+                continue              # 숫자 칸 — 모델명이 아니다
+            n += 1
+
         if n > best_n:
-            best, best_n = c, n
+            best = c
+            best_n = n
+
     return best
 
 
+# 시트 하나 → {'month','weeks',[rows]} 또는 None.
 def parse_sheet(ws, month=None):
-    """시트 하나 → {'month','weeks',[rows]} 또는 None.
-
-    month 를 주면 그 달 주차만 읽는다. 한 표가 9월(W40)과 10월(W41~44)에
-    걸쳐 있을 때 한 달이 버려지지 않게 하려는 것이다.
-    """
     hdr = _find_week_header(ws)
     if not hdr:
         return None
@@ -221,18 +262,40 @@ def parse_sheet(ws, month=None):
     model_col = _find_model_col(ws, sub_row, min(week_cols))
     if not model_col:
         return None
-
-    # 달을 지정해 부르면 그대로 쓴다 (한 표가 두 달에 걸친 경우)
+    # -----------------------------------------------------------
+    # 달을 지정해 부른 경우 (한 표가 두 달에 걸쳐 있을 때)
+    # -----------------------------------------------------------
+    # 예) 한 시트에 W40(9월)과 W41~W44(10월)가 같이 있다. 10월을 달라고
+    #     부르면 W41~W44 만 떼어 읽는다. 안 그러면 9월이 통째로 버려진다.
     if month:
+        # -----------------------------------------------------------
+        # 1. 그 달이 가진 주차 목록 (예: 10월 → W41 W42 W43 W44)
+        # -----------------------------------------------------------
         try:
             own_m = set(_wcal.get_month_weeks(month))
         except Exception:
             own_m = set()
-        if not own_m or not any(f"W{n:02d}" in own_m for n in pairs):
-            return None
-        return _rows_of(ws, sub_row, model_col, month,
-                        {n: v for n, v in pairs.items()
-                         if f"W{n:02d}" in own_m}, notes)
+        if not own_m:
+            return None              # 달력을 못 읽었다
+        # -----------------------------------------------------------
+        # 2. 이 표에 그 달 주차가 하나라도 있는가
+        # -----------------------------------------------------------
+        has_any = False
+        for n in pairs:
+            if f"W{n:02d}" in own_m:
+                has_any = True
+                break
+        if not has_any:
+            return None              # 이 시트는 그 달과 무관하다
+        # -----------------------------------------------------------
+        # 3. 그 달 주차만 남긴다
+        # -----------------------------------------------------------
+        only_this_month = {}
+        for n, v in pairs.items():
+            if f"W{n:02d}" in own_m:
+                only_this_month[n] = v
+
+        return _rows_of(ws, sub_row, model_col, month, only_this_month, notes)
 
     # 이 시트가 어느 달 자료인가.
     #
@@ -249,8 +312,13 @@ def parse_sheet(ws, month=None):
             own_c = set(_wcal.get_month_weeks(cand))
         except Exception:
             own_c = set()
-        if own_c and any(f"W{n:02d}" in own_c for n in pairs):
-            month = cand
+        # 이름이 말하는 달이 실제로 이 표의 주차를 갖고 있는지 맞춰 본다.
+        # 이름만 믿으면, 이름이 틀린 파일에서 엉뚱한 달로 들어간다.
+        if own_c:
+            for n in pairs:
+                if f"W{n:02d}" in own_c:
+                    month = cand
+                    break
     if not month:
         votes = collections.Counter()
         for n in pairs:
@@ -260,36 +328,72 @@ def parse_sheet(ws, month=None):
         if not votes:
             return None
         month = votes.most_common(1)[0][0]
+    # -----------------------------------------------------------
     # 그 달이 실제로 가진 주차만 남긴다
+    # -----------------------------------------------------------
+    #    투표로 정한 달이라도, 표에는 옆 달 주차가 섞여 있을 수 있다.
+    #    남겨 두면 10월 자료에 9월 숫자가 섞여 들어간다.
     own = set(_wcal.get_month_weeks(month))
-    pairs = {n: v for n, v in pairs.items() if f"W{n:02d}" in own}
+    kept = {}
+    for n, v in pairs.items():
+        if f"W{n:02d}" in own:
+            kept[n] = v
+    pairs = kept
     if not pairs:
         return None
     return _rows_of(ws, sub_row, model_col, month, pairs, notes)
 
 
-# ==========================================
+# ============================================================
 #  예시 줄인가 — 빈 양식에 얹어 둔 본보기
-# ==========================================
+# ============================================================
 def _is_example(label) -> bool:
     t = str(label or "").strip()
-    return any(t.startswith(m) or m in t for m in EXAMPLE_MARKS)
+
+    # EXAMPLE_MARKS = ('(예시)', '[예시]', '↑ 여기까지 예시' …)
+    # 표가 맨 앞에 붙기도 하고(= '(예시) 챔버'), 중간에 들어가기도 한다
+    # (= '챔버 (예시)'). 두 경우를 다 본다.
+    for mark in EXAMPLE_MARKS:
+        if t.startswith(mark):
+            return True
+        if mark in t:
+            return True
+    return False
 
 
+# 머리글을 다 찾은 뒤 실제 줄을 읽는다
 def _rows_of(ws, sub_row, model_col, month, pairs, notes=None):
-    """머리글을 다 찾은 뒤 실제 줄을 읽는다."""
     notes = notes or {}
     rows = []
     for r in range(sub_row + 1, ws.max_row + 1):
+        # -----------------------------------------------------------
+        # 1. 이 줄의 라벨 (모델명 또는 파트넘버)
+        # -----------------------------------------------------------
+        #    칸 안에서 줄바꿈한 경우가 있어 공백으로 바꿔 한 줄로 만든다
         label = _s(ws.cell(r, model_col).value).replace("\n", " ").strip()
-        # 라벨 칸이 비어도 왼쪽 어딘가에 합계 글자가 있으면 거기서 끊는다
-        line = " ".join(_s(ws.cell(r, c).value) for c in range(1, model_col + 1)).lower()
-        if any(w in line for w in STOP_WORDS):
+        # -----------------------------------------------------------
+        # 2. 표가 끝났는지 먼저 본다
+        # -----------------------------------------------------------
+        #    라벨 칸이 비어 있어도 왼쪽 어딘가에 '합계'가 있으면 거기서
+        #    표가 끝난 것이다. 양식은 '합계'를 1열에 적는다.
+        left_cells = []
+        for c in range(1, model_col + 1):
+            left_cells.append(_s(ws.cell(r, c).value))
+        line = " ".join(left_cells).lower()
+        hit_stop = False
+        for word in STOP_WORDS:
+            if word in line:
+                hit_stop = True
+                break
+        if hit_stop:
             break
+        # -----------------------------------------------------------
+        # 3. 읽을 줄이 아닌 경우는 건너뛴다
+        # -----------------------------------------------------------
         if not label:
-            continue
+            continue              # 라벨이 없는 빈 줄
         if _is_example(label):
-            continue
+            continue              # 양식에 얹어 둔 예시 줄
         weeks, any_val = {}, False
         for n, (pc, ac) in sorted(pairs.items()):
             p = _num(ws.cell(r, pc).value)
@@ -310,9 +414,9 @@ def _rows_of(ws, sub_row, model_col, month, pairs, notes=None):
     }
 
 
-# ==========================================
+# ============================================================
 #  프로젝트 현황 — 프로젝트째 멈췄는가
-# ==========================================
+# ============================================================
 PROJ_LABEL = "프로젝트 현황"
 #: 양식에서 고르는 말 → 서버가 쓰는 말.
 #: 2026-10-22 — 고르는 말을 '진행 중 · 보류 중 · 드롭 예정' 으로 바꿨다.
@@ -325,17 +429,8 @@ PROJ_STATE_OUT = {
 PROJ_STATES = tuple(PROJ_STATE_OUT)
 
 
+# 양식 아래의 '프로젝트 현황' 두 줄 → {'hold','note'} 또는 None.
 def read_project_status(ws):
-    """양식 아래의 '프로젝트 현황' 두 줄 → {'hold','note'} 또는 None.
-
-    모델 줄의 비고와 **다른 칸**이다. 비고는 그 모델 하나만 멈춘 것이고
-    여기는 프로젝트 전체가 멈춘 것이다. 둘을 섞으면 모델 하나 드롭이
-    프로젝트 전체 드롭으로 읽힌다.
-
-    읽는 자리는 '합계' 아래라 주차 숫자를 읽는 데는 끼어들지 않는다.
-    이름표를 찾아 바로 다음 줄을 본다 — 줄 번호를 박아 두면 위쪽 적는
-    줄 수가 바뀔 때마다 어긋난다.
-    """
     for r in range(1, min(ws.max_row, 1000) + 1):
         if _s(ws.cell(r, 1).value) != PROJ_LABEL:
             continue
@@ -354,34 +449,43 @@ def read_project_status(ws):
     return None
 
 
+# '미달 사유' 줄 → {'W41': '자재 지연', ...}
 def _week_notes(ws, sub_row, model_col, pairs):
-    """'미달 사유' 줄 → {'W41': '자재 지연', ...}
-
-    사유는 모델 한 줄씩이 아니라 **그 주 합계**에 붙는다. 양식에서는
-    모델 목록이 '합계' 줄에서 끝나고, 그 아래 '미달 사유' 줄에 주차마다
-    한 칸씩 있다. 화면의 '계획 미달 — 왜 못 채웠는지' 와 같은 단위다.
-    """
     out = {}
-    wide = max(model_col, 4)          # 라벨이 왼쪽 어느 칸에 있어도 잡는다
+
+    # 라벨('미달 사유')이 1열에 있을 수도, 2~4열에 있을 수도 있다.
+    # 그래서 왼쪽 네 칸까지는 무조건 같이 본다.
+    wide = max(model_col, 4)
+
     for r in range(sub_row + 1, ws.max_row + 1):
-        head = "".join(_s(ws.cell(r, c).value) for c in range(1, wide + 1))
-        if re.sub(r"\s+", "", head).lower() not in NOTE_WORDS:
+        # -----------------------------------------------------------
+        # 1. 이 줄이 '미달 사유' 줄인가
+        # -----------------------------------------------------------
+        # 왼쪽 칸들을 붙여 한 덩어리로 만들고, 공백을 전부 떼고 NOTE_WORDS('미달사유' · '사유' · '비고' …)와 맞춰 본다
+        head_cells = []
+        for c in range(1, wide + 1):
+            head_cells.append(_s(ws.cell(r, c).value))
+        head = "".join(head_cells)
+        head_key = re.sub(r"\s+", "", head).lower()
+        if head_key not in NOTE_WORDS:
             continue
+        # -----------------------------------------------------------
+        # 2. 찾았으면 주차마다 그 칸의 글을 가져온다
+        # -----------------------------------------------------------
+        #    사유는 계획 칸(pc) 자리에 적는다 — 실적 칸은 비워 둔다.
         for n, (pc, _ac) in pairs.items():
             txt = _s(ws.cell(r, pc).value).replace("\n", " ").strip()
             if txt:
                 out[f"W{n:02d}"] = txt
+
+        # 사유 줄은 하나뿐이다. 찾았으면 더 내려갈 이유가 없다.
         break
+
     return out
 
 
+# 시트 하나가 걸친 달을 **전부** → [parsed, ...] (이른 달부터).
 def parse_sheet_all(ws):
-    """시트 하나가 걸친 달을 **전부** → [parsed, ...] (이른 달부터).
-
-    하바 현황 파일의 주차표는 W40~W44 다. 달력으로는 W40 이 9월,
-    W41~W44 가 10월이라 한 표가 두 달에 걸친다. 대표 달 하나만 보면
-    9월이 통째로 사라진다.
-    """
     hdr = _find_week_header(ws)
     if not hdr:
         return []
@@ -402,21 +506,8 @@ def parse_sheet_all(ws):
     return out
 
 
+# 한 시트가 한 해를 통째로 담고 있으면 그 달들 → ['2026-01', ...]
 def sheet_months_of(ws):
-    """한 시트가 한 해를 통째로 담고 있으면 그 달들 → ['2026-01', ...]
-
-    아니면 빈 목록. 그러면 예전처럼 시트 하나를 달 하나로 읽는다.
-
-    작성용 양식(plan_form)이 한 장에 열두 달을 넣는다. 적는 달만 펼쳐져
-    있고 나머지는 접혀 있지만, 접힌 건 숨긴 것뿐이라 펴서 적을 수 있다.
-    펴서 적은 달이 안 읽히면 적을 수 있게 생겼는데 안 먹는 칸이 된다.
-
-    남의 파일을 잘못 건드리지 않으려고 조건을 좁게 잡는다 —
-      · 시트 이름이 'YYYY-MM' 이어야 한다 (OneView 가 내려준 양식)
-      · 그 달이 안 가진 주차를 들고 있어야 한다
-    둘 다 맞을 때만 한 해로 본다. 파워박스 파일처럼 한 표가 두 달에
-    걸치는 건 지금 하던 대로 parse_sheet 가 알아서 한다.
-    """
     hdr = _find_week_header(ws)
     if not hdr:
         return []
@@ -430,14 +521,26 @@ def sheet_months_of(ws):
     year, mm = int(m.group(1)), int(m.group(2))
     if not (1 <= mm <= 12):
         return []
+    # ── 1. 시트 이름이 말하는 달이 가진 주차
     own = set(_wcal.get_month_weeks("%04d-%02d" % (year, mm)) or [])
-    have = {f"W{n:02d}" for n in pairs}
+
+    # ── 2. 이 표에 실제로 들어 있는 주차
+    have = set()
+    for n in pairs:
+        have.add(f"W{n:02d}")
+
+    # ── 3. 표의 주차가 전부 그 달 안에 있으면 볼 것 없다
+    #    (have <= own 은 '표의 주차가 그 달 주차에 모두 들어간다'는 뜻)
     if not own or have <= own:
-        return []                      # 그 달 것만 있다 — 예전 그대로
+        return []
+
+    # ── 4. 걸쳐 있다 — 그 해 열두 달 중 이 표와 겹치는 달을 모은다
+    #    예) 표에 W40·W41~44 가 있으면 9월과 10월 둘 다 나온다
     out = []
     for i in range(1, 13):
         ym = "%04d-%02d" % (year, i)
-        if set(_wcal.get_month_weeks(ym) or []) & have:
+        weeks_of_month = set(_wcal.get_month_weeks(ym) or [])
+        if weeks_of_month & have:      # 겹치는 주차가 하나라도 있으면
             out.append(ym)
     return out
 
@@ -448,8 +551,8 @@ def sheet_months_of(ws):
 REPORT_SHEETS = ("PPT 붙이기", "PPT 붙이는 표", "작성 안내")
 
 
+# 보기 · 복사용 장인가 — 적는 장이 아니다
 def _is_report_sheet(ws) -> bool:
-    """보기 · 복사용 장인가 — 적는 장이 아니다."""
     t = str(getattr(ws, "title", "") or "").strip()
     if t in REPORT_SHEETS:
         return True
@@ -461,8 +564,8 @@ def _is_report_sheet(ws) -> bool:
     return "PPT 붙이는 표" in head
 
 
+# 시트 하나에서 읽어 낸 달들 → [parsed, ...]
 def _sheet_parts(ws):
-    """시트 하나에서 읽어 낸 달들 → [parsed, ...]"""
     if _is_report_sheet(ws):
         return []
     out = []
@@ -482,31 +585,37 @@ def _sheet_parts(ws):
     return [got] if (got and got["rows"]) else []
 
 
+# 워크북에서 쓸 만한 시트를 모두 읽어 월별로 돌려준다
 def parse(wb, month=None):
-    """워크북에서 쓸 만한 시트를 모두 읽어 월별로 돌려준다.
-
-    month 를 주면 그 달 시트만, 없으면 가장 최근 달 시트를 고른다.
-    """
     found = []
     for ws in wb.worksheets:
         found.extend(_sheet_parts(ws))
     if not found:
         return None
     if month:
-        # 하바처럼 주차별 스냅샷이 34장 들어 있으면 같은 달 시트가 여럿이다.
-        # 순서대로 첫 번째를 집으면 가장 **오래된** 스냅샷을 쓰게 된다.
-        # 줄이 많은 쪽, 같으면 뒤쪽(최신) 시트를 쓴다.
-        cands = [(i, g) for i, g in enumerate(found) if g["month"] == month]
+        # 하바처럼 주차별 스냅샷이 34장 들어 있으면 같은 달 시트가 여럿이다
+        cands = []
+        for i, g in enumerate(found):
+            if g["month"] == month:
+                cands.append((i, g))
         if not cands:
             return None
+
+        # ── 2. 줄이 많은 쪽, 같으면 뒤쪽(최신) 시트를 쓴다
+        #    key 의 (줄 수, 시트 순서) 로 오름차순 정렬하고 맨 뒤를 집는다.
+        #    줄이 많은 시트가 더 채워진 스냅샷이고, 줄 수가 같으면 나중에
+        #    만든 시트가 최신이다.
         cands.sort(key=lambda x: (len(x[1]["rows"]), x[0]))
-        return cands[-1][1]
+        newest = cands[-1]
+        return newest[1]
+
+    # ── 달을 안 정했으면: 달이 늦은 쪽, 같으면 줄이 많은 쪽
     found.sort(key=lambda g: (g["month"], len(g["rows"])))
     return found[-1]
 
 
+# 어떤 달 자료가 들어 있는지만 훑는다
 def sheet_months(wb):
-    """어떤 달 자료가 들어 있는지만 훑는다."""
     out = []
     for ws in wb.worksheets:
         for got in _sheet_parts(ws):
@@ -517,13 +626,8 @@ def sheet_months(wb):
 
 # ────────────────────────────────────────────────────────── 모델 맞추기
 
+# 등록된 모델과 엑셀 라벨을 맞춘다
 class Matcher:
-    """등록된 모델과 엑셀 라벨을 맞춘다.
-
-    엑셀 라벨은 'AETHER GDX 925-800083-394' 처럼 이름과 품번이 섞여 있고,
-    등록 쪽도 'KIYO GX 575-B68653-XXXX' 처럼 품번 칸에 이름이 들어간 게 있다.
-    그래서 양쪽 모두에서 품번처럼 생긴 토막을 뽑아 색인을 만든다.
-    """
 
     def __init__(self, models):
         self.by_id = {}
@@ -536,15 +640,31 @@ class Matcher:
             raw_pn = _s(m.get("part_number"))
             # 별칭 — 같은 물건을 거래처마다 다른 품번으로 부른다.
             # 복사본 엑셀의 853-800575-009 가 우리 714-025898-009 다.
-            alts = [_s(a) for a in (m.get("aliases") or []) if _s(a)]
+            alts = []
+            for a in (m.get("aliases") or []):
+                a = _s(a)
+                if a:
+                    alts.append(a)
 
+            # ── 이 모델을 가리킬 수 있는 글자를 전부 모아 한 덩어리로
+            #    색인을 넓게 깔아 두는 이유: 엑셀마다 같은 물건을 다르게
+            #    적는다. 이름으로 적기도 하고 품번으로 적기도 한다.
             blob = " ".join([raw_id, raw_name, raw_pn] + alts)
+
+            # ── 1. 통째로 쓰는 열쇠 (id · 파트넘버 · 별칭)
             for one in [raw_id, raw_pn] + alts:
                 self._add_id(_norm(one), m)
+
+            # ── 2. 글자 덩어리 안에서 '품번처럼 생긴 토막'을 뽑아 열쇠로
+            #    예) 'AETHER GDX 925-800083-394' → '925-800083-394'
             for pn in PN_RE.findall(blob):
                 self._add_id(_norm(pn), m)
+
+            # ── 3. 6~9자리 숫자도 열쇠로 (하이픈 없이 적는 엑셀이 있다)
             for d in re.findall(r"\b\d{6,9}\b", blob):
                 self._add_id(_norm(d), m)
+
+            # ── 4. 모델명은 따로 모아 둔다 (품번이 안 맞을 때 쓰는 길)
             n = _norm(raw_name)
             if n:
                 self.by_name[n].append(m)
@@ -565,31 +685,75 @@ class Matcher:
         for p, m in self.prefix:
             if key.startswith(p):
                 return m, "품번(계열)"
+        # -----------------------------------------------------------
+        # 3. X 자리를 아무 글자로 쳐 주고 맞춰 본다
+        # -----------------------------------------------------------
+        #    계열 품번을 'KIYO GX 575-B68653-XXXX' 처럼 끝을 X 로 적어 두는
+        #    경우가 있다. 그 X 자리는 무엇이 와도 같은 물건으로 본다.
+        #    글자 수가 같아야 자리끼리 맞출 수 있으니 길이부터 본다.
         for rk, m in self.by_id.items():
-            if len(key) == len(rk) and all(a == b or a == "X" or b == "X"
-                                           for a, b in zip(key, rk)):
+            if len(key) != len(rk):
+                continue
+            same = True
+            for a, b in zip(key, rk):
+                if a == b:
+                    continue          # 같은 글자
+                if a == "X" or b == "X":
+                    continue          # 한쪽이 X — 아무 글자나 된다
+                same = False
+                break
+            if same:
                 return m, "품번(X)"
+
         return None, None
 
+    # → (모델, 어떻게 찾았는지) · 못 찾으면 (None, 사유)
     def match(self, text, group=None):
-        """→ (모델, 어떻게 찾았는지) · 못 찾으면 (None, 사유)"""
         t = _s(text).replace("\n", " ")
         if not t:
             return None, "빈칸"
+        # -----------------------------------------------------------
+        # 1. 품번으로 먼저 찾는다
+        # -----------------------------------------------------------
+        #    라벨 안에 품번처럼 생긴 토막이 있으면 그걸로 맞춰 본다.
+        #    품번이 이름보다 믿을 만하다 — 이름은 같은 게 여럿 있다.
         for pn in PN_RE.findall(t):
             m, how = self._by_id(_norm(pn))
             if m:
                 return m, how
-        rest = PN_RE.sub(" ", t)
-        rest = re.sub(r"[()/\-]", " ", rest)
-        rest = re.sub(r"\b\d+\b", " ", rest)
+        # -----------------------------------------------------------
+        # 2. 품번으로 못 찾았으면 이름으로
+        # -----------------------------------------------------------
+        #    라벨에서 품번·괄호·하이픈·숫자를 지워 '이름만' 남긴다.
+        #      예) 'AETHER GDX 925-800083-394 (2차)' → 'AETHER GDX'
+        rest = PN_RE.sub(" ", t)              # 품번 토막 제거
+        rest = re.sub(r"[()/\-]", " ", rest)  # 괄호 · 빗금 · 하이픈 제거
+        rest = re.sub(r"\b\d+\b", " ", rest) # 남은 숫자 제거
         cands = self.by_name.get(_norm(rest), [])
+        # -----------------------------------------------------------
+        # 3. 이름이 같은 모델이 여럿이면 같은 구분(양산/개발)으로 좁힌다
+        # -----------------------------------------------------------
+        #    좁혔는데 하나도 안 남으면 좁히기 전 목록을 그대로 쓴다.
+        #    구분이 안 적힌 모델까지 버리면 멀쩡한 줄을 놓친다.
         if group:
-            cands = [c for c in cands if c.get("group") == group] or cands
+            same_group = []
+            for c in cands:
+                if c.get("group") == group:
+                    same_group.append(c)
+            if same_group:
+                cands = same_group
+        # -----------------------------------------------------------
+        # 4. 결과 판정
+        # -----------------------------------------------------------
         if len(cands) == 1:
             return cands[0], "이름"
         if len(cands) > 1:
+            # 둘 이상이면 고르지 않는다. 엉뚱한 모델에 숫자를 넣는 것보다
+            # '못 찾았다' 고 말하고 사람이 보게 하는 편이 낫다.
             return None, f"이름 중복 {len(cands)}종"
+        # -----------------------------------------------------------
+        # 5. 마지막으로 라벨 전체를 열쇠로 한 번 더
+        # -----------------------------------------------------------
         m, how = self._by_id(_norm(t))
         if m:
             return m, how

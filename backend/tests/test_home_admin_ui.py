@@ -10,12 +10,28 @@ SRC = (ROOT / 'admin_v2.html').read_text(encoding='utf-8')
 ok = 0
 
 # ── 사이드바가 전사 / 사업부로 갈렸는지 ──
-nav = SRC[SRC.index('<div class="nav-title">전사</div>'):SRC.index('<div class="spacer">')]
-assert nav.index('data-page="homeadmin"') < nav.index('<div class="nav-title">사업부</div>'), \
-    '홈 관리가 전사 묶음에 없다'
+# 2026-10-26 — 묶음 이름에 설명을 붙이고(전사 · 회사 전체) 사업부를
+# 상자(.biz-box)로 가뒀다. 글자가 아니라 **차례**를 본다.
+import re as _re
+def _at(pat):
+    m = _re.search(pat, nav)
+    assert m, '사이드바에서 %r 를 못 찾았다' % pat
+    return m.start()
+
+nav = SRC[SRC.index('<div class="nav-title">전사'):SRC.index('<div class="spacer">')]
+_biz = _at(r'<div class="nav-title">사업부')
+assert _at(r'data-page="homeadmin"') < _biz, '홈 관리가 전사 묶음에 없다'
 for pg in ('models', 'revenue'):
-    assert nav.index('data-page="%s"' % pg) > nav.index('<div class="nav-title">사업부</div>'), \
-        f'{pg} 가 사업부 묶음에 없다'
+    assert _at(r'data-page="%s"' % pg) > _biz, '%s 가 사업부 묶음에 없다' % pg
+# 전사와 사업부 사이를 선으로 끊고, 사업부는 상자 안에 둔다 —
+# 안 그러면 잔·특근 · 백업까지 그 사업부 것처럼 읽힌다
+assert _at(r'class="nav-sep"') < _biz, '전사와 사업부 사이에 끊는 선이 없다'
+assert 'class="biz-box"' in nav, '사업부 묶음이 상자 안에 없다'
+_box = _at(r'class="biz-box"')
+for pg in ('home', 'models', 'revenue', 'purchase'):
+    assert _at(r'data-page="%s"' % pg) > _box, '%s 가 사업부 상자 밖에 있다' % pg
+for pg in ('homeadmin', 'overtime', 'backup'):
+    assert _at(r'data-page="%s"' % pg) < _box, '%s(전사)가 사업부 상자 안에 들어갔다' % pg
 ok += 1
 
 # ── 라우팅 · 이름표 ──

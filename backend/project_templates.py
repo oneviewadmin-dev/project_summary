@@ -11,12 +11,8 @@ from pathlib import Path
 
 import re as _re_section_title
 
+# N2 정규화: 앞부분의 번호 prefix만 제거.
 def _normalize_section_title(title) -> str:
-    """
-    N2 정규화: 앞부분의 번호 prefix만 제거.
-    예) "2-1. 내재화 프레임 진행현황(화성 17종)" -> "내재화 프레임 진행현황(화성 17종)"
-        "5. 직납프레임 TREOS"                  -> "직납프레임 TREOS"
-    """
     if not isinstance(title, str):
         return ""
     t = title.strip()
@@ -25,16 +21,8 @@ def _normalize_section_title(title) -> str:
     return t.strip()
 
 
+# 하이브리드 매칭(C):
 def _canonical_section_match_key(title, existing_keys):
-    """
-    하이브리드 매칭(C):
-    - 기본 키는 _normalize_section_title 결과 (lowercase)
-    - 단, 그 키가 기존에 채택된 어떤 키와 'prefix 포함 관계' 이면 그 키로 합침
-      예) 기존 '내재화 프레임 진행현황(화성 17종)' 가 채택돼 있으면
-          새로 들어온 '내재화 프레임 진행현황' 은 같은 카드로 봄
-    - prefix 비교는 양방향: 더 긴 쪽이 더 짧은 쪽을 prefix 로 가지면 같은 카드
-    - 단, prefix 뒤가 (한글/영문/숫자) 글자로 바로 이어지면 안 됨 → 공백/괄호/구분자만 허용
-    """
     base = _normalize_section_title(title).lower()
     if not base:
         return base
@@ -50,7 +38,6 @@ def _canonical_section_match_key(title, existing_keys):
             if rest[:1] in (" ", "(", "[", "{", "-", "_", ".", ",", ":", "/"):
                 return k
     return base
-
 
 
 BASE_DIR = Path(__file__).parent
@@ -95,8 +82,8 @@ _CHOSUNG = ['ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ'
 _JUNGSUNG = ['ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ', 'ㅙ', 'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ']
 _JONGSUNG = ['', 'ㄱ', 'ㄲ', 'ㄳ', 'ㄴ', 'ㄵ', 'ㄶ', 'ㄷ', 'ㄹ', 'ㄺ', 'ㄻ', 'ㄼ', 'ㄽ', 'ㄾ', 'ㄿ', 'ㅀ', 'ㅁ', 'ㅂ', 'ㅄ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ']
 
+# 한글 문자를 초성/중성/종성으로 분리
 def _decompose_hangul(char: str) -> tuple:
-    """한글 문자를 초성/중성/종성으로 분리"""
     if '가' <= char <= '힣':
         code = ord(char) - 0xAC00
         jong = code % 28
@@ -105,8 +92,8 @@ def _decompose_hangul(char: str) -> tuple:
         return (_CHOSUNG[cho], _JUNGSUNG[jung], _JONGSUNG[jong])
     return (char, '', '')
 
+# 텍스트의 발음 키 생성 (초성+중성만, 종성 생략)
 def _get_phonetic_key(text: str) -> str:
-    """텍스트의 발음 키 생성 (초성+중성만, 종성 생략)"""
     result = []
     for char in text:
         if '가' <= char <= '힣':
@@ -116,8 +103,8 @@ def _get_phonetic_key(text: str) -> str:
             result.append(char.lower())
     return ''.join(result)
 
+# 두 한국어 텍스트의 발음 유사도 (0.0 ~ 1.0)
 def _phonetic_similarity(a: str, b: str) -> float:
-    """두 한국어 텍스트의 발음 유사도 (0.0 ~ 1.0)"""
     if not a or not b:
         return 0.0
     
@@ -141,8 +128,8 @@ def _phonetic_similarity(a: str, b: str) -> float:
         return 0.0
     return 1.0 - (distance / max_len)
 
+# 레벤슈타인 거리 계산
 def _levenshtein(a: str, b: str) -> int:
-    """레벤슈타인 거리 계산"""
     if len(a) < len(b):
         return _levenshtein(b, a)
     if len(b) == 0:
@@ -160,8 +147,8 @@ def _levenshtein(a: str, b: str) -> int:
     
     return previous_row[-1]
 
+# 프로젝트의 모든 별칭/발음 변형 반환
 def _get_project_aliases(project_key: str) -> list[str]:
-    """프로젝트의 모든 별칭/발음 변형 반환"""
     aliases = []
     
     # 기본 키워드
@@ -197,23 +184,25 @@ def _get_project_aliases(project_key: str) -> list[str]:
     
     return list(set(aliases))
 
+# 프로젝트 키 매칭 (발음 유사도 기반 퍼지 매칭)
 def _match_project_key(product_name: str) -> Optional[str]:
-    """프로젝트 키 매칭 (발음 유사도 기반 퍼지 매칭)"""
     if not product_name:
         return None
     
     name = product_name.strip()
     best_match = None
     best_score = 0.0
-    
-    # 1. 정확한 키워드 매칭 (기존 로직)
+    # -----------------------------------------------------------
+    # 정확한 키워드 매칭 (기존 로직)
+    # -----------------------------------------------------------
     name_lower = name.lower()
     for keywords, key in PRODUCT_TO_PROJECT:
         for kw in keywords:
             if kw.lower() in name_lower:
                 return key
-    
-    # 2. 발음 유사도 매칭 (퍼지)
+    # -----------------------------------------------------------
+    # 발음 유사도 매칭 (퍼지)
+    # -----------------------------------------------------------
     for keywords, key in PRODUCT_TO_PROJECT:
         all_aliases = _get_project_aliases(key)
         for alias in all_aliases:
@@ -248,8 +237,8 @@ _STOP_WORDS = {"및", "의", "에", "을", "를", "은", "는", "이", "가", "�
                "현황", "상황", "내용", "관련", "기타", "에서", "에는", "에도"}
 
 
+# 섹션 제목에서 의미 있는 키워드만 뽑기 (한글 2자 이상, 영문 3자 이상)
 def _extract_keywords(title: str) -> set[str]:
-    """섹션 제목에서 의미 있는 키워드만 뽑기 (한글 2자 이상, 영문 3자 이상)"""
     if not title:
         return set()
     # 한글 단어 / 영문 단어 분리
@@ -257,13 +246,8 @@ def _extract_keywords(title: str) -> set[str]:
     return {t for t in tokens if t not in _STOP_WORDS}
 
 
+# 업로드 섹션명과 GPT 섹션명의 매칭 점수 (0.0 ~ 1.0)
 def _section_match_score(upload_title: str, gpt_title: str) -> float:
-    """
-    업로드 섹션명과 GPT 섹션명의 매칭 점수 (0.0 ~ 1.0)
-    - 1.0: 완전 일치 (정규화 후)
-    - 0.5 이상: 키워드 일부 일치
-    - 0.0: 매칭 없음
-    """
     if not upload_title or not gpt_title:
         return 0.0
 
@@ -292,12 +276,8 @@ def _section_match_score(upload_title: str, gpt_title: str) -> float:
     return score
 
 
+# 이미지 매핑에서 해당 프로젝트 + 섹션에 가장 잘 매칭되는 이미지 반환
 def _load_custom_images_for_section(project_key: str, section_title: str) -> list[dict]:
-    """
-    이미지 매핑에서 해당 프로젝트 + 섹션에 가장 잘 매칭되는 이미지 반환
-    - 완전 일치 우선
-    - 그 다음 부분 일치 (점수 0.5 이상)
-    """
     if not CUSTOM_IMAGES_MAPPING_FILE.exists():
         return []
     try:

@@ -1,26 +1,6 @@
-"""사업부 월별 매입·지급 현황 (v2 — 해외/국내 + 재고 + 비고).
-
-엑셀 '월별 매입 현황 분석'을 그대로 담는다. 한 칸이 이제 숫자 하나가
-아니라 셋이다.
-
-    {"total": 8776516, "overseas": 3510607, "domestic": 5265910}
-
-안 적은 칸은 None 으로 남긴다. 0 과 '안 적음'은 다르다 — 해외를 아직
-안 나눈 달은 합계만 있고, 앱은 그 달의 해외 탭에서 '미입력' 이라고
-말해야 한다. 0 으로 채우면 없는 게 아니라 0원인 것처럼 읽힌다.
-
-잔액은 계산하지 않고 '적힌 값'을 쓴다. 표의 잔액이 매입-지급과 맞지
-않는 달이 있어서다. 비워두면 그때만 매입-지급으로 채운다.
-
-비고는 줄바꿈을 그대로 지킨다. '/' 로 이어 붙이면 몇 건인지 세려고
-눈으로 훑어야 한다.
-
-누적(summary)은 달들을 더해서 만들지 않고 따로 담는다. 엑셀의 '합계'
-열이 달 합과 안 맞는 줄이 있다 — 매출 합계가 4~8월 합보다 31만 크다.
-어느 쪽이 맞는지는 표를 쓴 사람이 안다. 게다가 해외/국내는 달별로
-안 나눠져 있고 누적에만 있다. 그래서 적힌 값을 적힌 대로 둔다.
-누적이 없으면 예전처럼 달을 더해서 보여 준다.
-"""
+# ============================================================
+#  사업부 월별 매입·지급 현황 (v2 — 해외/국내 + 재고 + 비고)
+# ============================================================
 from __future__ import annotations
 
 import datetime as _dt
@@ -60,8 +40,8 @@ def _s(v) -> str:
     return "" if v is None else str(v).strip()
 
 
+# 비고 — 줄바꿈은 지키고 줄 끝 공백만 턴다
 def _note(v) -> str:
-    """비고 — 줄바꿈은 지키고 줄 끝 공백만 턴다."""
     t = "" if v is None else str(v)
     t = t.replace("\r\n", "\n").replace("\r", "\n")
     lines = [ln.rstrip() for ln in t.split("\n")]
@@ -72,8 +52,8 @@ def _note(v) -> str:
     return "\n".join(lines)[:MAX_NOTE]
 
 
+# 빈 칸은 None 으로 남긴다 — 0 과 '안 적음' 은 다르다
 def _num(v):
-    """빈 칸은 None 으로 남긴다 — 0 과 '안 적음' 은 다르다."""
     if v is None or isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
@@ -108,11 +88,10 @@ def _key(v, fallback: str) -> str:
     return t if _KEY_RE.match(t) else fallback
 
 
-# ── 한 칸 = 합계/해외/국내 ─────────────────────────────────────
-
-
+# ============================================================
+#  한 칸 = 합계/해외/국내
+# ============================================================
 def cell(raw) -> dict:
-    """숫자 하나로 적힌 옛 데이터도 받는다 (그건 합계로 본다)."""
     if isinstance(raw, dict):
         return {r: _num(raw.get(r)) for r in REGIONS}
     return {"total": _num(raw), "overseas": None, "domestic": None}
@@ -139,12 +118,8 @@ def normalize_item(raw, idx: int) -> dict:
     return out
 
 
+# 저장은 리스트로 하고 입력은 dict 로도 받는다
 def normalize_stock(raw) -> list:
-    """저장은 리스트로 하고 입력은 dict 로도 받는다.
-
-    한 번 저장한 뒤 다시 읽을 때 리스트를 못 알아보면 재고가 통째로
-    비워진다 — 실제로 그렇게 한 번 날렸다.
-    """
     rows = {}
     if isinstance(raw, dict):
         rows = raw
@@ -168,12 +143,8 @@ _NOTE_PATH = re.compile(r"^(revenue|prepaid|actual_paid|invest|receivable|total_
                         r"|sum:(buy|paid|balance)|ratio|month)$")
 
 
+# 비고는 줄마다 하나다 — 매출액·매입액·지급액·잔액에 각각 적는다
 def normalize_notes(raw, items_raw, stock_raw) -> dict:
-    """비고는 줄마다 하나다 — 매출액·매입액·지급액·잔액에 각각 적는다.
-
-    한 항목에 하나만 달 수 있던 때 잔액 줄에 몰아 적었다. 옛 데이터의
-    그 비고는 그 항목의 잔액 줄로 옮긴다.
-    """
     out = {}
     if isinstance(raw, dict):
         for k, v in raw.items():
@@ -234,8 +205,8 @@ def normalize_month(raw) -> dict:
     }
 
 
+# 누적에 쓸 만한 숫자가 하나라도 있는지.
 def summary_has_data(sv) -> bool:
-    """누적에 쓸 만한 숫자가 하나라도 있는지."""
     if not isinstance(sv, dict):
         return False
     for k in ("revenue", "prepaid", "actual_paid", "invest",
@@ -251,8 +222,8 @@ def summary_has_data(sv) -> bool:
     return bool(sv.get("notes"))
 
 
+# 누적 한 칸. 달 한 칸과 모양이 같고 어느 구간인지만 더 붙는다
 def normalize_summary(raw, months=None) -> dict:
-    """누적 한 칸. 달 한 칸과 모양이 같고 어느 구간인지만 더 붙는다."""
     raw = raw if isinstance(raw, dict) else {}
     out = normalize_month(raw)
     keys = sorted(months or {})
@@ -309,11 +280,10 @@ def save(path: Path, data: dict) -> dict:
     return out
 
 
-# ── 보기 ─────────────────────────────────────────────────────
-
-
+# ============================================================
+#  보기
+# ============================================================
 def _resolve(mv: dict, region: str) -> dict:
-    """한 달치를 앱이 그릴 수 있는 형태로 푼다. 한 지역만 본다."""
     notes = mv.get("notes") or {}
     items, buy, paid, bal = [], 0.0, 0.0, 0.0
     for it in mv.get("items") or []:
@@ -389,9 +359,8 @@ def month_label(m: str) -> str:
         return m
 
 
+# 누적. 항목은 키로 합치고, 재고는 마지막 달 값을 쓴다 — 재고는 시점 값이라 더하면 없는 숫자가 된다
 def _sum_months(months: list) -> dict:
-    """누적. 항목은 키로 합치고, 재고는 마지막 달 값을 쓴다 —
-    재고는 시점 값이라 더하면 없는 숫자가 된다."""
     tot = {"revenue": 0.0, "buy": 0.0, "paid": 0.0, "balance": 0.0,
            "receivable": None, "total_buy": None}
     acc, order, labels, notes = {}, [], {}, {}
@@ -450,13 +419,8 @@ def _fill_regions(mv: dict, out: dict) -> dict:
     return out
 
 
+# 어느 지역이 한 번이라도 적혔는지.
 def region_filled(body: dict, scope: str = "all") -> dict:
-    """어느 지역이 한 번이라도 적혔는지. 앱이 탭을 흐리게 할 때 쓴다.
-
-    scope="months" 는 달별, "summary" 는 누적만 본다. 이 엑셀은 해외/국내가
-    누적에만 있어서, 둘을 뭉쳐 보면 앱이 '해외 탭에 달별 숫자가 있다'고
-    잘못 알아듣는다.
-    """
     out = {r: False for r in REGIONS}
     if scope in ("all", "months"):
         for mv in (body.get("months") or {}).values():
@@ -524,8 +488,8 @@ def for_admin(data: dict, div: str) -> dict:
     }
 
 
+# 한 사업부 통째로 갈아끼운다 — 화면이 전체를 들고 있다
 def put_division(data: dict, div: str, payload: dict) -> dict:
-    """한 사업부 통째로 갈아끼운다 — 화면이 전체를 들고 있다."""
     out = normalize(data)
     payload = payload if isinstance(payload, dict) else {}
     old_summary = (out.get("divisions") or {}).get(div, {}).get("summary")

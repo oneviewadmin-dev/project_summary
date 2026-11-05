@@ -44,7 +44,9 @@ class _RevenueDetailScreenState extends State<RevenueDetailScreen> {
   // 사업부를 펴 놓았는지. 지금은 반도체 하나지만, 다른 사업부 파일이
   // 들어오면 줄이 늘어난다.
   // 접어 두면 화면이 통째로 빈다. 세부를 보려고 들어온 화면이다.
-  bool _openDiv = true;
+  // 어느 사업부를 펴 놨나 (2026-11-03). 전에는 '전사' 카드 하나라
+  // true/false 하나면 됐다.
+  final Set<String> _openKeys = <String>{};
   _Sort _sort = _Sort.actual;
 
   @override
@@ -158,62 +160,57 @@ class _RevenueDetailScreenState extends State<RevenueDetailScreen> {
           Text(v, maxLines: 1, style: AppText.bodyStrong),
         ]);
 
-    // 부서 한 줄씩 (펴 봤을 때).
-    //
-    // 예상을 Commodity 별로 넣은 달은 부서마다 제 달성률이 있다.
-    // 금액만 넣은 달은 나눌 근거가 없어서 총합 대비 비중만 본다 —
+    // 사업부마다 제 달성률이 있는 달인지. 예상을 Commodity 별로
+    // 넣은 달만 그렇고, 금액만 넣은 달은 비중으로 본다 —
     // 없는 달성률을 지어내지 않는다.
     final byGroup = r.hasEstimateGroups;
-    Widget deptRow(RevenueGroup g) {
-      final all = r.actual;
-      final pc = byGroup
-          ? g.rate
-          : (all > 0 ? (g.actual * 100 / all).round() : null);
-      final tint = g.key == 'internal'
-          ? AppColors.statusGray
-          : AppColors.summaryInProgress;
+
+    // 사업부를 폈을 때 나오는 줄 하나.
+    // 비중은 그 사업부 안에서 센다 — 전사 대비로 재면 큰 사업부 안의
+    // 줄은 다 0% 로 눌려서 안 보인다.
+    Widget itemRow(RevenueItem it, int divTotal) {
+      final pc = divTotal > 0 ? (it.actual * 100 / divTotal).round() : null;
       return Padding(
-        padding: const EdgeInsets.only(top: 12),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            Expanded(
-              child: Text(g.short,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: AppText.body
-                      .copyWith(fontSize: 13.5, fontWeight: FontWeight.w700)),
-            ),
-            const SizedBox(width: 8),
-            Text(
-                byGroup && g.estimate > 0
-                    ? '${Fmt.moneyShort(g.actual)} / ${Fmt.moneyShort(g.estimate)}'
-                    : Fmt.moneyShort(g.actual),
-                style: AppText.caption.copyWith(color: AppColors.textMute)),
-            const SizedBox(width: 8),
-            SizedBox(
-              width: 38,
-              child: Text(pc == null ? '-' : '$pc%',
-                  textAlign: TextAlign.right,
-                  style: AppText.bodyStrong.copyWith(fontSize: 12.5)),
-            ),
-          ]),
-          const SizedBox(height: 5),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(999),
-            child: LinearProgressIndicator(
-              value: pc == null ? 0 : (pc / 100).clamp(0.0, 1.0),
-              minHeight: 4,
-              backgroundColor: AppColors.statusGraySoft,
-              valueColor: AlwaysStoppedAnimation<Color>(tint),
-            ),
+        padding: const EdgeInsets.only(top: 10),
+        child: Row(children: [
+          Expanded(
+            child: Text(it.item,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: AppText.body
+                    .copyWith(fontSize: 13, fontWeight: FontWeight.w600)),
+          ),
+          const SizedBox(width: 8),
+          Text(Fmt.moneyShort(it.actual),
+              style: AppText.caption.copyWith(color: AppColors.textMute)),
+          const SizedBox(width: 8),
+          SizedBox(
+            width: 38,
+            child: Text(pc == null ? '-' : '$pc%',
+                textAlign: TextAlign.right,
+                style: AppText.bodyStrong.copyWith(fontSize: 12.5)),
           ),
         ]),
       );
     }
 
-    // 사업부 한 줄. 누르면 그 안의 부서가 펴진다 — 데이터 센터도
-    // 우주항공도 구미·화성도 결국 반도체 하나 안의 이야기다.
-    Widget divisionCard() {
+    // 사업부 한 곳 = 카드 한 장 (2026-11-03).
+    //
+    // Min: "전사 걍 빼버리고 각각 사업부 리스트 두고 사업부 밑에 만약에
+    //      상세로 내용이 있으면 눌렀을 때 뜨게끔 해줘"
+    //
+    // 전에는 '전사' 카드 한 장 밑에 사업부가 매달려 있었다. 머리글이
+    // '반도체' 로 박혀 있던 시절의 모양이다 — 데이터 센터도 우주항공도
+    // 결국 반도체 하나 안의 이야기였으니까. 사업부가 여섯이 되고 나니
+    // 한 겹이 군더더기가 됐다.
+    //
+    // 쪼갠 내용(items)이 없는 사업부는 안 펴진다. 눌러도 아무 일도 안
+    // 나는 화살표를 그려 두면 고장으로 읽힌다.
+    Widget divisionCard(RevenueGroup d) {
+      final sub = d.items;
+      final open = _openKeys.contains(d.key);
+      final pc = byGroup ? d.rate : (r.actual > 0
+          ? (d.actual * 100 / r.actual).round() : null);
       return Container(
         margin: const EdgeInsets.only(bottom: 10),
         decoration: BoxDecoration(
@@ -224,51 +221,61 @@ class _RevenueDetailScreenState extends State<RevenueDetailScreen> {
         child: Column(children: [
           InkWell(
             borderRadius: BorderRadius.circular(AppRadius.lg),
-            onTap: () => setState(() => _openDiv = !_openDiv),
+            onTap: sub.isEmpty
+                ? null
+                : () => setState(() {
+                      if (open) {
+                        _openKeys.remove(d.key);
+                      } else {
+                        _openKeys.add(d.key);
+                      }
+                    }),
             child: Padding(
               padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
+              child: Row(children: [
+                Expanded(
+                  child: Text(d.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: AppText.bodyStrong.copyWith(fontSize: 15.5)),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                    byGroup && d.estimate > 0
+                        ? '${Fmt.moneyShort(d.actual)} / ${Fmt.moneyShort(d.estimate)}'
+                        : Fmt.moneyShort(d.actual),
+                    style: AppText.caption.copyWith(color: AppColors.textMute)),
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 44,
+                  child: Text(pc == null ? '-' : '$pc%',
+                      textAlign: TextAlign.right,
+                      style: AppText.bodyStrong.copyWith(fontSize: 13.5)),
+                ),
+                // 펼 게 없으면 화살표도 안 그린다
+                SizedBox(
+                  width: 20,
+                  child: sub.isEmpty
+                      ? const SizedBox.shrink()
+                      : Icon(open ? Icons.expand_less : Icons.expand_more,
+                          size: 20, color: AppColors.textMute),
+                ),
+              ]),
+            ),
+          ),
+          if (open && sub.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
               child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // 위 카드에 이미 크게 나온 숫자다. 여기서 또 크게 쌓으면
-                    // 같은 말을 두 번 하면서 오른쪽만 비운다. 한 줄에 붙인다.
-                    Row(children: [
-                      Expanded(
-                        child: Text('반도체',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: AppText.bodyStrong.copyWith(fontSize: 15.5)),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(Fmt.moneyShort(r.actual),
-                          style: AppText.caption
-                              .copyWith(color: AppColors.textMute)),
-                      // 한동안 여기에 '100%' 가 적혀 있었다. 사업부가
-                      // 하나뿐이라 비중이 100 인 것뿐인데 달성률로 읽혔다.
-                      // 예상이 들어온 뒤로는 진짜 달성률을 적는다.
-                      if (est) ...[
-                        const SizedBox(width: 8),
-                        Text(r.rate == null ? '-' : '${r.rate}%',
-                            style:
-                                AppText.bodyStrong.copyWith(fontSize: 13.5)),
-                      ],
-                      Icon(_openDiv ? Icons.expand_less : Icons.expand_more,
-                          size: 20, color: AppColors.textMute),
-                    ]),
+                    const Divider(height: 8, color: AppColors.borderSoft),
+                    const SizedBox(height: 4),
+                    Text('상세',
+                        style:
+                            AppText.caption.copyWith(color: AppColors.textHint)),
+                    for (final it in sub) itemRow(it, d.actual),
                   ]),
-            ),
-          ),
-          if (_openDiv)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                const Divider(height: 8, color: AppColors.borderSoft),
-                const SizedBox(height: 4),
-                Text(byGroup ? '부서별 실적 / 예상 · 달성' : '부서별 실적 · 비중',
-                    style: AppText.caption.copyWith(color: AppColors.textHint)),
-                for (final g in r.lines) deptRow(g),
-              ]),
             ),
         ]),
       );
@@ -367,7 +374,22 @@ class _RevenueDetailScreenState extends State<RevenueDetailScreen> {
           child: Text('사업부',
               style: AppText.caption.copyWith(color: AppColors.textMute)),
         ),
-        divisionCard(),
+        for (final d in r.lines) divisionCard(d),
+        if (r.lines.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 18),
+            child: Center(
+              child: Text('이 달 목표·실적이 들어온 사업부가 없습니다',
+                  style: AppText.caption.copyWith(color: AppColors.textHint)),
+            ),
+          ),
+        // 목표도 실적도 없는 사업부는 이름만 한 줄로
+        if (r.noTarget.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(left: 2, top: 4),
+            child: Text('목표 미등록 · ${r.noTarget.join(' · ')}',
+                style: AppText.caption.copyWith(color: AppColors.textHint)),
+          ),
       ],
     );
   }

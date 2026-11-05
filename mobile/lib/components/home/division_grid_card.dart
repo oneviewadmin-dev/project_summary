@@ -17,6 +17,7 @@ import 'package:flutter/material.dart';
 import '../../design/colors.dart';
 import '../../design/typography.dart';
 import '../../models/dashboard.dart';
+import '../../config/owner_label.dart';
 
 class DivisionGridCard extends StatelessWidget {
   const DivisionGridCard({
@@ -111,7 +112,9 @@ class DivisionGridCard extends StatelessWidget {
               Padding(
                 padding: const EdgeInsets.only(right: 5),
                 child: Text(
-                  projectCount == 0 ? '등록된 프로젝트 없음' : '프로젝트 $projectCount개',
+                  projectCount == 0
+                      ? '등록된 ${ownerLabelOf(divisionId)} 없음'
+                      : '${ownerLabelOf(divisionId)} $projectCount개',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: AppText.caption.copyWith(

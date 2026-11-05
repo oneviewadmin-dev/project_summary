@@ -1,18 +1,6 @@
-"""자주 묻는 질문을 데이터에서 바로 답하는 라우터.
-
-LLM 을 거치지 않고 models.json 만으로 확정 답변을 만든다.
-매칭되지 않으면 None 을 돌려주고, 기존 LLM 경로가 이어서 처리한다.
-
-다루는 질문
-  1) 프로젝트 요약        "하바플레이트", "챔버 현황", "파워박스 어때"
-  2) 모델 상태            "713-312133-006", "C08288 진행률", "저 모델 어디까지 왔어"
-  3) 이슈/지연            "이슈 있어?", "지연된 거", "문제 있는 모델"
-  4) 모델 수/목록         "개발 몇 종", "양산 모델 리스트"
-  5) 진행률 랭킹          "진행률 낮은 모델", "제일 빠른 모델"
-  6) 공정 단계 조회        "LAIR 승인 남은 모델", "FAIR 제출한 모델"
-  7) 데이터 범위          "어떤 주차 있어", "언제까지 등록됐어"
-  8) 프로젝트 목록        "프로젝트 뭐 있어"
-"""
+# ============================================================
+#  자주 묻는 질문을 데이터에서 바로 답하는 라우터
+# ============================================================
 
 import re
 
@@ -48,8 +36,8 @@ def _s(v):
     return "" if v is None else str(v).strip()
 
 
+# 받침 유무 따라 은/는, 이/가 등을 붙인다
 def _josa(word, pair=("은", "는")):
-    """받침 유무 따라 은/는, 이/가 등을 붙인다."""
     w = _s(word)
     if not w:
         return pair[1]
@@ -66,8 +54,8 @@ def _filled(proc):
                if any(_s((st or {}).get(k)) for k in ("expected", "actual", "status")))
 
 
+# 모델 진행률. 데이터 없으면 None.
 def _model_progress(m, process_progress):
-    """모델 진행률. 데이터 없으면 None."""
     if m.get("group") == "개발":
         proc = m.get("process") if isinstance(m.get("process"), list) else []
         if not _filled(proc):
@@ -87,9 +75,8 @@ def _fmt_models(ids, limit=8):
     return head + (f" 외 {len(ids) - limit}종" if len(ids) > limit else "")
 
 
+# 확정 답변 문자열을 만들거나 None.
 def resolve(text, project_key, ctx):
-    """확정 답변 문자열을 만들거나 None. ctx = {load_models, process_progress,
-    process_current, known_weeks, project_label, projects}"""
     t = _s(text)
     if not t:
         return None
@@ -103,13 +90,15 @@ def resolve(text, project_key, ctx):
     projects = data.get("projects") or {}
     proj = projects.get(project_key) if project_key and project_key != "all" else None
     label = ctx.get("project_label") or "이 프로젝트"
-
-    # ── 8) 프로젝트 목록 ──
+    # -----------------------------------------------------------
+    # 8) 프로젝트 목록
+    # -----------------------------------------------------------
     if any(k in t for k in ["프로젝트 뭐", "프로젝트 목록", "무슨 프로젝트", "어떤 프로젝트", "프로젝트 리스트"]):
         names = ctx.get("project_labels") or list(projects.keys())
         return f"등록된 프로젝트는 {len(names)}개입니다.\n" + ", ".join(names)
-
-    # ── 7) 데이터 범위 ──
+    # -----------------------------------------------------------
+    # 7) 데이터 범위
+    # -----------------------------------------------------------
     if any(k in t for k in ["어떤 주차", "무슨 주차", "주차 목록", "몇 주차까지", "언제까지 등록", "데이터 범위"]):
         weeks = sorted(ctx["known_weeks"](project_key),
                        key=lambda w: int(re.sub(r"\D", "", w) or 0))
@@ -123,8 +112,9 @@ def resolve(text, project_key, ctx):
     models = [m for m in (proj.get("models") or []) if isinstance(m, dict)]
     mass = [m for m in models if m.get("group") != "개발"]
     dev = [m for m in models if m.get("group") == "개발"]
-
-    # ── 2) 특정 모델 ──
+    # -----------------------------------------------------------
+    # 2) 특정 모델
+    # -----------------------------------------------------------
     mid = None
     hit = MODEL_ID_RE.search(t) or MODEL_TAIL_RE.search(t)
     if hit:
@@ -140,8 +130,9 @@ def resolve(text, project_key, ctx):
                 mid = matches[0]
     if mid is not None:
         return _answer_model(mid, process_progress, process_current)
-
-    # ── 3) 이슈 / 지연 ──
+    # -----------------------------------------------------------
+    # 3) 이슈 / 지연
+    # -----------------------------------------------------------
     if any(k in t for k in ["이슈", "리스크", "문제", "지연", "늦어", "밀린"]):
         rows = []
         for m in models:
@@ -151,8 +142,9 @@ def resolve(text, project_key, ctx):
         if not rows:
             return f"{label}에 등록된 이슈가 없습니다."
         return f"{label} 이슈 {len(rows)}건입니다.\n" + "\n".join(rows[:10])
-
-    # ── 6) 공정 단계 조회 (개발) ──
+    # -----------------------------------------------------------
+    # 6) 공정 단계 조회 (개발)
+    # -----------------------------------------------------------
     for key, aliases in DEV_STEP_ALIASES:
         if not any(a in low for a in aliases):
             continue
@@ -172,8 +164,9 @@ def resolve(text, project_key, ctx):
         if any(k in t for k in ["완료", "끝난", "된 모델", "한 모델"]):
             return (f"{label} '{name}' 완료 {len(done_ids)}종입니다.\n{_fmt_models(done_ids)}")
         return (f"{label} '{name}' 미완료 {len(todo_ids)}종입니다.\n{_fmt_models(todo_ids)}")
-
-    # ── 5) 진행률 랭킹 ──
+    # -----------------------------------------------------------
+    # 5) 진행률 랭킹
+    # -----------------------------------------------------------
     if any(k in t for k in ["진행률 낮", "제일 늦", "가장 늦", "느린", "뒤처", "진행률 높", "제일 빠", "가장 빠"]):
         scored = []
         for m in models:
@@ -188,8 +181,9 @@ def resolve(text, project_key, ctx):
         head = "진행률이 낮은" if asc else "진행률이 높은"
         lines = [f"· {i}: {p}%" for p, i in top]
         return f"{label} {head} 모델 {len(top)}종입니다.\n" + "\n".join(lines)
-
-    # ── 4) 모델 수 / 목록 ──
+    # -----------------------------------------------------------
+    # 4) 모델 수 / 목록
+    # -----------------------------------------------------------
     if any(k in t for k in ["몇 종", "몇종", "몇 개", "몇개", "모델 수", "목록", "리스트", "어떤 모델"]):
         want_dev = "개발" in t
         want_mass = "양산" in t
@@ -200,8 +194,9 @@ def resolve(text, project_key, ctx):
             ids = [_s(m.get("id")) for m in mass]
             return f"{label} 양산 모델은 {len(mass)}종입니다.\n{_fmt_models(ids)}"
         return (f"{label} 전체 {len(models)}종입니다. 양산 {len(mass)}종, 개발 {len(dev)}종.")
-
-    # ── 1) 프로젝트 요약 ──
+    # -----------------------------------------------------------
+    # 1) 프로젝트 요약
+    # -----------------------------------------------------------
     summary_words = ["현황", "상태", "어때", "어떻게", "요약", "알려줘", "정리"]
     bare = re.sub(r"\s+", "", t)
     is_bare_name = len(bare) <= 12 and not any(c.isdigit() for c in bare)
@@ -255,12 +250,8 @@ def _answer_model(m, process_progress, process_current):
     return line
 
 
+# '2026-09' → {'W36','W37',...}.
 def _weeks_by_month(models):
-    """'2026-09' → {'W36','W37',...}.
-
-    주차가 몇 월인지는 모델의 weekly_plan 에만 적혀 있다. 그룹 합계
-    (weekly_summary) 는 주차만 들고 월을 모른다.
-    """
     out = {}
     for m in models:
         for mon, wk in ((m or {}).get("weekly_plan") or {}).items():
@@ -269,17 +260,8 @@ def _weeks_by_month(models):
     return out
 
 
+# 'W37' → {'plan': n, 'actual': n}.
 def _week_cells(proj, models):
-    """'W37' → {'plan': n, 'actual': n}.
-
-    수량은 주차마다 weekly_summary 가 정본이다 (주간보고 엑셀에서 그대로
-    온 값). 그 주차가 summary 에 없을 때만 모델별 weekly_plan 을 쓴다.
-
-    한 주차를 양쪽에서 더하면 안 된다 — 엑셀에는 개별 모델 행과 그것을
-    합한 집계 행이 같이 있어서 두 배가 된다. 반대로 summary 가 있다고
-    통째로 끝내도 안 된다: 주간보고는 지난주까지만 올라오고 이번 달
-    남은 주차는 모델 쪽에만 있다.
-    """
     out = {}
     ws = (proj or {}).get("weekly_summary") or {}
     for g in ("양산", "개발"):
@@ -303,16 +285,16 @@ def _wk_no(w):
     return int(re.sub(r"\D", "", _s(w)) or 0)
 
 
+# '계획 120대 / 실적 44대 (37%)'.
 def _pair(plan, actual):
-    """'계획 120대 / 실적 44대 (37%)'. 계획이 없으면 달성률을 지어내지 않는다."""
     line = f"계획 {plan:,}대 / 실적 {actual:,}대"
     if plan > 0:
         line += f" ({round(actual * 100 / plan)}%)"
     return line
 
 
+# 이슈 칸을 한 줄로 줄인다. 여러 줄이면 첫 줄만, 길면 자른다
 def _issue_brief(m, width=40):
-    """이슈 칸을 한 줄로 줄인다. 여러 줄이면 첫 줄만, 길면 자른다."""
     txt = ""
     for ln in _s(m.get("issues")).splitlines():
         ln = ln.strip().rstrip(" ,·/")
@@ -328,14 +310,10 @@ def _answer_project(label, proj, models, mass, dev, process_progress,
                     now_week='', now_month=''):
     lines = [f"{label}{_josa(label)} 모델 {len(models)}종입니다 (양산 {len(mass)}종, 개발 {len(dev)}종)."]
 
-    # PO 누계는 뺐다. 물어본 건 지금 어떤지인데, 연초부터 쌓인 숫자가
-    # 넉 줄을 차지하면서 이번 주와 그 달이 뒤로 밀렸다.
-
-    # ── 이번 주와 그 달 ──
-    #
-    # 예전에는 '가장 최근 실적이 있는 주차' 만 적었다. 이번 주가 아직
-    # 비어 있으면 지난주 숫자가 오늘 것처럼 읽혔고, 그 달을 통틀어
-    # 얼마나 했는지는 아예 없었다.
+    # PO 누계는 뺐다. 물어본 건 지금 어떤지인데, 연초부터 쌓인 숫자가 넉 줄을 차지하면서 이번 주와 그 달이 뒤로 밀렸다
+    # -----------------------------------------------------------
+    # 이번 주와 그 달
+    # -----------------------------------------------------------
     cells = _week_cells(proj, models)
     if cells:
         this_w = _s(now_week)

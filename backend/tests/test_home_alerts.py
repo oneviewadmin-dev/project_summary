@@ -42,7 +42,14 @@ g['_cl'] = type('C', (), {'get_projects': staticmethod(
     lambda division_id=None, visible_only=True: [
         p for p in CFG
         if (p.get('visible', True) or not visible_only)
-        and (not division_id or p.get('division_id') == division_id)])})()
+        and (not division_id or p.get('division_id') == division_id)]),
+    # 2026-11-03 — 내역을 사업부로 한 겹 접어서 같이 내려보낸다.
+    #   Min: "이거 지금 사진에 보이는거 사업부별로 나눠줘"
+    'get_divisions': staticmethod(lambda visible_only=True: [
+        {'id': d, 'label': d} for d in
+        sorted({p.get('division_id') or '' for p in CFG} - {''})]),
+    'derive_division_from_project': staticmethod(
+        lambda k: next((p.get('division_id') for p in CFG if p['id'] == k), ''))})()
 
 # ── 지어낸 데이터로 판정 확인 ──
 import datetime
@@ -146,7 +153,12 @@ if bk:
                 p for p in CFG
                 if (p.get('visible', True) or not visible_only)
                 and (not division_id or p.get('division_id') == division_id)]),
-        'get_project': staticmethod(lambda k: CFGM.get(k))})()
+        'get_project': staticmethod(lambda k: CFGM.get(k)),
+        'get_divisions': staticmethod(lambda visible_only=True: [
+            {'id': d, 'label': d} for d in
+            sorted({p.get('division_id') or '' for p in CFG} - {''})]),
+        'derive_division_from_project': staticmethod(
+            lambda k: (CFGM.get(k) or {}).get('division_id') or '')})()
     b = fn(12)['bloom']
     assert b and (b['plan'] > 0 or b['prev_plan'] > 0), f'블룸 요약이 비었다: {b}'
     assert b['items'] > 0
@@ -169,9 +181,12 @@ assert '_sel = k' in B, '타일을 눌러도 목록이 안 바뀐다'
 # 타일을 눌러도 되고 옆으로 밀어도 넘어간다.
 # 왼쪽으로 밀면 다음, 오른쪽으로 밀면 이전. 끝에서는 안 넘어간다 —
 # 정상에서 왼쪽으로 밀었는데 집중관리가 나오면 어디로 간 건지 모른다.
-# 지금 숫자는 반도체사업부 것만이다. 그렇다고 적어 둬야 전사 숫자로
-# 읽히지 않는다. 다른 사업부 자료가 들어오면 이 꼬리표를 뗀다.
-assert '(반도체 기준)' in B, '전사 숫자인 것처럼 보인다'
+# 2026-11-02 부터 전 사업부를 센다 (division= 를 비워 부른다).
+# Min: "반도체 기준이 아니라 이제 전체적인 사업부 다 내용도 포함"
+# 그래도 무슨 범위인지는 적혀 있어야 한다 — 적힌 것과 세는 것이
+# 다르면 숫자를 믿을 수 없다는 규칙은 그대로다.
+assert '(반도체 기준)' not in B, '전사를 세는데 반도체 기준이라 적혀 있다'
+assert '(전 사업부)' in B, '무슨 범위인지 안 적혀 있다'
 assert 'onHorizontalDragEnd' in B, '옆으로 밀어도 안 넘어간다'
 assert 'primaryVelocity' in B and '_Kind.values[next]' in B
 assert 'next < 0 || next >= _Kind.values.length' in B, '끝에서 감아 돈다'
@@ -208,7 +223,13 @@ ok += 1
 # 목록 화면이 네 가지를 다 받는다
 A = (LIB / 'screens' / 'alert_list_screen.dart').read_text(encoding='utf-8')
 # 칩 글자는 '마감 임박', 걸러내는 값은 서버가 쓰는 '임박'
-assert "_chip('문제'" in A and "_chip('PO 대기'" in A
+#
+# 2026-11-03 — '문제' 와 '전체' 칩을 뺐다. 같은 건이 세 칩에 겹쳐 세어져서
+# 18 · 18 · 19 가 나란히 섰다 (Min: "탭/pill을 정상, 일정지연, 집중관리,
+# 특이사항, PO 대기 로만"). 칩 구성은 test_alert_list_division.py 가 본다.
+assert "_chip('문제'" not in A and "_chip('전체'" not in A, \
+    '겹쳐 세던 칩이 되살아났다'
+assert "_chip('PO 대기'" in A
 for _c in ('StatusWords.delayed', 'StatusWords.issue', 'StatusWords.soon',
            'StatusWords.normal'):
     assert f'_chip({_c}' in A, f'{_c} 칩이 없다'
@@ -235,12 +256,16 @@ ok += 1
 # 찾으면 'fluence' / 'sdi' 가 소문자 키 그대로 화면에 떴다.
 assert 'PROJECT_LABELS.get(pk, pk)' not in SRC, '알림이 아직 고정 맵으로 이름을 찾는다'
 assert '_display_project_label(pk)' in SRC, '설정 라벨을 안 본다'
+# 2026-10-26 — ESS 프로젝트는 config 에서 빠졌다 (엑셀이 목록을 만든다).
+# 그래서 'fluence → 플루언스' 를 config 로 확인할 수가 없다. 확인할 것은
+# **라벨을 설정에서 찾는가** 이고, 그건 위 두 줄이 이미 지킨다.
+# 여기서는 config 에 남은 프로젝트가 전부 라벨을 갖고 있는지만 본다 —
+# 라벨이 없으면 키(소문자 영문)가 그대로 화면에 뜬다.
 import json as _json
 _cfg = _json.loads((ROOT / 'config' / 'projects.json').read_text(encoding='utf-8'))
 _ps = _cfg['projects'] if isinstance(_cfg.get('projects'), list) else list(_cfg['projects'].values())
-_lab = {x['id']: x.get('label') for x in _ps}
-assert _lab.get('fluence') == '플루언스', _lab.get('fluence')
-assert _lab.get('sdi') == 'SDI', 'SDI 는 SDI 로 둔다'
+_noname = [x.get('id') for x in _ps if not str(x.get('label') or '').strip()]
+assert not _noname, '이름(label) 없는 프로젝트가 있다: %r' % _noname
 ok += 1
 
 
@@ -248,7 +273,9 @@ ok += 1
 # 카드에 '(반도체 기준)' 이라 적혀 있는데 전 사업부를 세고 있었다.
 g['_load_models'] = lambda: {'projects': {
     'powerbox': {'models': [dev('P-1', past), dev('P-2', soon)]},   # 반도체
-    'net_samsung': {'models': [dev('O-1', past), dev('O-2', past)]},  # 네트워크
+    # 2026-10-26 — 네트워크 프로젝트는 config 에서 빠졌다(엑셀이 만든다).
+    # 반도체가 아닌 자리는 공용(sys_cable)으로 든다.
+    'sys_cable': {'models': [dev('O-1', past), dev('O-2', past)]},   # 반도체 밖
 }}
 _r2 = fn(10)
 assert _r2['counts']['total'] == 2, \

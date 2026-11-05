@@ -1,25 +1,6 @@
-"""'전사 사업부별 주간 잔특근 취합' 엑셀 읽기.
-
-파일 한 개에 사업부 시트가 16장 있고, 각 장이 월~일 7줄이다. 요약
-시트(전체_주간현황 · W39_주간현황 · W38_W39_비교)와 확인사항 시트가
-따로 있다.
-
-머리줄이 두 층이고 가로로 병합돼 있다.
-
-    [총 보유인원      ][지원인력 ][실제 가용인원        ][잔업 인원  ]…
-    [전체][주간][야간 ][ (+)][(-)][전체][주간][야간][야간비율][전체][직접][간접]
-
-병합은 왼쪽 위 칸에만 값이 있어서, 그대로 읽으면 두 번째 칸부터
-빈칸이 된다. 그래서 병합을 먼저 펴 놓고 (위 라벨, 아래 라벨) 짝으로
-열을 찾는다. 좌표를 박지 않는 이유는 늘 같다 — 다음 주에 열이 하나
-끼면 전부 밀린다.
-
-'X' 는 0 이 아니다. 일요일 잔업, 평일 특근이 'X' 다. 0 으로 바꾸면
-주 평균이 6/7 로 줄어든다. num() 이 None 으로 돌려주고, 저장도 None 이다.
-
-비고와 일치확인은 사업부 시트가 아니라 [전체_주간현황] 에 있다.
-확인사항 시트는 주차 전체에 붙는 메모로 담는다.
-"""
+# ============================================================
+#  '전사 사업부별 주간 잔특근 취합' 엑셀 읽기
+# ============================================================
 from __future__ import annotations
 
 import datetime as _dt
@@ -44,13 +25,8 @@ GROUPS = [
     ("잔업인원", ("overtime", "people")),
     ("특근인원", ("special", "people")),
 ]
+# 아래 머리줄 → 어느 칸인지.
 def _sub_key(label) -> str:
-    """아래 머리줄 → 어느 칸인지.
-
-    라벨이 한국어·영어·베트남어가 줄바꿈으로 붙어 있고, 첫 줄만 보면
-    '야간(가용인원)' 과 '야간비율(%)' 이 둘 다 '야간' 이 된다 — 비율이
-    인원을 덮어썼다. 그래서 한글만 남겨 놓고 본다.
-    """
     ko = re.sub(r"[^가-힣]", "", _txt(label))
     if not ko:
         return ""
@@ -80,8 +56,8 @@ def _txt(v) -> str:
     return str(v).replace(" ", " ").strip()
 
 
+# 머리줄 비교용 — 줄바꿈·괄호·공백·기호를 다 턴다
 def _norm(v) -> str:
-    """머리줄 비교용 — 줄바꿈·괄호·공백·기호를 다 턴다."""
     t = _txt(v)
     t = re.split(r"[\n\r]", t)[0] if "\n" in t else t
     return re.sub(r"[\s()（）\[\]·.,/+\-%]+", "", t).lower()
@@ -91,8 +67,8 @@ def _norm_all(v) -> str:
     return re.sub(r"[\s()（）\[\]·.,/+\-%]+", "", _txt(v)).lower()
 
 
+# 빈 칸과 'X' 는 None — 0 과 다르다
 def num(v):
-    """빈 칸과 'X' 는 None — 0 과 다르다."""
     if v is None or isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
@@ -119,15 +95,15 @@ def _open_book(data):
             raise ValueError("파일을 바이트로 읽지 못했습니다.")
         raw = bytes(raw)
     else:
-        return load_workbook(data, data_only=True)
+        return load_workbook(data, data_only=True, keep_links=False)
     try:
-        return load_workbook(io.BytesIO(raw), data_only=True)
+        return load_workbook(io.BytesIO(raw), data_only=True, keep_links=False)
     except Exception:
         fd, path = tempfile.mkstemp(suffix=".xlsx")
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(raw)
-            return load_workbook(path, data_only=True)
+            return load_workbook(path, data_only=True, keep_links=False)
         finally:
             try:
                 os.unlink(path)
@@ -135,8 +111,8 @@ def _open_book(data):
                 pass
 
 
+# 병합을 펴서 읽는다 — 병합 칸은 왼쪽 위에만 값이 있다
 def _grid(ws, max_row=80, max_col=60):
-    """병합을 펴서 읽는다 — 병합 칸은 왼쪽 위에만 값이 있다."""
     rows = min(ws.max_row or 1, max_row)
     cols = min(ws.max_column or 1, max_col)
     g = [[None] * cols for _ in range(rows)]
@@ -154,8 +130,8 @@ def _grid(ws, max_row=80, max_col=60):
     return g
 
 
+# '요일' 이 있는 줄을 위 머리줄로 본다
 def _header(grid):
-    """'요일' 이 있는 줄을 위 머리줄로 본다. 그 다음 줄이 아래 머리줄."""
     for i, row in enumerate(grid[:12]):
         for j, v in enumerate(row):
             if _norm(v) == "요일":
@@ -163,8 +139,8 @@ def _header(grid):
     return -1, -1
 
 
+# (위, 아래) 라벨을 보고 어느 열이 무엇인지 만든다
 def _columns(grid, h1: int):
-    """(위, 아래) 라벨을 보고 어느 열이 무엇인지 만든다."""
     top, sub = grid[h1], grid[h1 + 1] if h1 + 1 < len(grid) else []
     cols, extra = {}, {}
     for j in range(len(top)):
@@ -198,8 +174,8 @@ def _put(day: dict, path, value):
     cur[path[-1]] = value
 
 
+# 월~일 줄을 읽는다. '합계/평균' 줄에서 멈춘다
 def _sheet_days(grid, h1: int, dayj: int, cols: dict):
-    """월~일 줄을 읽는다. '합계/평균' 줄에서 멈춘다."""
     days, warnings = {}, []
     for ri in range(h1 + 2, len(grid)):
         raw = _txt(grid[ri][dayj]) if dayj < len(grid[ri]) else ""
@@ -238,8 +214,8 @@ def _is_division_sheet(grid, h1: int, dayj: int) -> bool:
     return False
 
 
+# [전체_주간현황] — 사업부별 비고 · 일치확인.
 def _summary_notes(grid, h1: int, dayj: int, extra: dict):
-    """[전체_주간현황] — 사업부별 비고 · 일치확인. 이름 → (비고, 확인)."""
     out = {}
     namej = 0
     for ri in range(h1 + 2, len(grid)):
@@ -253,8 +229,8 @@ def _summary_notes(grid, h1: int, dayj: int, extra: dict):
     return out
 
 
+# 확인사항 시트 — 주차 전체에 붙는 메모.
 def _issues(ws):
-    """확인사항 시트 — 주차 전체에 붙는 메모."""
     out = []
     for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row or 1, 40), max_col=4):
         vals = [_txt(c.value) for c in row]

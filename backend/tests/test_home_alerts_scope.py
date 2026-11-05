@@ -44,7 +44,10 @@ t("목록에 없으면 뺀다", 'if pk not in visible' in src)
 t("사업부를 지정하면 빈 목록이어도 전사로 안 샌다", 'scoped' in src)
 
 # 카드가 말하는 범위와 같아야 한다
-t("카드에 '(반도체 기준)' 이 적혀 있다", '(반도체 기준)' in CARD)
+# 2026-11-02 부터 앱이 division= 를 비워 부른다 — 전 사업부다.
+# 서버 기본값은 'semiconductor' 로 남아 있다 (위 검사). 그건 아직
+# 안 올린 앱을 위한 것이고, 카드에 적히는 말은 지금 세는 범위다.
+t("카드에 '(전 사업부)' 라고 적혀 있다", '(전 사업부)' in CARD)
 
 # 설정상 반도체가 전사보다 적어야 의미가 있다 (같으면 필터가 무의미)
 import config_loader as _cl  # noqa: E402
@@ -56,3 +59,34 @@ except Exception as e:
     print("  skip  설정을 못 읽음: %s" % e)
 
 print(f"전부 통과 ({ok}개)")
+
+# ── 사업부로 묶은 내역 (2026-11-03) ──────────────────────────────
+# Min: "이거 지금 사진에 보이는거 사업부별로 나눠줘"
+#
+# 프로젝트로 줄을 세우면 121곳이다. '모두 보기 (121곳)' 를 눌러도
+# Smac · 파워박스 · SM … 이 끝없이 늘어설 뿐이라 어디가 문제인지 한눈에
+# 안 들어온다. 사업부는 여섯이다.
+_a = SRC.find('def get_home_alerts')
+_b = SRC[_a:SRC.find('\n@app.', _a)]
+t("사업부로 묶은 내역을 같이 준다", '"by_kind_div": by_kind_div' in _b)
+t("프로젝트 내역은 그대로 둔다 (목록 화면이 쓴다)", '"by_kind": by_kind' in _b)
+t("프로젝트에서 사업부를 찾는다", 'derive_division_from_project' in _b)
+# 사업부를 못 찾은 프로젝트를 버리면 합이 조용히 빈다
+t("사업부를 못 찾아도 안 버린다", "'_etc', '기타'" in _b or '"_etc", "기타"' in _b)
+t("사업부 줄에 프로젝트 수도 담는다", '"projects": 0' in _b)
+
+_D = ROOT.parent / 'mobile' / 'lib'
+_svc = (_D / 'services' / 'home_alerts_service.dart').read_text(encoding='utf-8')
+_card = (_D / 'components' / 'home' / 'status_board_card.dart').read_text(encoding='utf-8')
+_home = (_D / 'screens' / 'home_screen.dart').read_text(encoding='utf-8')
+t("앱이 사업부 내역을 읽는다", "j['by_kind_div']" in _svc)
+t("카드가 사업부 줄을 쓴다", 'widget.alerts.byKindDiv[_key[k]]' in _card)
+# 서버가 아직 안 올라간 폰에서 목록이 통째로 비면 안 된다
+t("옛 서버면 프로젝트로 돌아간다", 'if (d != null && d.isNotEmpty) return d;' in _card)
+# 세는 단위가 다른데 같은 말을 쓰면 숫자가 거짓이 된다
+t("줄 단위를 '사업부' 로 적는다", "? '사업부'" in _card and '${_unit}' in _card)
+# 줄을 누르면 프로젝트 화면이 아니라 그 사업부로 가야 한다
+t("사업부 줄이 사업부 화면으로 간다", '_openStatusRow' in _home)
+t("사업부를 못 찾으면 프로젝트로 연다", '_openProject(key, name);' in _home)
+
+print('ok — 사업부로 묶은 전체 현황')

@@ -3,6 +3,9 @@
 // 응답에는 cards (개별 카드 단위)와 grouped_cards (모델 단위 묶음) 가 있는데,
 // 홈 화면의 KPI/즉시확인 용으로는 cards 만 사용해도 충분합니다.
 
+import 'division.dart';
+import '../services/progress_service.dart';
+
 // 단일 신호등 카드.
 // 한 프로젝트에 대한 상태(status), 마감일 후보(due_date_min),
 // 요약 bullet 들이 담겨 있습니다.
@@ -239,4 +242,48 @@ DivisionStatus computeDivisionStatus(
   if (hasWarning) return DivisionStatus.warning;
   if (hasAny) return DivisionStatus.active;
   return DivisionStatus.empty;
+}
+
+/// 모델이 한 종이라도 등록된 사업부 (2026-11-03).
+///
+/// Min: "전체 사업부별 카드에 시스템 빼곤 다 진행중이여서"
+///      "목록에도 홈처럼 동일하게 반영되게끔 연결 되어야지"
+///
+/// 카드의 '진행 중' 은 /dashboard 의 주간보고 카드만 보고 정했다. 주간보고를
+/// 내는 건 반도체뿐이라, 프로젝트가 27개씩 있는 아리스타 · PCB · 자동차 ·
+/// 네트워크가 전부 '진행 데이터 없음' 이었다.
+///
+/// 같은 규칙을 홈과 목록 두 군데에 나눠 적었더니 홈만 고쳐지고 목록은
+/// 그대로였다. 규칙은 여기 하나만 둔다 — 두 화면이 이 함수를 부른다.
+///
+/// 잣대는 자료 하나뿐이고 사업부 이름을 적어 두지 않는다. 그래서
+/// 시스템사업부에 품목을 올리면 코드를 고치지 않아도 그날로 '진행 중' 이
+/// 된다 — 반대로 품목을 다 지우면 다시 '진행 데이터 없음' 으로 돌아간다.
+Set<String> divisionsWithModels(
+  List<Division> divisions,
+  ProgressSummary progress,
+) {
+  final hit = <String>{};
+  for (final d in divisions) {
+    for (final p in d.projects) {
+      if ((progress.of(p.id)?.modelsTotal ?? 0) > 0) {
+        hit.add(d.id);
+        break;
+      }
+    }
+  }
+  return hit;
+}
+
+/// 주간보고가 없어도 모델이 있으면 진행 중이다.
+DivisionStatus divisionStatusWithModels(
+  String divisionId,
+  List<DashboardCard> cards,
+  Set<String> withModels,
+) {
+  final s = computeDivisionStatus(divisionId, cards);
+  if (s == DivisionStatus.empty && withModels.contains(divisionId)) {
+    return DivisionStatus.active;
+  }
+  return s;
 }

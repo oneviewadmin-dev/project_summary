@@ -1,15 +1,6 @@
-"""'구분 x 주차' 형태의 출하/실적 엑셀 파서.
-
-파워박스 '출하 및 실적' 시트처럼 아래 구조를 읽는다.
-
-    구분 | PO수량 | 출하실적 | 잔량 | 6월(계획/실적) | 7월(계획/실적) |
-         | 8월 [ W32(계획/실적) W33 ... ] | 8월 합계(계획/실적) | 9월(계획) ...
-    AetherGDX  ...
-    양산19종   ...
-    합계       ...
-
-열 위치는 고정하지 않고 '계획/실적' 하위 머리글과 병합된 월/주차 머리글로 찾는다.
-"""
+# ============================================================
+#  '구분 x 주차' 형태의 출하/실적 엑셀 파서
+# ============================================================
 
 import week_calendar as _wcal
 import re
@@ -25,8 +16,8 @@ SITE_ALIAS = {"화성": "HS", "HS": "HS", "VN": "VN", "베트남": "VN",
 AGG_RE = re.compile(r"(\d+\s*종|^양산|^개발|^EMA\s*양산)")
 
 
+# 'CEFEM BE 재고: 79' → ('CEFEM BE', 79)
 def _clean_label(t):
-    """'CEFEM BE\n재고: 79' → ('CEFEM BE', 79)"""
     t = _s(t)
     if not t:
         return "", None
@@ -63,8 +54,8 @@ def _num(v):
         return 0
 
 
+# 병합 셀은 앵커 값을 범위 전체에 퍼뜨린 2차원 값 배열(1-based dict).
 def _filled_grid(ws):
-    """병합 셀은 앵커 값을 범위 전체에 퍼뜨린 2차원 값 배열(1-based dict)."""
     grid = {}
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
@@ -78,13 +69,8 @@ def _filled_grid(ws):
     return grid
 
 
+# ISO 주차 번호 → 그 주차를 소유한 'YYYY-MM'.
 def _month_of_week_iso(wno, year):
-    """ISO 주차 번호 → 그 주차를 소유한 'YYYY-MM'.
-
-    예전에는 목요일이 속한 달만 봤는데, 앱이 읽는 규칙(week_calendar)은
-    말일이 3일 이상 걸친 주를 앞 달이 가져간다. 2026년 W40 이 그런 경우라
-    저장은 10월, 조회는 9월이 되어 그 주 물량이 통째로 사라졌다.
-    """
     try:
         return _wcal.month_of_week_no(wno, year)
     except Exception:
@@ -103,8 +89,8 @@ def _year_for_month(mon, today=None):
     return y
 
 
+# (하위머리글행, 라벨열, 주차쌍, 월쌍, 정보열, 사이트열) 반환.
 def find_layout(ws, grid):
-    """(하위머리글행, 라벨열, 주차쌍, 월쌍, 정보열, 사이트열) 반환."""
     sub_row = None
     # 시트 전체에서 찾는다. 위에 다른 표가 얼마나 오든 상관없다 —
     # 하바플레이트는 모델 목록 네 덩어리가 먼저 와서 '계획/실적' 줄이 87행이다.

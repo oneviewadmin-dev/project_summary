@@ -16,7 +16,7 @@ class ProjectGridCard extends StatelessWidget {
   final int modelsTotal;
   final VoidCallback onTap;
   final VoidCallback onToggleFavorite;
-
+ 
   const ProjectGridCard({
     super.key,
     required this.englishName,

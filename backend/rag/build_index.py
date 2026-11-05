@@ -1,7 +1,6 @@
-"""
-FAISS 벡터 인덱스 빌드 스크립트
-notes.json -> 프로젝트 카드 단위로 청킹 -> OpenAI 임베딩 -> FAISS 저장
-"""
+# ============================================================
+#  FAISS 벡터 인덱스 빌드 스크립트 notes.json -> 프로젝트 카드 단위로 청킹 -> OpenAI 임베딩 -> FAISS 저장
+# ============================================================
 import json
 import os
 from pathlib import Path
@@ -26,11 +25,8 @@ EMBED_DIM = 1536
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
+# notes.json -> 청크 리스트로 변환 각 프로젝트 카드 = 1 청크 (raw_text 사용)
 def build_chunks(notes_data: dict) -> list[dict]:
-    """
-    notes.json -> 청크 리스트로 변환
-    각 프로젝트 카드 = 1 청크 (raw_text 사용)
-    """
     chunks = []
     notes = notes_data.get("notes", {})
     for division_id, div in notes.items():
@@ -61,8 +57,8 @@ def build_chunks(notes_data: dict) -> list[dict]:
     return chunks
 
 
+# OpenAI 임베딩 배치 호출
 def embed_batch(texts: list[str]) -> np.ndarray:
-    """OpenAI 임베딩 배치 호출"""
     resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
     vecs = [d.embedding for d in resp.data]
     return np.array(vecs, dtype=np.float32)

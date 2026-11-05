@@ -6,7 +6,6 @@
 //  - 데이터가 없는 모델은 집계에서 빠지고, 전부 빠지면 progress = null → 화면에 '-'.
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
 
 import '../config/app_config.dart';
 import 'offline_store.dart';
@@ -184,7 +183,7 @@ class TrendService {
       };
       final uri = Uri.parse('$kApiBaseUrl/progress-trend')
           .replace(queryParameters: q);
-      final res = await http.get(uri).timeout(const Duration(seconds: 8));
+      final res = await OfflineStore.httpGet(uri).timeout(const Duration(seconds: 8));
       if (res.statusCode != 200) return ProgressTrend.empty;
       final decoded = jsonDecode(utf8.decode(res.bodyBytes));
       if (decoded is! Map) return ProgressTrend.empty;

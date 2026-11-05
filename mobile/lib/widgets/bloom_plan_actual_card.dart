@@ -148,12 +148,16 @@ class _BloomPlanActualCardState extends State<BloomPlanActualCard> {
 
   String? _day;
 
+  /// 고른 칸 (주차 또는 날짜). 칸 목록이 바뀌면 다시 잡는다.
+  int? _colAt;
+
   BloomDailyBoard get b => _other ?? widget.board;
 
   /// 날짜 칩 줄을 처음부터 다시 그리게 한다 (달을 바꾸면 날짜가 달라진다).
   void _resetChips() {
     _chips?.dispose();
     _chips = null;
+    _colAt = null;
   }
 
   /// 달을 바꾼다. 이번 달로 돌아오면 부모가 준 보드를 그대로 쓴다.
@@ -251,11 +255,15 @@ class _BloomPlanActualCardState extends State<BloomPlanActualCard> {
             ),
             _Seg(
               left: '월간',
-              right: '일별',
+              // 2026-10-26 — 지난 주는 주 단위로 접히고 이번 주만 날짜로
+              // 펴진다. '일별' 이라고만 적으면 주차 칸이 왜 섞여 있는지
+              // 설명할 말이 없다.
+              right: '주차 · 일별',
               rightOn: _daily,
               onChanged: (v) => setState(() {
                 _daily = v;
                 _day ??= _defaultDay();
+                _colAt = null;
               }),
             ),
           ]),
@@ -359,35 +367,64 @@ class _BloomPlanActualCardState extends State<BloomPlanActualCard> {
   }
 
   // ── 일별 ────────────────────────────────────────────────────
+  // ── 주차 · 일별 ────────────────────────────────────────────────
+  //
+  // 2026-10-26 — 전에는 날짜 칩만 있었고, 그날 숫자가 적힌 품목만 줄로
+  // 섰다. 그래서 (1) 한 달치를 보려면 칩을 서른 번 눌러야 했고,
+  // (2) 어제는 보이던 품목이 오늘은 사라져서 '빠진 건가' 를 매번 물었다.
+  //
+  //   · 칸은 서버가 접어 준다 — 지난 주는 '41주차', 이번 주는 날짜
+  //   · 품목은 **전부** 세운다. 안 적힌 칸은 '입력 전' 으로 둔다
+  List<BloomColumn> _cols() {
+    if (b.columns.isNotEmpty) return b.columns;
+    // 옛 서버 — 날짜를 그대로 칸으로 쓴다 (되돌릴 자리)
+    final ds = [...b.dates]..sort();
+    return [
+      for (final d in ds)
+        BloomColumn(kind: 'day', label: _md(d), dates: [d]),
+    ];
+  }
+
+  /// 처음 열 때 고를 칸. 실적이 적힌 마지막 날이 든 칸, 없으면 맨 끝.
+  int _defaultCol(List<BloomColumn> cols) {
+    final last = _lastActual();
+    if (last != null) {
+      for (var i = 0; i < cols.length; i++) {
+        if (cols[i].dates.contains(last)) return i;
+      }
+    }
+    for (var i = cols.length - 1; i >= 0; i--) {
+      if (cols[i].today) return i;
+    }
+    return cols.isEmpty ? 0 : cols.length - 1;
+  }
+
   Widget _dailyView() {
-    final dates = [...b.dates]..sort(); // 날짜 순
-    final day = _day ?? _defaultDay();
-    // 처음 열 때 고른 날이 보이도록 (앞에 이틀 정도 여유)
-    final at = day == null ? 0 : dates.indexOf(day);
-    _chips ??= ScrollController(
-        initialScrollOffset: at > 2 ? (at - 2) * 56.0 : 0);
-    if (day == null || dates.isEmpty) {
+    final cols = _cols();
+    if (cols.isEmpty) {
       return const Text('날짜별 계획이 없습니다',
           style: TextStyle(fontSize: 12, color: AppColors.textHint));
     }
-    bool hasActual(String d) =>
-        b.items.any((it) => it.steps.any((s) => s.at(d)?.actual != null));
+    var at = _colAt ?? _defaultCol(cols);
+    if (at < 0 || at >= cols.length) at = cols.length - 1;
+    final col = cols[at];
+    _chips ??= ScrollController(
+        initialScrollOffset: at > 2 ? (at - 2) * 64.0 : 0);
 
-    // 그날 공정 묶음별 합계
+    bool hasActual(BloomColumn c) => b.items.any(
+        (it) => it.steps.any((s) => (s.over(c.dates)?.actual) != null));
+
+    // 그 칸의 공정 묶음별 합계
     final tot = <String, List<int?>>{}; // g -> [plan, actual(null=입력 전)]
     for (final it in b.items) {
       for (final s in it.steps) {
-        final c = s.at(day);
+        final c = s.over(col.dates);
         if (c == null) continue;
         final cur = tot.putIfAbsent(s.group, () => [0, null]);
         cur[0] = (cur[0] ?? 0) + (c.plan ?? 0);
         if (c.actual != null) cur[1] = (cur[1] ?? 0) + c.actual!;
       }
     }
-    final rows = b.items.where((it) => it.steps.any((s) {
-          final c = s.at(day);
-          return c != null && ((c.plan ?? 0) > 0 || c.actual != null);
-        })).toList();
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -397,37 +434,44 @@ class _BloomPlanActualCardState extends State<BloomPlanActualCard> {
           child: ListView.separated(
             controller: _chips,
             scrollDirection: Axis.horizontal,
-            itemCount: dates.length,
+            itemCount: cols.length,
             separatorBuilder: (_, _) => const SizedBox(width: 6),
             itemBuilder: (_, i) {
-              final d = dates[i];
+              final c = cols[i];
               return _DayChip(
-                label: _md(d),
-                sub: _dow(d),
-                on: d == day,
-                filled: hasActual(d),
-                onTap: () => setState(() => _day = d),
+                // 날짜 칸만 '10/26' 으로 줄여 적는다. 주차 · 월 합계는
+                // 적힌 이름이 곧 뜻이라 그대로 쓴다.
+                label: c.kind == 'day' ? _mdOf(c) : c.label,
+                sub: c.kind == 'day' ? _dowOf(c) : (c.isWeek ? '주' : '달'),
+                on: i == at,
+                filled: hasActual(c),
+                onTap: () => setState(() => _colAt = i),
               );
             },
           ),
         ),
         const SizedBox(height: 10),
-        // 그날 합계
         Wrap(spacing: 8, runSpacing: 6, children: [
           for (final g in [..._kGroups, ...tot.keys.where((k) => !_kGroups.contains(k))])
             if (tot[g] != null) _DayTotal(group: g, plan: tot[g]![0] ?? 0, actual: tot[g]![1]),
         ]),
         const SizedBox(height: 6),
-        if (rows.isEmpty)
+        if (b.items.isEmpty)
           const Padding(
             padding: EdgeInsets.symmetric(vertical: 10),
-            child: Text('이날은 계획도 실적도 없습니다',
+            child: Text('품목이 없습니다',
                 style: TextStyle(fontSize: 12, color: AppColors.textHint)),
           ),
-        for (var i = 0; i < rows.length; i++) _ItemDay(item: rows[i], day: day, first: i == 0),
+        for (var i = 0; i < b.items.length; i++)
+          _ItemDay(item: b.items[i], dates: col.dates, first: i == 0),
       ],
     );
   }
+
+  /// 날짜 칸의 '10/26'. 칸에 날짜가 여럿이면 첫 날.
+  String _mdOf(BloomColumn c) => c.dates.isEmpty ? c.label : _md(c.dates.first);
+  String _dowOf(BloomColumn c) => c.dates.isEmpty ? '' : _dow(c.dates.first);
+
 }
 
 // ── 조각들 ─────────────────────────────────────────────────────
@@ -709,16 +753,22 @@ class _DayTotal extends StatelessWidget {
 
 class _ItemDay extends StatelessWidget {
   final BloomItem item;
-  final String day;
+
+  /// 이 줄이 보여줄 날짜들. 주차 칸이면 그 주 날짜 전부.
+  final List<String> dates;
   final bool first;
-  const _ItemDay({required this.item, required this.day, required this.first});
+  const _ItemDay({required this.item, required this.dates, required this.first});
 
   @override
   Widget build(BuildContext context) {
+    // 2026-10-26 — 공정을 **전부** 세운다.
+    //
+    // 전에는 그 칸에 숫자가 적힌 공정만 세웠다. 그래서 어제는 세 줄이던
+    // 품목이 오늘은 한 줄이 되고, 빠진 공정이 '안 한 것' 인지 '안 적은
+    // 것' 인지 알 수가 없었다. 줄은 늘 서고, 안 적힌 칸은 '입력 전' 이다.
     final cells = [
       for (final s in item.steps)
-        if (s.at(day) != null && ((s.at(day)!.plan ?? 0) > 0 || s.at(day)!.actual != null))
-          (s, s.at(day)!),
+        (s, s.over(dates) ?? const BloomCell()),
     ];
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 9),

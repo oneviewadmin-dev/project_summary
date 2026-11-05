@@ -70,8 +70,10 @@ assert r4['B'] == '완료' and r4['C'] == '대기' and r4['D'] == '대기', r4
 ok += 1
 
 # ── 진행률도 같은 규칙을 탄다 (뒤 단계는 안 센다) ──
+# 2026-11-05 — 앞 단계를 완료로 채우지 않는다. LAIR 작성 · 승인은 '대기' 라고
+# 적혀 있으니 끝난 게 아니다 (Min: "앞 단계 채우기 전부 빼기"). 7/12.
 prog = g['_process_progress']
-assert prog(P) == round(9 / len(P) * 100), prog(P)
+assert prog(P) == round(7 / len(P) * 100), prog(P)
 ok += 1
 
 # ── admin 화면: 고른 값과 보이는 값이 다르면 이유를 말한다 ──

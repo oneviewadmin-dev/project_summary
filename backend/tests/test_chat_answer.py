@@ -32,14 +32,16 @@ import sys
 sys.path.insert(0, str(ROOT))
 resolve = g['_chat_resolve_project']
 
+# 2026-10-26 — 블룸 질문(YFP · SL7 · BOP Assy …)은 여기서 뺐다.
+#
+# 프로젝트 목록을 **엑셀이 만들게** 바꾸면서 config 에는 반도체만 남았다.
+# 아직 양식을 안 올린 상태에서는 그 이름들이 없으니 못 찾는 게 맞다.
+# 찾는 **방법**(이름 · 별칭 · 짧은 약어 경계)은 아래 반도체 보기와
+# 지어 낸 보기로 그대로 지킨다.
 CASES = [
     ('파워박스 매출 얼마야', 'powerbox'),
-    ('블룸 오늘 실적 어때', 'bloom_main'),
     ('큐리 진행 상황 알려줘', 'spacex'),        # '큐리' 는 예전에 못 잡았다
     ('하바플레이트 지연', 'hrva_plate'),
-    ('YFP 오늘 계획', 'bloom_yfp'),
-    ('BOP Assy 실적', 'bloom_bop_assy'),
-    ('SL7 어제 실적', 'bloom_sl7'),
     ('메이저모듈 8월', 'major_module'),
     ('프레임 진행률', 'frame'),
     ('이번주 매출 얼마야', None),               # 프로젝트가 없으면 None
@@ -49,7 +51,8 @@ for q, want in CASES:
     assert got == want, f'{q!r} → {got} (기대 {want})'
     ok += 1
 
-# 짧은 영문 약어는 단어 경계로만 잡는다 (TC 가 아무 데나 붙으면 안 된다)
+# 짧은 영문 약어는 단어 경계로만 잡는다 (TC 가 아무 데나 붙으면 안 된다).
+# 양식으로 'TC' 프로젝트가 생긴 뒤에도 'batch' 안의 tc 를 잡으면 안 된다.
 assert resolve('batch 파일 확인') != 'bloom_tc'
 ok += 1
 

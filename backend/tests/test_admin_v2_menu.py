@@ -99,3 +99,42 @@ assert out['crumbBack'] == '반도체사업부', out['crumbBack']
 ok += 1
 
 print(f'전부 통과 ({ok}/8)')
+
+# ======================================================================
+#  새로고침해도 보던 자리에 그대로 (2026-10-26)
+#
+#  전에는 무엇을 보고 있었든 새로고침하면 첫 사업부(반도체) · 첫 화면으로
+#  돌아갔다. 적을 때는 'v2_division' 에 적고 읽을 때는
+#  'v2_selected_division' 을 봐서, 이름이 어긋나 저장이 아무 일도 안 했다.
+#  엑셀을 반영하면 화면이 저절로 다시 뜨기 때문에 더 자주 걸린다.
+# ======================================================================
+_s = (BACK / "admin_v2.html").read_text(encoding="utf-8") if 'BACK' in dir() \
+     else __import__('io').open(__import__('os').path.join(
+         __import__('os').path.dirname(__import__('os').path.dirname(
+             __import__('os').path.abspath(__file__))), 'admin_v2.html'),
+         encoding='utf-8').read()
+
+_fail = []
+def _ok(c, why):
+    if not c:
+        _fail.append(why)
+
+_ok("localStorage.setItem('v2_page', pg)" in _s,
+    "보던 화면을 안 적어 둔다 — 새로고침하면 홈으로 떨어진다")
+_ok("localStorage.getItem('v2_page')" in _s, "보던 화면을 안 되살린다")
+_ok("localStorage.setItem('v2_selected_division'" in _s,
+    "사업부를 읽는 이름으로 안 적는다 — 적어도 되살아나지 않는다")
+_ok("localStorage.getItem('v2_selected_division') ||" in _s,
+    "옛 이름('v2_division')도 같이 읽지 않는다 — 쓰던 사람만 또 처음으로 간다")
+_ok(".nav-item[data-page=\"' + _pg + '\"]" in _s,
+    "되살릴 때 그 메뉴를 누르지 않는다")
+# 반영 뒤에는 사람이 안 눌러도 저절로 다시 뜬다
+_ok("setTimeout(function() { location.reload(); }" in _s,
+    "반영하고 나서 화면이 저절로 다시 뜨지 않는다")
+
+if _fail:
+    print("실패 %d건" % len(_fail))
+    for f in _fail:
+        print(" -", f)
+    raise SystemExit(1)
+print("ok — 새로고침 자리 지키기")

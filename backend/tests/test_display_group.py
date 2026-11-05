@@ -88,6 +88,10 @@ assert 'if _display_group(m, cutoff) == "개발":' in SRC, \
 assert '_norm_group(_display_group(m)) != grp' in SRC, '보드 행이 아직 저장된 group 으로 묶인다'
 assert 'out["process"] = _proc' in SRC, '양산으로 넘어가면 공정 기록이 사라진다'
 assert 'out["display_group"] = _disp' in SRC, '상세가 display_group 을 안 붙인다'
+# 2026-10-28 — 목록이 나뉘는 기준은 그대로 _display_group 이다.
+# 아리스타 개발을 '양산처럼 보이게' 한 것은 **틀(frame)** 이지 구분이
+# 아니다 — Min: "양산 개발을 나뉘는데 개발에 들어가더라도 양산처럼
+# 틀 똑같이 맞춰달라는거였어". 틀은 test_arista_dev_frame.py 가 본다.
 assert 'g = _display_group(m) if isinstance(m, dict) else "기타"' in SRC, \
     '앱 목록 탭이 아직 저장된 group 으로 나뉜다'
 ok += 1

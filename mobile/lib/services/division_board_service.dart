@@ -16,9 +16,9 @@
 // (/projects/{key}/weekly-board)를 한꺼번에 받아, 각 보드의 '합계' 줄을
 // 그 프로젝트의 한 줄로 쓴다. 나중에 서버가 /divisions/{id}/weekly-board
 // 를 주면 이 파일만 그 호출로 바꾸면 되고, 화면은 그대로다.
+import 'offline_store.dart';
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
 
 import '../config/app_config.dart';
 import '../config/demo_board.dart';
@@ -54,6 +54,14 @@ class DivisionBoardService {
     String? month,
   }) async {
     if (projects.isEmpty) return null;
+
+    // ── 서버가 한 장으로 만들어 주면 그걸 쓴다 (2026-10-26)
+    //
+    // 어느 프로젝트를 세울지는 사업부가 정한다 (아리스타는 렉이 든
+    // 일곱 개뿐). 그 조건을 앱이 또 들고 있으면 서버와 어긋난다 —
+    // 서버가 고른 결과를 그대로 그린다. 옛 서버면 아래 길로 간다.
+    final one = await _divisionBoard(divisionId, month);
+    if (one != null) return one;
 
     // ---- 프로젝트별 보드를 한꺼번에 받는다
     final boards = await Future.wait(
@@ -127,14 +135,41 @@ class DivisionBoardService {
     };
   }
 
+  /// 서버가 사업부 보드를 한 장으로 만들어 주는가 (/divisions/{id}/weekly-board).
+  ///
+  /// 못 받거나 줄이 없으면 null — 그때는 예전처럼 프로젝트를 하나씩
+  /// 받아다 앱이 합친다.
+  static Future<Map<String, dynamic>?> _divisionBoard(
+      String divisionId, String? month) async {
+    try {
+      final q = (month == null || month.isEmpty)
+          ? ''
+          : '?month=${Uri.encodeComponent(month)}';
+      final res = await OfflineStore
+          .httpGet(Uri.parse('$kApiBaseUrl/divisions/'
+              '${Uri.encodeComponent(divisionId)}/weekly-board$q'))
+          .timeout(const Duration(seconds: 10));
+      if (res.statusCode != 200) return null;
+      final d = jsonDecode(utf8.decode(res.bodyBytes));
+      if (d is! Map<String, dynamic>) return null;
+      final rows = (d['rows'] as List?) ?? const [];
+      if (rows.isEmpty) return null;
+      d['division_board'] = true;
+      d['demo'] = false;
+      return d;
+    } catch (_) {
+      return null;
+    }
+  }
+
   // ==== 프로젝트 보드 한 장 받기 ====
   static Future<Map<String, dynamic>?> _one(String key, String? month) async {
     try {
       final q = (month == null || month.isEmpty)
           ? ''
           : '?month=${Uri.encodeComponent(month)}';
-      final res = await http
-          .get(Uri.parse(
+      final res = await OfflineStore
+          .httpGet(Uri.parse(
               '$kApiBaseUrl/projects/${Uri.encodeComponent(key)}/weekly-board$q'))
           .timeout(const Duration(seconds: 10));
       if (res.statusCode != 200) return null;

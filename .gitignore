@@ -193,3 +193,16 @@ backend/models.json
 # 한 번 띄우기만 해도 생긴다.
 backend/models.json.auto_*
 backend/models.json.tmp
+
+# 앱에서 사업부를 숨긴 목록. 진짜는 서버 /data 에 있다 — 여기 생기는 건
+# 로컬에서 한 번 돌려 본 흔적이라 저장소에 들어가면 안 된다.
+backend/division_app_hidden.json
+backend/division_app_hidden.json.tmp
+
+# 사업부별 용어 사전. 진짜는 서버 /data 에 있다.
+backend/division_terms.json
+backend/division_terms.json.tmp
+
+# 사업부 매출 파일로 들어온 금액 (운영 자료 · /data 볼륨에 산다)
+backend/division_revenue.json
+backend/division_revenue.json.tmp

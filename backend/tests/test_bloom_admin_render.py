@@ -101,8 +101,15 @@ _foot = html[html.index('bd-foot'):html.index('</tbody>')]
 _nums = __import__('re').findall(r'>(\d+)</td>', _foot)
 assert _nums == ['100', '73', '155', '60'], _nums
 ok += 1
-# 자재 ETA
-assert '9/16' in html and '퓨즈' in html and '미정' in html, 'ETA 메모가 안 나온다'
+# 메모 — 2026-10-26 부터 '이슈' 라고 적힌 것만 띄운다.
+#
+# 엑셀 메모 칸에는 그날 적어 둔 말이 다 들어온다(재고 수량 · 입고 주기 ·
+# 자재 코드 · 작업 지연 사유). 통째로 쏟으면 표보다 메모가 길어져서
+# 정작 숫자를 못 본다. 남는 게 없으면 칸째 안 그린다.
+assert '자재 입고 예정' not in html, "'자재 입고 예정' 머리말이 아직 있다"
+assert 'ETA:9/16' not in html, "'이슈' 라고 안 적힌 메모가 아직 뜬다"
+assert 'bd-eta' not in html, '남는 메모가 없는데 메모 칸을 그렸다'
+assert 'var BD_NOTES_ON = false;' in BLOCK, '메모 칸을 끄는 스위치가 없다'
 ok += 1
 # 비고
 assert '퓨즈 대기' in html, '비고가 안 나온다'

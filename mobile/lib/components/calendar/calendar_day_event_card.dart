@@ -96,8 +96,14 @@ class CalendarDayEventCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '${event.divisionLabel} · ${event.projectLabel}${event.time != null ? " · ${event.time}" : ""}',
-                      style: const TextStyle(fontSize: 11, color: Color(0xFF7C8594)),
+                      '${event.divisionLabel} · ${event.projectLabel}'
+                      '${event.statusLabel.isNotEmpty ? " · ${event.statusLabel}" : ""}'
+                      '${event.time != null ? " · ${event.time}" : ""}',
+                      style: TextStyle(
+                          fontSize: 11,
+                          color: event.isLate
+                              ? const Color(0xFFDC2626)
+                              : const Color(0xFF7C8594)),
                     ),
                   ],
                 ),

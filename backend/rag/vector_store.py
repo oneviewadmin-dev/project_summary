@@ -1,6 +1,6 @@
-"""
-FAISS 벡터스토어 로드 및 검색 유틸
-"""
+# ============================================================
+#  FAISS 벡터스토어 로드 및 검색 유틸
+# ============================================================
 import json
 import os
 from pathlib import Path
@@ -30,8 +30,8 @@ def _get_client() -> OpenAI:
     return _client
 
 
+# 인덱스와 메타를 lazy 로드
 def _load():
-    """인덱스와 메타를 lazy 로드"""
     global _index, _meta
     if _index is None and INDEX_PATH.exists():
         _index = faiss.read_index(str(INDEX_PATH))
@@ -44,11 +44,9 @@ def is_ready() -> bool:
     return _index is not None and _meta is not None
 
 
+# 쿼리 임베딩 -> Top-K 검색 반환: [{score, division_id, project_key, project_label, report_date, text},
+# ...]
 def search(query: str, top_k: int = 5) -> list[dict]:
-    """
-    쿼리 임베딩 -> Top-K 검색
-    반환: [{score, division_id, project_key, project_label, report_date, text}, ...]
-    """
     _load()
     if _index is None or _meta is None:
         return []

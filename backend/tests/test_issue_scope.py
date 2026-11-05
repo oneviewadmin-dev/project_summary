@@ -92,7 +92,7 @@ assert '없습니다' in g['_alert_answer_all'](['지연'])
 ok += 1
 
 # ── 질문에 나온 종류만 고른다 ──
-_br = SRC.split('# ── 이슈·지연 질문은 적힌 그대로 답한다')[1].split('# ── 월 범위 기억')[0]
+_br = SRC.split('# 이슈·지연 질문은 적힌 그대로 답한다')[1].split('# 월 범위 기억')[0]
 assert "_kinds.append('지연')" in _br and "_kinds.append('이슈')" in _br, \
     '물어본 종류를 안 가린다'
 assert '_proj_in_msg' in _br and 'last_project' not in _br, \

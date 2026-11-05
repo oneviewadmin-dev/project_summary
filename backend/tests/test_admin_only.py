@@ -48,28 +48,29 @@ for frag, why in [
     ok(frag in MAIN, why)
 
 
-# ── 2. 블룸 — 올리는 자리가 admin 에 보인다 ─────────────────────────
-ids = [p.get("id") for p in admin_list("bloom")]
-ok("bloom_main" in ids, "admin 목록에 bloom_main 이 없다 — 올릴 자리가 화면에 없다")
-for item in ("bloom_yfp", "bloom_corva_kpe", "bloom_sl7", "bloom_tc",
-             "bloom_wdm", "bloom_bop", "bloom_bop_assy"):
-    ok(item in ids, "admin 목록에서 %s 가 빠졌다" % item)
-ok(len(ids) == 8, "블룸 admin 목록이 8개가 아니다: %d" % len(ids))
+# ── 2. 2026-10-26 · 프로젝트 목록은 엑셀이 만든다 ──────────────────
+#
+# 전에는 블룸 품목 여덟 개 + 저장소(bloom_main)를 config 에 박아 뒀다.
+# 그런데 양식에 적힌 이름이 그와 달라지면(CORVA EFM KPE · SM 등) 화면에
+# '등록된 모델 없음' 짜리와 새로 생긴 것이 나란히 서서 어느 쪽이 진짜인지
+# 알 수 없게 됐다. 이제 기준은 올라온 엑셀 하나다.
+#
+# config 에는 반도체(와 공용)만 남는다. 다른 사업부 프로젝트는 양식을
+# 올릴 때 만들어진다 — 그래서 여기서 셀 수가 없다. 대신 '만들어지는 길'
+# 이 살아 있는지만 지킨다.
+_cfg_divs = {p.get("division_id") for p in cl.get_projects(visible_only=False)}
+ok(_cfg_divs <= {"semiconductor", "system"},
+   "config 에 반도체 · 공용 말고 다른 사업부가 남아 있다: %r" % sorted(_cfg_divs))
 
-lead = [p for p in admin_list("bloom") if p.get("admin_only")]
-ok(len(lead) == 1, "블룸의 '올리는 자리' 가 %d개다 (1개여야 한다)" % len(lead))
-if lead:
-    ok(lead[0].get("id") == "bloom_main", "올리는 자리가 bloom_main 이 아니다")
-    ok("전체" in str(lead[0].get("label")),
-       "라벨에 '전체' 가 없다 — 품목처럼 보이면 대표라는 게 안 읽힌다: %r"
-       % lead[0].get("label"))
-
-
-# ── 3. 앱·홈이 보는 목록은 안 바뀐다 ────────────────────────────────
-vis = [p.get("id") for p in cl.get_projects(division_id="bloom", visible_only=True)]
-ok("bloom_main" not in vis,
-   "bloom_main 이 앱·홈 목록에도 나온다 — visible 은 false 로 둬야 한다")
-ok(len(vis) == 7, "앱·홈 블룸 목록이 7개가 아니다: %d" % len(vis))
+for frag, why in [
+    ('def _df_create_projects', "양식으로 프로젝트를 만드는 자리가 없다"),
+    ('row["bloom_item"] = r["owner"]',
+     "양식으로 만든 일 보고 프로젝트에 품목 이름을 안 붙인다 — "
+     "일 보고를 잘라 볼 열쇠가 없어진다"),
+    ('"created_by": "division_form"',
+     "양식이 만든 프로젝트에 표시를 안 남긴다 — 나중에 정리할 수가 없다"),
+]:
+    ok(frag in MAIN, why)
 
 
 # ── 4. 다른 사업부는 하나도 안 바뀐다 ───────────────────────────────
@@ -86,7 +87,10 @@ for div in sorted(divs):
 # ── 5. admin_only 를 아무 데나 달아 두지 않았는지 ───────────────────
 alls = cl.get_projects(visible_only=False)
 ao = [p.get("id") for p in alls if p.get("admin_only")]
-ok(ao == ["bloom_main"], "admin_only 가 붙은 프로젝트가 예상과 다르다: %s" % ao)
+# 2026-10-26 — bloom_main 이 config 에서 빠지면서 admin_only 도 비었다.
+# 아무 데나 달지 않았는지만 본다 (반도체에는 하나도 없어야 한다).
+ok(all(p.get("division_id") != "semiconductor" for p in alls if p.get("admin_only")),
+   "반도체 프로젝트에 admin_only 가 붙었다: %s" % ao)
 for p in alls:
     if p.get("admin_only"):
         ok(p.get("visible") is False,
@@ -104,11 +108,18 @@ for p in raw.get("projects", []):
     ok(p.get("division_id"), "%s 에 division_id 가 없다" % i)
     ok(p.get("label"), "%s 에 label 이 없다" % i)
 
-# 화면의 '올리는 곳' 선언과 config 가 같은 곳을 가리키는가
+# 2026-10-26 — '자료 올리는 곳'(블룸 전체) 줄은 없앴다.
+#
+# 일 보고 자료는 오른쪽 위 '엑셀 올리기' 안에서 올린다. 그래서 품목도
+# 모델도 없는 'bloom_main' 줄이 목록 맨 앞에 설 이유가 없어졌다.
+# config 에서 지우지는 않는다 — 지난 자료가 그 키에 붙어 있다.
 AV2 = (BACK / "admin_v2.html").read_text(encoding="utf-8")
-ok("UPLOAD_LEAD_PROJECT" in AV2, "화면에 UPLOAD_LEAD_PROJECT 선언이 없다")
-ok("bloom_main: {" in AV2 or "bloom_main:{" in AV2,
-   "화면의 UPLOAD_LEAD_PROJECT 가 bloom_main 을 안 가리킨다")
+ok("UPLOAD_LEAD_PROJECT = {};" in AV2,
+   "'올리는 곳' 선언을 비우지 않았다 — 블룸 (전체) 줄이 다시 선다")
+ok("MDL_PICK_HIDE" in AV2 and "'bloom_main'" in AV2,
+   "프로젝트 목록에서 bloom_main 을 숨기지 않는다")
+ok("블룸 자료는 <b>블룸 (전체)</b>" not in AV2,
+   "없앤 '블룸 (전체)' 로 안내가 아직 보낸다")
 
 if FAIL:
     print("실패 %d건" % len(FAIL))

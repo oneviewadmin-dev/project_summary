@@ -64,16 +64,12 @@ def _ledger() -> Path:
     return base / "excel_uploads.json"
 
 
+# 옛 자리(폴더 안). 이미 쌓인 게 있으면 같이 읽어 준다
 def _ledger_old() -> Path:
-    """옛 자리(폴더 안). 이미 쌓인 게 있으면 같이 읽어 준다."""
     return _root() / "ledger.jsonl"
 
 
 # ==== 파일 이름 안전하게 만들기 ====
-#
-# 올라온 파일 이름은 사람이 지은 것이라 무엇이든 들어 있다. 경로
-# 구분자('../'), 제어문자, 윈도에서 못 쓰는 글자, 맥에서 오는 자모
-# 분리(NFD) 까지. 그대로 쓰면 보관함 밖에 파일을 쓸 수도 있다.
 def safe_name(name: str) -> str:
     s = unicodedata.normalize("NFC", (name or "").strip())
     s = s.replace("\\", "/").split("/")[-1]      # 경로는 마지막 조각만
@@ -117,12 +113,6 @@ def stats() -> dict:
 
 
 # ==== 보관 ====
-#
-# where   어느 업로드 경로로 들어왔는지 (/admin/.../plan-file/apply 같은 것)
-# project 프로젝트 키. 없으면 빈 칸
-#
-# 돌려주는 값은 기록된 한 줄이다. 실패해도 예외를 던지지 않고
-# {"ok": False, ...} 를 돌려준다.
 def keep(raw: bytes, filename: str, where: str = "", project: str = "",
          admin: str = "") -> dict:
     now = datetime.now()
@@ -156,16 +146,18 @@ def keep(raw: bytes, filename: str, where: str = "", project: str = "",
                   "MAX_TOTAL_BYTES 를 올려야 한다."
                   % (st["bytes"] / 1073741824, MAX_TOTAL_BYTES / 1073741824))
             return _write_ledger(rec)
-
-        # ---- 같은 파일을 또 올렸으면 파일은 한 벌만 둔다 (기록은 남긴다)
+        # -----------------------------------------------------------
+        # 같은 파일을 또 올렸으면 파일은 한 벌만 둔다 (기록은 남긴다)
+        # -----------------------------------------------------------
         same = _find_by_hash(rec["sha256"])
         if same:
             rec["stored"] = same
             rec["ok"] = True
             rec["duplicate_of"] = same
             return _write_ledger(rec)
-
-        # ---- 저장
+        # -----------------------------------------------------------
+        # 저장
+        # -----------------------------------------------------------
         mdir = _root() / now.strftime("%Y-%m")
         mdir.mkdir(parents=True, exist_ok=True)
         fname = "%s__%s__%s__%s" % (
@@ -200,12 +192,8 @@ def keep(raw: bytes, filename: str, where: str = "", project: str = "",
             return rec
 
 
+# 기록 한 줄 추가.
 def _write_ledger(rec: dict) -> dict:
-    """기록 한 줄 추가.
-
-    옆에 다 쓰고 이름만 바꾼다. 쓰는 도중에 서버가 죽거나 배포로 교체되면
-    반만 적힌 JSON 이 남고, 그건 다시 읽을 수 없다 (_save_models 와 같은 방식).
-    """
     try:
         recs = entries(limit=0)
         recs.append(rec)
@@ -236,7 +224,9 @@ def _find_by_hash(sha: str) -> str:
 # limit 0 이면 전부. 최근 것이 뒤에 온다(기록 순서 그대로).
 def entries(month: str = "", project: str = "", limit: int = 500) -> list:
     out = []
-    # ---- 지금 자리 (DATA_DIR/excel_uploads.json — 배열)
+    # -----------------------------------------------------------
+    # 지금 자리 (DATA_DIR/excel_uploads.json — 배열)
+    # -----------------------------------------------------------
     p = _ledger()
     if p.exists():
         try:
@@ -245,7 +235,9 @@ def entries(month: str = "", project: str = "", limit: int = 500) -> list:
                 out.extend(r for r in data if isinstance(r, dict))
         except Exception as e:
             print("[보관함] 기록 읽기 실패 — %s" % e)
-    # ---- 옛 자리 (폴더 안 ledger.jsonl — 한 줄에 한 건)
+    # -----------------------------------------------------------
+    # 옛 자리 (폴더 안 ledger.jsonl — 한 줄에 한 건)
+    # -----------------------------------------------------------
     q = _ledger_old()
     if q.exists():
         try:
@@ -261,21 +253,44 @@ def entries(month: str = "", project: str = "", limit: int = 500) -> list:
                     out.append(rec)
         except Exception as e:
             print("[보관함] 옛 기록 읽기 실패 — %s" % e)
-
+    # -----------------------------------------------------------
+    # 3. 올린 시각 순으로 줄을 세운다
+    # -----------------------------------------------------------
+    #    지금 자리와 옛 자리에서 읽은 것이 섞여 있어서 한 번 정렬해야
+    #    화면에 시간 순서대로 뜬다.
     out.sort(key=lambda r: str(r.get("at", "")))
+    # -----------------------------------------------------------
+    # 4. 달로 거른다 (month 를 줬을 때만)
+    # -----------------------------------------------------------
+    #    기록의 at 은 '2026-10-23T09:12:00' 꼴이라, 앞부분이 '2026-10' 으로
+    #    시작하면 그 달 것이다.
     if month:
-        out = [r for r in out if str(r.get("at", "")).startswith(month)]
+        kept = []
+        for r in out:
+            at = str(r.get("at", ""))
+            if at.startswith(month):
+                kept.append(r)
+        out = kept
+    # -----------------------------------------------------------
+    # 5. 프로젝트로 거른다 (project 를 줬을 때만)
+    # -----------------------------------------------------------
     if project:
-        out = [r for r in out if r.get("project") == project]
+        kept = []
+        for r in out:
+            if r.get("project") == project:
+                kept.append(r)
+        out = kept
+    # -----------------------------------------------------------
+    # 6. 너무 많으면 최근 것만 남긴다
+    # -----------------------------------------------------------
+    #    앞에서 자르는 이유: 뒤쪽이 최근 기록이다.
     if limit and len(out) > limit:
         out = out[-limit:]
+
     return out
 
 
 # ==== 한 건의 실제 파일 경로 ====
-#
-# 바깥에서 오는 id 로 파일을 찾는다. 경로를 직접 받지 않는 이유는
-# '../../etc/passwd' 같은 값으로 보관함 밖을 읽히지 않기 위해서다.
 def path_of(entry_id: str) -> Path | None:
     for rec in reversed(entries(limit=0)):
         if rec.get("id") != entry_id or not rec.get("stored"):
@@ -289,8 +304,8 @@ def path_of(entry_id: str) -> Path | None:
     return None
 
 
+# 파일이 있는 연-월 목록. 최근 것이 앞.
 def months() -> list:
-    """파일이 있는 연-월 목록. 최근 것이 앞."""
     root = _root()
     if not root.exists():
         return []
@@ -299,8 +314,8 @@ def months() -> list:
     return sorted(ms, reverse=True)
 
 
+# 한 달치를 zip 한 덩어리로. 후임이 브라우저로 통째로 내려받는 길.
 def zip_bytes(month: str) -> bytes:
-    """한 달치를 zip 한 덩어리로. 후임이 브라우저로 통째로 내려받는 길."""
     import io
     import zipfile
     mdir = _root() / month

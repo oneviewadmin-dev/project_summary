@@ -1,6 +1,6 @@
+import '../services/offline_store.dart';
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import '../config/app_config.dart';
 import '../design/typography.dart';
 
@@ -22,11 +22,41 @@ class DevProcessScreen extends StatefulWidget {
 class _DevProcessScreenState extends State<DevProcessScreen> {
   late Future<Map<String, dynamic>> _future;
 
+  // 반도체 13단계가 쓰는 묶음. 색만 여기서 가져온다.
   static const _groups = [
     ['발주', Color(0xFFDBEAFE), Color(0xFF1D4ED8)],
     ['제작·검사', Color(0xFFFEF3C7), Color(0xFFB45309)],
     ['승인', Color(0xFFEDE9FE), Color(0xFF7C3AED)],
   ];
+  static const _plain = ['개발 단계', Color(0xFFF1F5F9), Color(0xFF475569)];
+
+  /// 단계를 **서버가 준 그대로** 묶는다 (2026-11-02).
+  ///
+  /// Min: "자동차 개발은 고객사별로 개발 일정 양식이 맞춰져야돼"
+  ///
+  /// 전에는 위 세 묶음만 훑어서 `group` 이 그 셋 중 하나인 단계만 그렸다.
+  /// 그런데 개발 일정 양식으로 들어온 단계는 group 이 빈 값이다 — 묶음은
+  /// 반도체 13단계에만 붙어 있는 값이라서다. 그래서 자동차
+  /// (01 T-car … 06 SOP) 와 블룸 (PO 발주 → PRP → 최종 승인) 은
+  /// 진행률과 초록 체크는 맞게 나오는데 **단계 목록이 통째로 비어** 보였다.
+  ///
+  /// 이제 묶음이 있으면 그 묶음으로, 없으면 '개발 단계' 한 덩이로 그린다.
+  /// 순서는 서버가 준 차례를 지킨다 — 고객사마다 단계가 달라서, 화면이
+  /// 멋대로 재정렬하면 그 고객사의 일하는 차례가 깨진다.
+  static List<List<dynamic>> _sections(List<Map<String, dynamic>> steps) {
+    final out = <List<dynamic>>[];
+    final seen = <String>{};
+    for (final s in steps) {
+      final g = (s['group'] ?? '').toString().trim();
+      final key = g.isEmpty ? _plain[0] as String : g;
+      if (seen.contains(key)) continue;
+      seen.add(key);
+      final known = _groups.firstWhere((x) => x[0] == key,
+          orElse: () => _plain);
+      out.add([key, known[1], known[2]]);
+    }
+    return out;
+  }
 
   @override
   void initState() {
@@ -35,8 +65,8 @@ class _DevProcessScreenState extends State<DevProcessScreen> {
   }
 
   Future<Map<String, dynamic>> _fetch() async {
-    final res = await http
-        .get(Uri.parse(
+    final res = await OfflineStore
+        .httpGet(Uri.parse(
             '$kApiBaseUrl/projects/${widget.projectKey}/model-process?model_id=${Uri.encodeComponent(widget.modelId)}'))
         .timeout(const Duration(seconds: 8));
     if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
@@ -60,7 +90,7 @@ class _DevProcessScreenState extends State<DevProcessScreen> {
             return const Center(child: CircularProgressIndicator());
           }
           if (snap.hasError) {
-            return Center(child: Text('로드 실패: ${snap.error}'));
+            return Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(OfflineStore.errorText(snap.error), textAlign: TextAlign.center, style: const TextStyle(fontSize: 13.5, height: 1.5, color: Color(0xFF6B7280)))));
           }
           final d = snap.data ?? {};
           final steps = (d['steps'] as List? ?? []).cast<Map<String, dynamic>>();
@@ -167,8 +197,11 @@ class _DevProcessScreenState extends State<DevProcessScreen> {
               ],
               const SizedBox(height: 12),
               // 단계 그룹
-              ..._groups.map((g) {
-                final list = steps.where((s) => s['group'] == g[0]).toList();
+              ..._sections(steps).map((g) {
+                final list = steps.where((s) {
+                  final sg = (s['group'] ?? '').toString().trim();
+                  return (sg.isEmpty ? _plain[0] : sg) == g[0];
+                }).toList();
                 if (list.isEmpty) return const SizedBox.shrink();
                 return Container(
                   margin: const EdgeInsets.only(bottom: 12),

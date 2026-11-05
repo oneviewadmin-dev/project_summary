@@ -31,7 +31,9 @@ import '../widgets/bloom_plan_actual_card.dart';
 import '../widgets/bloom_today_card.dart';
 import '../widgets/purchase_status_card.dart';
 import '../widgets/weekly_board_card.dart';
+import '../widgets/daily_board_card.dart';
 import '../services/division_board_service.dart';
+import '../config/demo_board.dart';
 import '../services/purchase_service.dart';
 import '../models/purchase_status.dart';
 import '../components/division/division_immediate_check.dart'
@@ -51,6 +53,8 @@ import 'project_overview_screen.dart';
 import 'revenue_detail_screen.dart';
 import 'calendar_screen.dart';
 import 'chat_screen.dart';
+import '../config/owner_label.dart';
+import '../config/customer_groups.dart';
 
 class DivisionProjectsScreen extends StatefulWidget {
   final Division division;
@@ -77,7 +81,6 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
   bool _favoritesOnly = false;
 
   /// 매출 계획이 없는 프로젝트 그룹 펼침 여부
-  bool _showNoPlan = false;
 
   late Future<List<DashboardCard>> _future;
 
@@ -135,8 +138,16 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
   bool get _purchaseFrame => _onlyPurchase && !kSameFrameForAll;
 
   /// 프로젝트 안에 있던 주차별 계획(주차 현황 보드)을 사업부 화면
-  /// 위쪽으로 끌어올리는 사업부인가. 지금은 블룸·자동차.
+  /// 위쪽으로 끌어올리는 사업부인가. 지금은 블룸만.
   bool get _divisionBoard => kDivisionBoardOn.contains(widget.division.id);
+
+  /// 일 보고 자료가 날마다 들어오는 사업부인가 (ESS · 블룸).
+  bool get _dailyBoard => kDailyBoardOn.contains(widget.division.id);
+
+  /// 지금 목록에 뜬 매출이 보여주기용 예시인가 (버릴 코드).
+  bool _demoRevenue = false;
+  int _demoRev = 0;    // 예시 매출 합 (히어로에 올린다)
+  int _demoPlan = 0;
 
   Future<void> _loadPurchase() async {
     final p = await PurchaseService.fetch(widget.division.id);
@@ -167,6 +178,43 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
     if (_bloomFrame) _loadBloom();
     if (_isSemi) _loadSheetRevenue();
     if (!kSameFrameForAll) _loadPurchase();
+    // 국내 / 해외로 묶는 사업부(PCB)는 매출 기여순 대신 이름순이 기본 (2026-11-04)
+    if (_grouped) _sort = _ProjectSort.name;
+  }
+
+  /// 고객사를 국내 / 해외(Lam · 아리스타 · 기타)로 묶어 보여 주나 (2026-11-04)
+  ///
+  /// 서버(/divisions 의 customer_groups)가 정한다 — 앱 배포 없이 바뀐다.
+  /// 옛 서버라 안 보내 주면 앱에 적어 둔 값(customer_groups.dart)으로.
+  bool get _grouped =>
+      _groupOrder.isNotEmpty;
+
+  List<List<String>> get _groupOrder =>
+      widget.division.customerGroups.isNotEmpty
+          ? widget.division.customerGroups
+          : (customerGroupsOn(widget.division.id) ? kCustomerGroupOrder : const []);
+
+  /// 그 고객사의 묶음 — 서버 값 먼저
+  List<String> _groupOf(String projectId) {
+    if (widget.division.customerGroups.isNotEmpty) {
+      for (final p in widget.division.projects) {
+        if (p.id == projectId && p.group != null) return p.group!;
+      }
+      return widget.division.customerGroups.first;
+    }
+    return customerGroupOf(widget.division.id, projectId) ?? const ['국내', ''];
+  }
+
+  /// 묶음 머리글 자리 — 위 버튼을 누르면 그 묶음으로 내려간다
+  final Map<String, GlobalKey> _groupKeys = {};
+
+  void _jumpTo(String gk) {
+    final ctx = _groupKeys[gk]?.currentContext;
+    if (ctx == null) return;
+    Scrollable.ensureVisible(ctx,
+        duration: const Duration(milliseconds: 320),
+        curve: Curves.easeOutCubic,
+        alignment: 0.02);
   }
 
   Future<void> _loadAuto() async {
@@ -505,6 +553,29 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
       ));
     }
 
+    // ── 보여주기용 매출 예시 (버릴 코드) ──────────────────────────
+    //
+    // 자동차는 월 매출이 /overview 에 안 들어와서 모든 줄이 '매출 미등록'
+    // 으로 떨어지고, 그러면 목록이 통째로 접힌 그룹으로 내려가 첫 화면이
+    // 빈다. 보고용으로 숫자를 채운다 — 서버에 0 만 있을 때만.
+    //
+    // 버릴 때: app_config 의 kDemoBoardData 를 false 로. (demo_board.dart)
+    _demoRevenue = false;
+    _demoRev = 0;
+    _demoPlan = 0;
+    if (kDemoBoardData &&
+        DemoBoard.hasRevenue(widget.division.id) &&
+        !projects.any((p) => p.revenue > 0 || p.planRevenue > 0)) {
+      for (var i = 0; i < projects.length; i++) {
+        final d = DemoBoard.of(widget.division.id, projects[i].id);
+        if (d == null || d.planRevenue <= 0) continue;
+        projects[i] = projects[i].withRevenue(d.revenue, d.planRevenue);
+        _demoRev += d.revenue;
+        _demoPlan += d.planRevenue;
+        _demoRevenue = true;
+      }
+    }
+
     // ── 사업부 전체 진행률: 집계 대상 '모델' 가중 평균
     final keys = projects.map((p) => p.id);
     final scoredModels = _progress.scoredModelsFor(keys);
@@ -586,8 +657,12 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
         if (ar != br) return br.compareTo(ar);
         return a.koreanName.compareTo(b.koreanName);
       }
-      if (a.hasRevenue != b.hasRevenue) return a.hasRevenue ? -1 : 1;
-      if (a.hasData != b.hasData) return a.hasData ? -1 : 1;
+      // 국내 / 해외로 묶는 사업부는 매출 · 자료 유무로 앞세우지 않는다 —
+      // 이름순으로 두면 찾는 고객사가 늘 같은 자리에 있다 (2026-11-04).
+      if (!_grouped) {
+        if (a.hasRevenue != b.hasRevenue) return a.hasRevenue ? -1 : 1;
+        if (a.hasData != b.hasData) return a.hasData ? -1 : 1;
+      }
 
       final ap = a.progressPercent;
       final bp = b.progressPercent;
@@ -632,6 +707,143 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
       case _ProjectStatusFilter.noData:
         return !p.hasData;
     }
+  }
+
+  /// 고객사 한 줄 — 아래 '한 목록' 과 같은 모양 (매출 있으면 금액 줄)
+  Widget _projectRow(_ProjectItem p) {
+    if (p.hasRevenue) {
+      return ProjectRevenueRow(
+        koreanName: p.koreanName,
+        status: p.status,
+        revenue: p.revenue,
+        planRevenue: p.planRevenue,
+        qtyPlan: p.qtyPlan,
+        qtyActual: p.qtyActual,
+        modelsTotal: p.modelsTotal,
+        progressPercent: p.progressPercent,
+        isFavorite: _favoriteProjects.contains(p.id),
+        isSelected: _selectedProjectId == p.id,
+        onTap: () => _tapProject(p.id, p.koreanName),
+        onToggleFavorite: () => _toggleFavorite(p.id),
+      );
+    }
+    return ProjectPlainRow(
+      koreanName: p.koreanName,
+      modelsTotal: p.modelsTotal,
+      progressPercent: p.progressPercent,
+      isFavorite: _favoriteProjects.contains(p.id),
+      onTap: () => _tapProject(p.id, p.koreanName),
+      onToggleFavorite: () => _toggleFavorite(p.id),
+    );
+  }
+
+  /// 국내 → 해외(Lam · 아리스타 · 기타). 묶음 안은 고른 정렬 그대로.
+  /// 빈 묶음은 안 그린다.
+  List<Widget> _groupedRows(List<_ProjectItem> list) {
+    final by = <String, List<_ProjectItem>>{};
+    for (final p in list) {
+      final g = _groupOf(p.id);
+      by.putIfAbsent('${g[0]}|${g[1]}', () => []).add(p);
+    }
+    final out = <Widget>[];
+    // ── 바로 가기 버튼 (2026-11-04)
+    // Min: "국내, 해외 위에 버튼으로 바로 이동 할 수 있게끔 해줘"
+    final jumps = <Widget>[];
+    for (final g in _groupOrder) {
+      final n = by['${g[0]}|${g[1]}']?.length ?? 0;
+      if (n == 0) continue;
+      final gk = '${g[0]}|${g[1]}';
+      jumps.add(_jumpChip(g[1].isEmpty ? g[0] : '${g[0]} · ${g[1]}', n, () => _jumpTo(gk)));
+    }
+    if (jumps.length > 1) {
+      out.add(Padding(
+        padding: const EdgeInsets.only(bottom: 4),
+        child: Wrap(spacing: 6, runSpacing: 6, children: jumps),
+      ));
+    }
+    String? lastBig;
+    for (final g in _groupOrder) {
+      final items = by['${g[0]}|${g[1]}'] ?? const <_ProjectItem>[];
+      if (items.isEmpty) continue;
+      final gk = '${g[0]}|${g[1]}';
+      final key = _groupKeys.putIfAbsent(gk, () => GlobalKey());
+      if (g[0] != lastBig) {
+        final n = _groupOrder
+            .where((x) => x[0] == g[0])
+            .fold<int>(0, (a, x) => a + (by['${x[0]}|${x[1]}']?.length ?? 0));
+        // 작은 묶음이 없는 큰 묶음(국내)은 큰 머리글이 곧 버튼이 내려갈 자리다
+        final head = _groupHead(g[0], n, big: true, first: lastBig == null);
+        out.add(g[1].isEmpty ? KeyedSubtree(key: key, child: head) : head);
+        lastBig = g[0];
+      }
+      if (g[1].isNotEmpty) {
+        out.add(KeyedSubtree(key: key, child: _groupHead(g[1], items.length)));
+      }
+      for (final p in items) {
+        out.add(_projectRow(p));
+        out.add(const SizedBox(height: 8));
+      }
+    }
+    return out;
+  }
+
+  Widget _jumpChip(String label, int n, VoidCallback onTap) {
+    return Material(
+      color: Colors.white,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: const BorderSide(color: Color(0xFFDDE3EA)),
+      ),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 6),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Text(label,
+                style: const TextStyle(
+                    fontSize: 12, fontWeight: FontWeight.w700, color: Color(0xFF1F2937))),
+            const SizedBox(width: 5),
+            Text('$n',
+                style: const TextStyle(
+                    fontSize: 11.5, fontWeight: FontWeight.w700, color: Color(0xFF94A3B8))),
+            const SizedBox(width: 2),
+            const Icon(Icons.south_rounded, size: 12, color: Color(0xFF94A3B8)),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _groupHead(String label, int n, {bool big = false, bool first = false}) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(big ? 2 : 6, big ? (first ? 2 : 14) : 4, 2, 6),
+      child: Row(children: [
+        if (!big)
+          Container(
+            width: 3,
+            height: 12,
+            margin: const EdgeInsets.only(right: 6),
+            decoration: BoxDecoration(
+              color: const Color(0xFF94A3B8),
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+        Text(label,
+            style: TextStyle(
+              fontSize: big ? 13.5 : 12,
+              fontWeight: FontWeight.w800,
+              color: big ? AppColors.headerNavy : const Color(0xFF475569),
+            )),
+        const SizedBox(width: 6),
+        Text('$n',
+            style: TextStyle(
+              fontSize: big ? 12 : 11,
+              fontWeight: FontWeight.w700,
+              color: AppColors.textHint,
+            )),
+      ]),
+    );
   }
 
   List<_ProjectItem> _visibleProjects(List<_ProjectItem> sorted) {
@@ -911,11 +1123,6 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
           final data = _computeData(snap.data!);
           final sortedProjects = _sortProjects(data.projects);
           final visibleProjects = _visibleProjects(sortedProjects);
-          // 매출이 걸린 프로젝트가 본문, 나머지는 접힌 그룹.
-          final withRevenue =
-              visibleProjects.where((p) => p.hasRevenue).toList();
-          final noRevenue =
-              visibleProjects.where((p) => !p.hasRevenue).toList();
 
           return SafeArea(
             top: false,
@@ -923,6 +1130,9 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
               onRefresh: _refresh,
               child: ListView(
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+                // 묶음 버튼으로 내려가려면 아래 줄까지 미리 그려져 있어야 한다.
+                // 고객사가 서른 줄 남짓이라 다 그려도 가볍다.
+                cacheExtent: _grouped ? 20000 : null,
                 children: [
                   // 2026-10-23 — 사업부 전용 카드는 안 그린다.
                   // 반도체사업부 화면에 없는 것은 어느 사업부에도 없다.
@@ -950,12 +1160,22 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                     DivisionRevenueHero(
                     month: _useSheet ? _rev.month : _overview.month,
                     // 반도체는 주간보고 실적과 사람이 넣은 타겟을 쓴다.
-                    revenue: _useSheet ? _rev.actual : _overview.revenue,
-                    planRevenue:
-                        _useSheet ? _rev.target : _overview.planRevenue,
-                    pairLabel: _useSheet
-                        ? (_rev.hasTarget ? '실적 / 타겟' : '실적')
-                        : '실적 / 계획',
+                    //
+                    // 예시 매출을 띄우는 사업부(자동차)는 히어로도 그 합으로
+                    // 바꾼다. /overview 는 사업부를 안 가려 회사 전체 값을
+                    // 돌려주는데, 아래 목록은 예시 숫자라 둘이 안 맞으면
+                    // 보여줄 때 더 헷갈린다. 딱지는 '예시 ·' 로 붙인다.
+                    revenue: _demoRevenue
+                        ? _demoRev
+                        : (_useSheet ? _rev.actual : _overview.revenue),
+                    planRevenue: _demoRevenue
+                        ? _demoPlan
+                        : (_useSheet ? _rev.target : _overview.planRevenue),
+                    pairLabel: _demoRevenue
+                        ? '예시 · 실적 / 계획'
+                        : (_useSheet
+                            ? (_rev.hasTarget ? '실적 / 타겟' : '실적')
+                            : '실적 / 계획'),
                     qtyPlan: _overview.qtyPlan,
                     qtyActual: _overview.qtyActual,
                     weekLabel: _weekLabel(),
@@ -993,6 +1213,16 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                       },
                     ),
                   ],
+                  // ── 일 보고 보드 (ESS · 블룸) ──────────────────
+                  // 날마다 들어오는 자료라 가장 최근 소식이다. 그래서
+                  // 주차 보드보다 위에 둔다.
+                  if (_dailyBoard) ...[
+                    const SizedBox(height: 14),
+                    DailyBoardCard(
+                      key: ValueKey('daily-${widget.division.id}'),
+                      divisionId: widget.division.id,
+                    ),
+                  ],
                   // ── 사업부 주차 현황 보드 (블룸 · 자동차) ────────
                   // 프로젝트 화면과 같은 표인데 '구분' 열이 프로젝트다.
                   // (YFP · Corva KPE · 외 N종 · 합계)
@@ -1001,8 +1231,10 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                     const SizedBox(height: 14),
                     WeeklyBoardCard(
                       key: ValueKey('division-board-${widget.division.id}'),
-                      loader: () => DivisionBoardService.fetch(
+                      // 보드 머리글에서 고른 달을 그대로 넘긴다 (2026-11-04)
+                      loader: (month) => DivisionBoardService.fetch(
                         divisionId: widget.division.id,
+                        month: month,
                         projects: [
                           for (final p in data.projects)
                             BoardProject(
@@ -1024,15 +1256,36 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                   Row(
                     children: [
                       Text(
-                        '프로젝트',
+                        ownerLabelOf(widget.division.id),
                         style: AppText.bodyStrong.copyWith(
                           fontSize: 14,
                           color: AppColors.headerNavy,
                         ),
                       ),
                       const SizedBox(width: 8),
+                      // 지어낸 매출로 그린 목록이라는 걸 붙여 둔다. 이 딱지가
+                      // 없으면 회의실에서 진짜 매출로 읽힌다 — 떼면 안 된다.
+                      if (_demoRevenue) ...[
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 7, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFFFF7ED),
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: const Color(0xFFFDBA74)),
+                          ),
+                          child: const Text('예시',
+                              style: TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w800,
+                                  color: Color(0xFF9A3412))),
+                        ),
+                        const SizedBox(width: 8),
+                      ],
                       Text(
-                        '${_autoFrame ? '계약 매출순' : _sort.label} · ${visibleProjects.length}건',
+                        _grouped
+                            ? '${widget.division.groupTitle.isNotEmpty ? widget.division.groupTitle : (_groupOrder.any((g) => g[0] == '국내') ? '국내 / 해외' : '종류별')}${_sort == _ProjectSort.name ? '' : ' · ${_sort.label}'} · ${visibleProjects.length}건'
+                            : '${_autoFrame ? '계약 매출순' : _sort.label} · ${visibleProjects.length}건',
                         style: AppText.caption.copyWith(
                           fontSize: 11.5,
                           color: AppColors.textHint,
@@ -1069,7 +1322,7 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                       });
                     },
                     onTapFilter: _openFilterSheet,
-                    hintText: '프로젝트 검색',
+                    hintText: '${ownerLabelOf(widget.division.id)} 검색',
                   ),
                   const SizedBox(height: 12),
 
@@ -1093,84 +1346,44 @@ class _DivisionProjectsScreenState extends State<DivisionProjectsScreen> {
                       const SizedBox(height: 8),
                     ],
                   ]
+                  // ── 국내 / 해외 묶음 (PCB, 2026-11-04) ─────────────────
+                  else if (_grouped) ..._groupedRows(visibleProjects)
+                  // ── 한 목록으로 (2026-11-02) ──────────────────────────
+                  // Min: "매출 계획 없는 프로젝트 구분 빼줘"
+                  //
+                  // 전에는 매출이 걸린 것만 본문에 두고 나머지를 접힌 그룹으로
+                  // 내렸다. 줄 수는 줄었지만, 프로젝트가 어느 쪽에 있는지 먼저
+                  // 알아야 찾을 수 있게 됐다. 이제 정렬 순서대로 한 줄씩 선다.
+                  //
+                  // 줄 모양만 다르다 — 매출이 없는 줄에 ProjectRevenueRow 를
+                  // 쓰면 금액 칸에 0 / 0 이 그대로 박힌다.
                   else ...[
-                    for (final p in withRevenue) ...[
-                      ProjectRevenueRow(
-                        koreanName: p.koreanName,
-                        status: p.status,
-                        revenue: p.revenue,
-                        planRevenue: p.planRevenue,
-                        qtyPlan: p.qtyPlan,
-                        qtyActual: p.qtyActual,
-                        modelsTotal: p.modelsTotal,
-                        progressPercent: p.progressPercent,
-                        isFavorite: _favoriteProjects.contains(p.id),
-                        isSelected: _selectedProjectId == p.id,
-                        onTap: () => _tapProject(p.id, p.koreanName),
-                        onToggleFavorite: () => _toggleFavorite(p.id),
-                      ),
-                      const SizedBox(height: 8),
-                    ],
-
-                    // 매출 계획이 없는 프로젝트는 기본으로 접어둔다.
-                    // 첫 화면에서 읽어야 할 줄 수를 줄이는 게 목적이라
-                    // 지우지는 않고 한 줄로만 남긴다.
-                    if (noRevenue.isNotEmpty) ...[
-                      InkWell(
-                        onTap: () =>
-                            setState(() => _showNoPlan = !_showNoPlan),
-                        borderRadius: BorderRadius.circular(AppRadius.md),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 13, vertical: 11),
-                          decoration: BoxDecoration(
-                            color: AppColors.statusGraySoft,
-                            borderRadius:
-                                BorderRadius.circular(AppRadius.md),
-                          ),
-                          child: Row(
-                            children: [
-                              Text(
-                                '매출 계획 없는 프로젝트',
-                                style: AppText.captionStrong.copyWith(
-                                  fontSize: 12.5,
-                                  color: AppColors.textMute,
-                                ),
-                              ),
-                              const Spacer(),
-                              Text(
-                                '${noRevenue.length}건',
-                                style: AppText.captionStrong.copyWith(
-                                  fontSize: 12.5,
-                                  fontWeight: FontWeight.w800,
-                                  color: AppColors.textHint,
-                                ),
-                              ),
-                              const SizedBox(width: 4),
-                              Icon(
-                                _showNoPlan
-                                    ? Icons.keyboard_arrow_up_rounded
-                                    : Icons.chevron_right,
-                                size: 18,
-                                color: const Color(0xFFC5CAD3),
-                              ),
-                            ],
-                          ),
+                    for (final p in visibleProjects) ...[
+                      if (p.hasRevenue)
+                        ProjectRevenueRow(
+                          koreanName: p.koreanName,
+                          status: p.status,
+                          revenue: p.revenue,
+                          planRevenue: p.planRevenue,
+                          qtyPlan: p.qtyPlan,
+                          qtyActual: p.qtyActual,
+                          modelsTotal: p.modelsTotal,
+                          progressPercent: p.progressPercent,
+                          isFavorite: _favoriteProjects.contains(p.id),
+                          isSelected: _selectedProjectId == p.id,
+                          onTap: () => _tapProject(p.id, p.koreanName),
+                          onToggleFavorite: () => _toggleFavorite(p.id),
+                        )
+                      else
+                        ProjectPlainRow(
+                          koreanName: p.koreanName,
+                          modelsTotal: p.modelsTotal,
+                          progressPercent: p.progressPercent,
+                          isFavorite: _favoriteProjects.contains(p.id),
+                          onTap: () => _tapProject(p.id, p.koreanName),
+                          onToggleFavorite: () => _toggleFavorite(p.id),
                         ),
-                      ),
-                      // 검색 중에는 접힌 그룹도 펼쳐야 결과가 보인다.
-                      if (_showNoPlan || _projectQuery.trim().isNotEmpty)
-                        for (final p in noRevenue) ...[
-                          const SizedBox(height: 8),
-                          ProjectPlainRow(
-                            koreanName: p.koreanName,
-                            modelsTotal: p.modelsTotal,
-                            progressPercent: p.progressPercent,
-                            isFavorite: _favoriteProjects.contains(p.id),
-                            onTap: () => _tapProject(p.id, p.koreanName),
-                            onToggleFavorite: () => _toggleFavorite(p.id),
-                          ),
-                        ],
+                      const SizedBox(height: 8),
                     ],
                   ],
                   ],
@@ -1281,4 +1494,19 @@ class _ProjectItem {
   /// 이번 달 매출 계획이나 실적이 잡혀 있는가.
   /// 없으면 리스트 본문이 아니라 접힌 그룹으로 내린다.
   bool get hasRevenue => planRevenue > 0 || revenue > 0;
+
+  /// 매출만 갈아 끼운 사본. 보여주기용 예시에서만 쓴다 — 버릴 코드.
+  _ProjectItem withRevenue(int rev, int plan) => _ProjectItem(
+        id: id,
+        englishName: englishName,
+        koreanName: koreanName,
+        status: status,
+        progressPercent: progressPercent,
+        hasData: hasData,
+        modelsTotal: modelsTotal,
+        revenue: rev,
+        planRevenue: plan,
+        qtyPlan: qtyPlan,
+        qtyActual: qtyActual,
+      );
 }

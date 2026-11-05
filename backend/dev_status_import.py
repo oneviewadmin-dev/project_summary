@@ -39,8 +39,8 @@ def _norm(v) -> str:
     return re.sub(r"[\s.　]", "", str(v or "")).lower()
 
 
+# 헤더 행과 열 위치. 못 찾으면 (None, {}).
 def _find_header(ws, limit: int = 12):
-    """헤더 행과 열 위치. 못 찾으면 (None, {})."""
     for r in range(1, min(ws.max_row, limit) + 1):
         cols = {}
         for c in range(1, ws.max_column + 1):
@@ -61,8 +61,8 @@ def _find_header(ws, limit: int = 12):
     return None, {}
 
 
+# 개발현황 엑셀인가.
 def sniff(wb) -> bool:
-    """개발현황 엑셀인가."""
     for ws in wb.worksheets:
         r, _ = _find_header(ws)
         if r:
@@ -70,8 +70,8 @@ def sniff(wb) -> bool:
     return False
 
 
+# 셀 값 → 'YYYY-MM-DD' 또는 ''.
 def _date(v):
-    """셀 값 → 'YYYY-MM-DD' 또는 ''. 날짜가 아니면 ''."""
     if v is None:
         return ""
     if isinstance(v, (_dt.datetime, _dt.date)):
@@ -89,8 +89,8 @@ def _date(v):
     return ""
 
 
+# 숫자 칸. 'N/A' 같은 글자는 None.
 def _num(v):
-    """숫자 칸. 'N/A' 같은 글자는 None."""
     if v is None:
         return None
     if isinstance(v, (int, float)):
@@ -149,8 +149,8 @@ def parse_sheet(ws):
     return out
 
 
+# {'sheet': 이름, 'rows': [...]}.
 def parse_workbook(wb):
-    """{'sheet': 이름, 'rows': [...]}. 못 읽으면 None."""
     for ws in wb.worksheets:
         rows = parse_sheet(ws)
         if rows:

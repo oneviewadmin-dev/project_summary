@@ -12,21 +12,37 @@ SRC = (ROOT / 'main.py').read_text(encoding='utf-8')
 CFG = json.loads((ROOT / 'config' / 'projects.json').read_text(encoding='utf-8'))['projects']
 ok = 0
 
+# ── 2026-10-26 · 프로젝트 목록은 **엑셀이 만든다** ─────────────────
+#
+# 전에는 블룸 품목 여덟 개를 config 에 미리 적어 뒀다. 그런데 양식에
+# 적힌 이름이 그와 달라지면(CORVA EFM KPE · SM · Telemaetry Cabinet)
+# 화면에는 '등록된 모델 없음' 짜리와 새로 생긴 것이 나란히 서서, 어느
+# 쪽이 진짜인지 알 수 없게 됐다.
+#
+# 이제 기준은 하나다 — **올라온 엑셀.** config 에는 반도체만 남기고,
+# 다른 사업부 프로젝트는 양식을 올릴 때 만들어진다
+# (_df_create_projects). 그때 블룸이면 bloom_item 도 같이 붙는다.
 bloom = [p for p in CFG if p.get('division_id') == 'bloom']
-store = [p for p in bloom if p['id'] == 'bloom_main']
-items = [p for p in bloom if p.get('bloom_item')]
-assert len(store) == 1 and store[0].get('visible') is False, \
-    '전체 저장소(bloom_main)가 화면에 보인다'
+assert not bloom, \
+    'config 에 블룸 프로젝트가 아직 박혀 있다 (%d개) — 엑셀이 목록을 만든다' % len(bloom)
 ok += 1
-assert [p['bloom_item'] for p in sorted(items, key=lambda x: x['order'])] == \
-    ['YFP', 'Corva KPE', 'SL7', 'TC', 'WDM', 'BOP 기구', 'BOP Assy'], \
-    [p['bloom_item'] for p in items]
-ok += 1
-assert all(p.get('visible') for p in items), '품목 프로젝트가 안 보인다'
-assert len({p['id'] for p in items}) == 7
+assert all(p.get('division_id') in ('semiconductor', 'system') for p in CFG), \
+    '반도체 · 공용 말고 다른 사업부가 config 에 남아 있다: %r' % \
+    sorted({p.get('division_id') for p in CFG})
 ok += 1
 # 반도체는 안 건드렸는지
 assert len([p for p in CFG if p.get('division_id') == 'semiconductor']) >= 12
+ok += 1
+# 양식으로 프로젝트를 만들 때 일 보고 품목 이름을 붙이는가.
+# 안 붙이면 새로 생긴 블룸 프로젝트가 일 보고를 잘라 볼 열쇠가 없다.
+assert 'row["bloom_item"] = r["owner"]' in SRC, \
+    '양식으로 만든 블룸 프로젝트에 bloom_item 을 안 붙인다'
+assert '_daily_store_key(division_id)' in SRC, \
+    '일 보고 사업부인지 안 보고 bloom_item 을 붙인다'
+# 2026-10-26 — 고객사형(ESS)에는 안 붙인다. 양식 첫 열이 고객사('SDI')라
+# 일 보고의 품목 이름과 다르다 — 붙이면 보드가 통째로 빈다.
+assert '_dcol.shape_of(division_id) == "프로젝트형"' in SRC, \
+    '고객사형 양식에까지 품목 이름을 붙인다'
 ok += 1
 
 # ── 잘라 보기 ─────────────────────────────────────────────────────
@@ -37,10 +53,18 @@ srcs = {n.name: ast.get_source_segment(SRC, n) for n in tree.body
 assert set(srcs) == {'_norm_label', '_bloom_item_of', '_bloom_slice'}, srcs.keys()
 
 
+# 잘라 보기는 config 와 상관없는 계산이다. 이제 블룸 프로젝트는 엑셀을
+# 올려야 생기므로, 여기서는 '양식이 만들었을 법한 모양' 을 지어서 쓴다.
+_FAKE = [
+    {'id': 'bloom_sl7', 'division_id': 'bloom', 'label': 'SL7', 'bloom_item': 'SL7'},
+    {'id': 'bloom_main', 'division_id': 'bloom', 'label': '블룸 (전체)'},
+] + [p for p in CFG if p.get('division_id') == 'semiconductor']
+
+
 class _CL:
     @staticmethod
     def get_project(pid):
-        return next((p for p in CFG if p['id'] == pid), None)
+        return next((p for p in _FAKE if p['id'] == pid), None)
 
 
 g = {'_cl': _CL}

@@ -1,6 +1,6 @@
+import '../services/offline_store.dart';
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import '../config/app_config.dart';
 import '../design/typography.dart';
 import 'model_cost_detail_screen.dart';
@@ -28,8 +28,8 @@ class _ModelCostListScreenState extends State<ModelCostListScreen> {
   }
 
   Future<List<Map<String, dynamic>>> _fetch() async {
-    final res = await http
-        .get(Uri.parse('$kApiBaseUrl/projects/${widget.projectKey}/models'))
+    final res = await OfflineStore
+        .httpGet(Uri.parse('$kApiBaseUrl/projects/${widget.projectKey}/models'))
         .timeout(const Duration(seconds: 8));
     if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
     final data = jsonDecode(utf8.decode(res.bodyBytes));
@@ -54,7 +54,7 @@ class _ModelCostListScreenState extends State<ModelCostListScreen> {
             return const Center(child: CircularProgressIndicator());
           }
           if (snap.hasError) {
-            return Center(child: Text('로드 실패: ${snap.error}'));
+            return Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(OfflineStore.errorText(snap.error), textAlign: TextAlign.center, style: const TextStyle(fontSize: 13.5, height: 1.5, color: Color(0xFF6B7280)))));
           }
           final all = snap.data ?? [];
           if (all.isEmpty) {

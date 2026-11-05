@@ -1,28 +1,6 @@
-"""주차별 계획·실적 엑셀 양식.
-
-시트 한 장이 한 달이다. 시트 이름이 곧 그 달(2026-09)이라 파서가 달을
-추측하지 않아도 된다. 여러 달을 한 파일에 넣어도 된다.
-
-    A        B        C     D     │  W36   │  W37   │ ...  │  월 합계
-    파트넘버  모델명    유형   구분  │ 계획 실적│ 계획 실적│      │ 계획 실적
-
-머리글이 두 줄인 이유가 있다. 한 줄로 'W36계획 W36실적' 처럼 쓰면 열
-이름이 길어져 사람이 못 읽고, 달이 바뀔 때마다 열 이름을 통째로 다시
-쓰게 된다. 위에 주차를 병합해 두면 눈으로도 묶여 보이고 파서도 '어느
-열이 몇 주차인지' 를 한 번만 찾으면 된다. 잔·특근 엑셀이 이미 이 모양이다.
-
-### 모델 칸은 미리 채운다
-
-매주 품번 열다섯 개를 손으로 적게 하면 언젠가 하나를 다르게 적는다.
-다르게 적힌 줄은 어느 모델에도 안 붙어서 조용히 사라진다 — 엔클로저의
-615·612·301 이 주차 데이터 없이 비어 있던 게 그 모양이다. 그래서 모델
-목록이 있으면 왼쪽 네 칸을 채워서 내보낸다. 사람은 숫자만 적는다.
-
-### 빈 칸은 '그대로 둬라'
-
-매주 같은 파일을 열어 그 주 실적만 채워 다시 올린다. 안 적은 칸이 0 으로
-들어가면 지난 주차 실적이 매번 날아간다. 0 으로 만들고 싶으면 0 을 적는다.
-"""
+# ============================================================
+#  주차별 계획·실적 엑셀 양식
+# ============================================================
 
 from __future__ import annotations
 
@@ -45,10 +23,6 @@ _thin = Side(style="thin", color=LINE)
 BORDER = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
 
 # 왼쪽 고정 칸 — (머리글, 너비, 모델에서 꺼낼 키)
-#
-# 앞쪽 네 칸은 '이 줄이 누구인가' 다. 뒤쪽 네 칸은 '그 모델에 대한 값' 이고
-# 적어 넣을 수 있다. 예전에는 뒤쪽이 '모델 등록 양식' 이라는 다른 파일에
-# 있었는데, 새 모델이 하나 생길 때마다 두 파일을 만져야 했다.
 FIXED = [
     ("파트넘버", 18, "part_number"),
     ("모델명", 24, "name"),
@@ -61,15 +35,11 @@ VALUE = [
     ("재료비($)", 12, "material_cost", '#,##0.00'),
     ("PO수량", 10, "po_qty", '#,##0'),
     ("실적수량", 10, "shipped_qty", '#,##0'),
-    # 2026-10-21 — 모델 등록 양식에만 있던 두 칸을 가져왔다.
-    #   이 둘까지 들어오면 '모델 등록 양식' 과 '주차별 계획 양식' 을
-    #   따로 받을 이유가 없어진다. 한 장으로 끝난다.
-    # 2026-10-22 — '전환주차' 만 적어 두니 무엇이 무엇으로 넘어가는
-    # 주차인지 묻는 사람이 많았다. 머리글에 방향을 적는다.
+    # 모델 등록 양식에만 있던 두 칸을 가져왔다
     ("개발→양산 전환주차", 16, "switch_week", None),
     ("비고", 26, "note", None),
 ]
-# 2026-10-22 — 불량을 넣었다가 뺐다. 불량률은 나중에 따로 정한다.
+# 불량을 넣었다가 뺐다. 불량률은 나중에 따로 정한다.
 WEEK_SUB = ("계획", "실적")
 WEEK_W = 9
 WEEK_N = len(WEEK_SUB)
@@ -88,40 +58,13 @@ FIRST_ROW = 4
 ALWAYS = ("name", "group")
 
 
+# 왼쪽 고정 칸 — 어느 프로젝트든 네 칸 그대로.
 def fixed_cols(models: list) -> list:
-    """왼쪽 고정 칸 — 어느 프로젝트든 네 칸 그대로.
-
-    2026-10-21 — 프로젝트마다 열을 빼던 것을 그만둔다.
-
-    전에는 '그 프로젝트가 실제로 쓰는 칸만' 두었다. 파트넘버가 하나도
-    없는 프로젝트에서 파트넘버 칸을 빼는 식이다. 적을 데가 없으면
-    엉뚱한 데 안 적을 테니까.
-
-    그런데 그 바람에 프로젝트마다 열 자리가 달라졌다. 챔버는 파트넘버가
-    A열인데 어떤 프로젝트는 모델명이 A열이다. 사람이 보기에도 헷갈리고,
-    "엑셀을 열었을 때 늘 같은 자리에 같은 것이 있다" 가 안 된다. 사업부
-    여덟 곳에서 올라오는 양식을 하나로 맞추려면 자리가 고정이어야 한다.
-
-    빈 칸에 엉뚱하게 적는 문제는 열을 빼서 막을 일이 아니다. 「작성 안내」
-    에 적고, 파트넘버로 못 찾은 줄은 올릴 때 '못 읽은 줄' 로 돌려준다.
-
-    인자 models 는 쓰지 않는다. 부르는 쪽을 전부 고치지 않으려고 남겨 둔다.
-    """
     return list(FIXED)
 
 
+# (파트넘버, 모델명) — 파트넘버가 먼저다
 def _pn_and_name(m: dict) -> tuple:
-    """(파트넘버, 모델명) — 파트넘버가 먼저다.
-
-    2026-10-22 — 등록된 자료가 세 모양으로 섞여 있다.
-      · 두 칸이 제대로 나뉨            853-800575-413 / AETHER GDX
-      · 두 칸에 같은 값               853-268706-003 / 853-268706-003
-      · 파트넘버가 비고 품번이 모델명에  (빈 칸)      / 715-A39794-613
-
-    품번은 늘 파트넘버 칸에 넣는다. 모델명은 **품번과 다를 때만** 적는다 —
-    같은 글자를 두 칸에 찍어 두면 사람이 '왜 두 번 적었나' 를 묻게 되고,
-    읽는 쪽도 어느 칸이 이름인지 헷갈린다.
-    """
     pn = str(m.get("part_number") or "").strip()
     nm = str(m.get("name") or "").strip() or str(m.get("id") or "").strip()
     if not pn:
@@ -149,16 +92,12 @@ def _model_row(m: dict, cols=None) -> list:
     return out
 
 
+# 적어 넣는 칸의 지금 값. 0 은 빈 칸으로 둔다
 def _value_row(m: dict) -> list:
-    """적어 넣는 칸의 지금 값. 0 은 빈 칸으로 둔다.
-
-    0 을 찍어 두면 '아직 안 정한 것' 과 '정말 0' 이 구분되지 않는다.
-    빈 칸으로 두면 임포터가 '그대로 둬라' 로 읽으니 손해도 없다.
-    """
     out = []
     for _h, _w, key, fmt in VALUE:
         v = m.get(key)
-        # 2026-10-21 — 글자 칸(전환주차·비고)이 들어오면서 숫자로만 보던
+        # 글자 칸(전환주차·비고)이 들어오면서 숫자로만 보던
         # 것을 갈랐다. 숫자서식이 없는 칸은 글자 그대로 둔다. 전에는
         # float() 에 걸려 전부 None 이 됐다 — 적어 둔 비고가 사라졌다.
         if fmt is None:
@@ -173,13 +112,8 @@ def _value_row(m: dict) -> list:
     return out
 
 
+# 그 모델의 그 달 주차 숫자 → {'W41': {'plan': 20, 'actual': 12}}.
 def week_cells(m: dict, month: str) -> dict:
-    """그 모델의 그 달 주차 숫자 → {'W41': {'plan': 20, 'actual': 12}}.
-
-    0 과 빈 칸을 구분하지 않고 둘 다 빈 칸으로 낸다. 양식의 빈 칸은
-    '그대로 둬라' 라서, 0 을 빈 칸으로 보내도 다시 올릴 때 0 이 0 으로
-    남는다 — 손해가 없고, 0 이 깔린 표보다 읽기 쉽다.
-    """
     wp = m.get("weekly_plan")
     if not isinstance(wp, dict):
         return {}
@@ -203,14 +137,8 @@ def week_cells(m: dict, month: str) -> dict:
     return out
 
 
+# 양식에 놓을 순서 — 유형끼리 모으고, 그 안에서 이름순.
 def order_models(models: list) -> list:
-    """양식에 놓을 순서 — 유형끼리 모으고, 그 안에서 이름순.
-
-    주차 보드가 유형으로 줄을 묶으니 양식도 같은 순서여야 한다. 보드에서
-    '413 직납' 을 보다가 양식을 열면 413 이 붙어 있어야 눈이 안 흩어진다.
-    유형이 없는 모델은 맨 아래로 내린다 — 거기 모여 있으면 '이것들 유형이
-    비었구나' 가 바로 보인다.
-    """
     def key(m):
         dt = str(m.get("dev_type") or "").strip()
         nm = str(m.get("name") or m.get("id") or "").strip()
@@ -219,13 +147,8 @@ def order_models(models: list) -> list:
     return sorted([m for m in models if isinstance(m, dict)], key=key)
 
 
+# 양식에서 서로 구분이 안 되는 줄.
 def duplicate_rows(models: list) -> list:
-    """양식에서 서로 구분이 안 되는 줄.
-
-    파서는 파트넘버로 찾고, 없으면 모델명으로 찾는다. 둘 다 같은 줄이
-    여럿이면 어느 줄의 숫자인지 알 수 없다 — 큐리의 '버스바' 다섯 줄이
-    파트넘버 없이 들어오면 그렇게 된다. 양식을 내보내기 전에 알려 준다.
-    """
     seen, dup = {}, []
     for m in models:
         if not isinstance(m, dict):
@@ -280,8 +203,9 @@ def _sheet(wb, month: str, weeks: list, models: list, label: str, first: bool,
            + ("지금 숫자가 채워져 있습니다 — 이번 주 칸만 더 적어 그대로 올리세요."
               if filled else
               "한 줄을 통째로 비워 두면 그 줄은 건드리지 않습니다."))
-
-    # ── 머리글 두 줄
+    # -----------------------------------------------------------
+    # 머리글 두 줄
+    # -----------------------------------------------------------
     for i, (name, width, _k) in enumerate(cols, start=1):
         ws.merge_cells(start_row=HDR_TOP, start_column=i, end_row=HDR_SUB, end_column=i)
         _head_cell(ws, HDR_TOP, i, name)
@@ -309,8 +233,9 @@ def _sheet(wb, month: str, weeks: list, models: list, label: str, first: bool,
         ws.column_dimensions[get_column_letter(c0 + j)].width = 10
     ws.row_dimensions[HDR_TOP].height = 20
     ws.row_dimensions[HDR_SUB].height = 18
-
-    # ── 줄
+    # -----------------------------------------------------------
+    # 줄
+    # -----------------------------------------------------------
     body = Font(name=KFONT, size=10)
     lock_f = PatternFill("solid", fgColor=LOCK)
     plan_f = PatternFill("solid", fgColor=BLUE)
@@ -371,9 +296,9 @@ def _sheet(wb, month: str, weeks: list, models: list, label: str, first: bool,
             # 빈 줄까지 0 이 깔리면 눈이 거기로 끌린다. 아무것도 없으면 빈 칸.
             c.value = '=IF(COUNT(%s)=0,"",SUM(%s))' % (cells, cells)
         ws.row_dimensions[r].height = 18
-
-    # ── 합계 줄 + 미달 사유 줄
-    #
+    # -----------------------------------------------------------
+    # 합계 줄 + 미달 사유 줄
+    # -----------------------------------------------------------
     # 미달 사유는 모델 한 줄씩이 아니라 **그 주 합계**에 붙는다. 화면의
     # '계획 미달 — 왜 못 채웠는지 적어 주세요' 와 같은 단위다. 품목별로
     # 따지지 않는 이유도 같다 — 한 주에 왜 못 채웠는지는 보통 한 가지다.
@@ -445,6 +370,14 @@ def _sheet(wb, month: str, weeks: list, models: list, label: str, first: bool,
     return ws
 
 
+# 왼쪽 고정 칸들의 이름을 '파트넘버·모델명·구분' 처럼 이어 붙인다
+def _col_names(cols) -> str:
+    names = []
+    for c in cols:
+        names.append(c[0])          # c = (이름, 폭, 키, …) 중 첫 칸이 이름
+    return "·".join(names)
+
+
 def _guide(wb, months, cols=None):
     g = wb.create_sheet("작성 안내")
     g.column_dimensions["A"].width = 16
@@ -456,7 +389,7 @@ def _guide(wb, months, cols=None):
         ("왼쪽 %d칸" % len(cols or FIXED),
          "%s입니다. 이미 채워져 있으면 그대로 두세요. "
          "이 칸으로 어느 모델인지 찾습니다. 고치면 다른 모델이 되거나 못 찾습니다."
-         % "·".join(c[0] for c in (cols or FIXED))),
+         % _col_names(cols or FIXED)),
         ("계획 / 실적", "그 주차에 나갈 예정 수량과 실제로 나간 수량입니다. "
                         "계획은 앞 주차까지 미리 적어도 됩니다. 실적은 지난 주차만 채우면 됩니다."),
         ("빈 칸", "주차 칸이 **한 줄 전체** 비어 있으면 그 줄은 건너뜁니다 — "
@@ -496,16 +429,23 @@ def _guide(wb, months, cols=None):
     g.sheet_properties.pageSetUpPr.fitToPage = True
 
 
+# 주차별 계획·실적 양식 바이트.
 def build_weekly_template(project_label="", sheets=None, models=None,
                           filled=False) -> bytes:
-    """주차별 계획·실적 양식 바이트.
+    # -----------------------------------------------------------
+    # 1. 쓸 수 있는 시트만 남긴다
+    # -----------------------------------------------------------
+    #    달이 없는 항목은 시트를 만들 수 없다. 여기서 걸러 두지 않으면
+    #    아래에서 s["month"] 를 꺼낼 때 터진다.
+    usable = []
+    for s in (sheets or []):
+        if not isinstance(s, dict):
+            continue
+        if not s.get("month"):
+            continue
+        usable.append(s)
+    sheets = usable
 
-    sheets : [{"month": "2026-09", "weeks": ["W36", ...], "notes": {...}}, ...]
-             — 시트 한 장씩. notes 는 {'W41': '미달 사유'}.
-    models : 왼쪽 칸을 채울 모델 목록. 없으면 빈 줄만 둔다.
-    filled : 주차 숫자와 미달 사유까지 채운다 (내보내기).
-    """
-    sheets = [s for s in (sheets or []) if isinstance(s, dict) and s.get("month")]
     if not sheets:
         raise ValueError("어느 달의 양식인지 알려 주세요")
     # 보드와 같은 순서로 — 유형끼리 모으고 그 안에서 이름순
@@ -513,12 +453,26 @@ def build_weekly_template(project_label="", sheets=None, models=None,
 
     wb = Workbook()
     for i, s in enumerate(sheets):
-        weeks = [str(w).strip().upper() for w in (s.get("weeks") or []) if str(w).strip()]
+        # -----------------------------------------------------------
+        # 주차 목록 다듬기
+        # -----------------------------------------------------------
+        #    'w41 ' 처럼 소문자나 공백이 섞여 와도 'W41' 로 맞춘다.
+        #    빈 칸은 버린다 — 빈 주차로 열을 만들면 머리글이 비어 버린다.
+        weeks = []
+        for w in (s.get("weeks") or []):
+            one = str(w).strip().upper()
+            if one:
+                weeks.append(one)
+
         if not weeks:
             raise ValueError("%s 의 주차 목록이 비었습니다" % s["month"])
         _sheet(wb, str(s["month"]), weeks, models, project_label, first=(i == 0),
                filled=filled, notes=s.get("notes") or {})
-    _guide(wb, [str(s["month"]) for s in sheets], fixed_cols(models))
+    # 안내 시트에 넣을 달 목록 (예: ['2026-09', '2026-10'])
+    month_names = []
+    for s in sheets:
+        month_names.append(str(s["month"]))
+    _guide(wb, month_names, fixed_cols(models))
 
     buf = BytesIO()
     wb.save(buf)

@@ -72,8 +72,15 @@ ok += 1
 # ── 6) 앱 ──
 assert 'process-steps' in D, '앱이 단계를 안 받아온다'
 assert 'class _Step' in D and 'final int? weeks' in D, '안 정한 단계를 구분 못 한다'
-assert "list[i].weeks}주)" in D, "칩에 (00주) 를 안 붙인다"
-assert 'list[i].weeks != null' in D, '안 정한 단계에도 괄호를 붙인다'
+# 2026-11-03 — 칩에 적을 글자를 서버가 정한다 (label). 자동차는 고객사가
+# 개월로 센다: '21개월' 을 '91주' 로 적어 놓으면 아무도 안 읽는다.
+#   Min: "Stellantis 01 11개월, 02 14개월 ..."
+# 주 단위 값은 서버가 '2주' 로 만들어 보내므로 화면 글자는 그대로다.
+assert "list[i].tail})" in D, "칩에 소요를 안 붙인다"
+assert 'final String label;' in D, '서버가 정한 글자를 안 받는다'
+assert "label.isNotEmpty ? label : (weeks == null ? '' : '$weeks주')" in D, \
+    'label 이 없을 때 주 단위로 안 돌아간다'
+assert 'list[i].tail.isNotEmpty' in D, '안 정한 단계에도 괄호를 붙인다'
 assert '_devProcessStepsFor(projectKey).map' in D, '서버가 안 되면 칩 줄이 사라진다'
 ok += 1
 

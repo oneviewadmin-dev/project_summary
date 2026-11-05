@@ -76,6 +76,23 @@ class BloomStep {
 
   BloomCell? at(String date) => days[date];
 
+  /// 여러 날을 한 칸으로 더한다 (주 단위 칸).
+  ///
+  /// 적힌 날이 하나도 없으면 null 로 둔다 — 0 으로 두면 '안 적음' 과
+  /// '0 이라고 적음' 이 같아 보인다. 그 둘은 다른 말이다.
+  BloomCell? over(List<String> dates) {
+    int? p, a;
+    var any = false;
+    for (final d in dates) {
+      final c = days[d];
+      if (c == null) continue;
+      any = true;
+      if (c.plan != null) p = (p ?? 0) + c.plan!;
+      if (c.actual != null) a = (a ?? 0) + c.actual!;
+    }
+    return any ? BloomCell(plan: p, actual: a) : null;
+  }
+
   /// 실적이 적힌 마지막 날. 없으면 null.
   String? get lastActualDate {
     String? last;
@@ -111,6 +128,42 @@ class BloomStep {
     if (p <= 0) return null;
     return ((monthActual ?? 0) * 100 / p).round();
   }
+}
+
+/// 보드의 가로 칸 하나. 지난 주는 주 단위로 접히고, 이번 주만 날짜로 펴진다.
+///
+/// 어느 날짜가 어느 칸에 드는지는 **서버가 정한다**(daily_view.py).
+/// 앱이 따로 접으면 admin 과 앱의 숫자가 갈린다. 앱은 받은 dates 만 더한다.
+class BloomColumn {
+  /// 'week' 또는 'day'
+  final String kind;
+
+  /// '41주차' · '10/26(월)'
+  final String label;
+
+  /// 이 칸에 드는 날짜들
+  final List<String> dates;
+
+  /// 오늘인가 (day 칸에만 true)
+  final bool today;
+
+  const BloomColumn({
+    this.kind = 'day',
+    this.label = '',
+    this.dates = const [],
+    this.today = false,
+  });
+
+  bool get isWeek => kind == 'week';
+
+  factory BloomColumn.fromJson(Map j) => BloomColumn(
+        kind: _s(j['kind']).isEmpty ? 'day' : _s(j['kind']),
+        label: _s(j['label']),
+        dates: ((j['dates'] as List?) ?? const [])
+            .map((e) => e.toString())
+            .toList(),
+        today: j['today'] == true,
+      );
 }
 
 class BloomItem {
@@ -272,6 +325,11 @@ class BloomDailyBoard {
   /// 어느 프로젝트의 보드인가. 달을 바꿀 때 다시 부르려면 필요하다.
   final String projectKey;
   final List<String> dates;
+
+  /// 가로 칸 (지난 주는 주 단위, 이번 주는 날짜). 서버가 접어서 준다.
+  /// 옛 서버면 비어 있고, 그때는 dates 를 날짜 칸으로 쓴다.
+  final List<BloomColumn> columns;
+
   final List<BloomItem> items;
   final List<BloomNote> notes;
   final BloomDaySummary today;
@@ -289,6 +347,7 @@ class BloomDailyBoard {
     this.months = const [],
     this.projectKey = '',
     this.dates = const [],
+    this.columns = const [],
     this.items = const [],
     this.notes = const [],
     this.today = const BloomDaySummary(),
@@ -312,6 +371,10 @@ class BloomDailyBoard {
           .toList(),
       projectKey: _s(j['project_key']),
       dates: ((j['dates'] as List?) ?? const []).map((e) => e.toString()).toList(),
+      columns: ((j['columns'] as List?) ?? const [])
+          .whereType<Map>()
+          .map(BloomColumn.fromJson)
+          .toList(),
       items: ((j['items'] as List?) ?? const [])
           .whereType<Map>()
           .map(BloomItem.fromJson)

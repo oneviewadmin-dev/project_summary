@@ -1,17 +1,6 @@
-"""모델 등록용 빈 엑셀 양식.
-
-프로젝트마다 필요한 모델 정보는 결국 같다. 이 여덟 칸이면 등록이 끝난다.
-
-    파트넘버 · 모델명 · 구분 · 유형 · 판가 · 재료비 · PO수량 · 실적수량 · 전환주차
-
-파트넘버를 첫 칸에 두는 이유가 있다. 임포터는 파트넘버로 모델을 찾는다.
-큐리 파일은 '버스바' 5줄, '시트메탈' 6줄이 파트넘버로만 갈리는데,
-예전처럼 모델명으로 맞추면 16줄이 7종으로 뭉개진다.
-
-이 양식이 담지 않는 것 두 가지는 따로 올린다.
-  - 주차별 계획/실적 → 주차 현황 보드의 '엑셀 올리기'
-  - 개발 모델의 공정 일정 → 개발 공정 탭
-"""
+# ============================================================
+#  모델 등록용 빈 엑셀 양식
+# ============================================================
 
 from __future__ import annotations
 
@@ -41,7 +30,7 @@ COLS = [
     ("재료비율", 10, '0.0%'),
     ("PO수량", 11, '#,##0'),
     ("실적수량", 11, '#,##0'),
-    # 2026-10-21 추가 — 개발 → 양산으로 넘어간 주차.
+    # 추가 — 개발 → 양산으로 넘어간 주차.
     # 구분(양산/개발)은 이제 이 엑셀로만 정한다. 화면에서는 못 고친다.
     ("개발→양산 전환주차", 16, None),
     ("비고", 34, None),
@@ -50,14 +39,15 @@ RATIO_COL = 7          # 재료비율 = 수식
 ROWS = 60              # 빈 줄
 
 
+# 빈 모델 등록 양식 바이트를 돌려준다
 def build_model_template(project_label="", types=None):
-    """빈 모델 등록 양식 바이트를 돌려준다."""
     wb = Workbook()
     ws = wb.active
     ws.title = "모델 목록"
     last = len(COLS)
-
-    # ── 안내 줄
+    # -----------------------------------------------------------
+    # 안내 줄
+    # -----------------------------------------------------------
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last)
     t = ws.cell(1, 1)
     t.value = ((f"{project_label} · " if project_label else "")
@@ -68,8 +58,9 @@ def build_model_template(project_label="", types=None):
     t.fill = PatternFill("solid", fgColor=NAVY)
     t.alignment = Alignment(horizontal="left", vertical="center", indent=1)
     ws.row_dimensions[1].height = 26
-
-    # ── 머리글
+    # -----------------------------------------------------------
+    # 머리글
+    # -----------------------------------------------------------
     for i, (name, width, _fmt) in enumerate(COLS, start=1):
         c = ws.cell(2, i, name)
         c.font = Font(name=KFONT, bold=True, size=10, color="FFFFFF")
@@ -78,8 +69,9 @@ def build_model_template(project_label="", types=None):
         c.border = BORDER
         ws.column_dimensions[get_column_letter(i)].width = width
     ws.row_dimensions[2].height = 20
-
-    # ── 빈 줄
+    # -----------------------------------------------------------
+    # 빈 줄
+    # -----------------------------------------------------------
     body = Font(name=KFONT, size=10)
     calc = PatternFill("solid", fgColor=GREY)
     for r in range(3, 3 + ROWS):
@@ -97,8 +89,9 @@ def build_model_template(project_label="", types=None):
                 c.value = f'=IF(E{r}>0,F{r}/E{r},"")'
                 c.fill = calc
         ws.row_dimensions[r].height = 18
-
-    # ── 입력 편의
+    # -----------------------------------------------------------
+    # 입력 편의
+    # -----------------------------------------------------------
     dv_g = DataValidation(type="list", formula1='"양산,개발"', allow_blank=True)
     ws.add_data_validation(dv_g)
     dv_g.add(f"C3:C{2 + ROWS}")
@@ -111,8 +104,9 @@ def build_model_template(project_label="", types=None):
 
     ws.freeze_panes = ws.cell(3, 3)          # 파트넘버·모델명 고정
     ws.sheet_view.showGridLines = False
-
-    # ── 설명 시트
+    # -----------------------------------------------------------
+    # 설명 시트
+    # -----------------------------------------------------------
     guide = wb.create_sheet("작성 안내")
     guide.column_dimensions["A"].width = 14
     guide.column_dimensions["B"].width = 92

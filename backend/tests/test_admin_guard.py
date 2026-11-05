@@ -98,6 +98,7 @@ KNOWN = [
     "/admin/config/projects",      # 화면 드롭다운
     "/admin/overview",             # 홈 대시보드 요약
     "/admin/projects/suggest",     # 프로젝트명 fuzzy match
+    "/admin/upload",               # 옛 화면 주소 — admin v2 로 보내기만 한다 (2026-11-05)
 ]
 ok(open_gets == KNOWN,
    "로그인 없이 열리는 /admin 읽기 주소가 달라졌다.\n"

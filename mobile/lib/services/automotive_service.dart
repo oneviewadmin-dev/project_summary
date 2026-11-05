@@ -2,9 +2,9 @@
 //
 // 실패해도 화면이 깨지지 않게 예외 대신 empty 를 돌려준다.
 // 사업부 화면과 고객사 화면이 같은 숫자를 보게 하려고 계산은 전부 서버에 둔다.
+import 'offline_store.dart';
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
 
 import '../config/app_config.dart';
 import '../models/automotive.dart';
@@ -43,8 +43,8 @@ class AutomotiveService {
       return hit;
     }
     try {
-      final r = await http
-          .get(Uri.parse('$kApiBaseUrl/divisions/automotive/summary?year=$y'))
+      final r = await OfflineStore
+          .httpGet(Uri.parse('$kApiBaseUrl/divisions/automotive/summary?year=$y'))
           .timeout(const Duration(seconds: 12));
       if (r.statusCode == 200) {
         final j = jsonDecode(utf8.decode(r.bodyBytes));
@@ -144,8 +144,8 @@ class AutomotiveService {
 
   static Future<AutoProjectSummary> project(String key) async {
     try {
-      final r = await http
-          .get(Uri.parse(
+      final r = await OfflineStore
+          .httpGet(Uri.parse(
               '$kApiBaseUrl/projects/${Uri.encodeComponent(key)}/automotive-summary'))
           .timeout(const Duration(seconds: 12));
       if (r.statusCode != 200) return AutoProjectSummary.empty;

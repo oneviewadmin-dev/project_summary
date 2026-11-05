@@ -35,7 +35,10 @@ src = next(ast.get_source_segment(SRC, n) for n in tree.body
 t("홈 카드와 같은 자리에서 온다", "_home_division_rows" in src)
 t("출처를 같이 준다", '"actual_source"' in src and '"target_source"' in src)
 t("없는 사업부는 404", "404" in src)
-t("프로젝트별로 쪼갠다", "_div_model_money" in src)
+# 2026-11-03 — 프로젝트 줄도 누계로 안 내려간다. 합계가 0 인 달에
+# 줄만 누계로 서면 더해도 안 맞아서 "어느 쪽이 틀렸지" 가 된다.
+t("프로젝트별로 쪼갠다", "_div_actual_money(ms, month)" in src)
+t("프로젝트 줄이 누계로 안 내려간다", "_div_model_money" not in src)
 
 # ── 화면 ─────────────────────────────────────────────────────
 t("반도체가 아니면 사업부 매출을 부른다",
@@ -43,7 +46,12 @@ t("반도체가 아니면 사업부 매출을 부른다",
 t("반도체는 예전 화면 그대로",
   "_dv !== 'semiconductor'" in HTML and "/admin/revenue/state?month=" in HTML)
 t("사업부 화면 그리기", "function dvView(" in HTML and "function dvWire(" in HTML)
-t("어느 사업부 숫자인지 말해 준다", "의 숫자입니다" in HTML)
+# 2026-10-28 — 화면을 반도체와 같은 모양으로 맞추면서 'dv-note' 줄을 뺐다.
+# 사업부 이름은 이제 제목 밑 설명줄이 말한다. 규칙은 그대로다 —
+# **어느 사업부 숫자인지 화면이 말해야 한다.**
+# Min: "다른 사업부 매출 관리도 반도체사업부처럼 동일하게 적용시켜줘"
+_dv = HTML[HTML.index("function dvView(d) {"):HTML.index("function _dvEsc(")]
+t("어느 사업부 숫자인지 말해 준다", "esc(d.label)" in _dv.split("ov-page-head")[1][:400])
 t("타겟은 홈 관리와 같은 곳에 저장", "/admin/home/division-target" in HTML)
 
 # 분기가 fetch 보다 먼저 와야 한다 — 뒤에 있으면 반도체 값을 한 번 받는다

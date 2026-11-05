@@ -36,8 +36,11 @@ ALLOW = {
     "/admin/notes/photo": "사진은 note_assets/photos 에 저장한다",
     "/admin/reports/{doc_id}/section-file": "uploads/manual/<doc_id>/ 에 저장한다",
 }
+# 읽으면서 보관까지 해 주는 도우미들. 창구가 이 중 하나를 부르면 통과다.
+# 2026-10-28 — _rv_file_open 추가 (사업부 매출 파일). 그 안에서
+# _keep_upload 를 부른다 — 아래 '도우미도 보관을 하는가' 에서 다시 본다.
 HELPERS = {"_keep_upload", "_pbx_open_upload", "_pbx_read_upload",
-           "_auto_read_upload"}
+           "_auto_read_upload", "_rv_file_open", "_ds_open"}
 
 
 def routes_of(node):
@@ -143,6 +146,22 @@ dl = found.get("/admin/uploads/file/{entry_id}")
 if dl:
     ok("upload_store.path_of" in calls(dl),
        "내려받기가 path_of 를 쓰지 않는다 — 보관함 밖 파일을 읽힐 수 있다")
+
+# ── 도우미도 보관을 하는가 (2026-10-28)
+#
+# 창구가 도우미를 부르면 통과시키는데, 그 도우미가 정작 보관을 안 하면
+# 검사가 통째로 헛돈다. 이름만 믿지 않는다.
+for _n in ast.walk(tree):
+    if not isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        continue
+    if _n.name not in HELPERS or _n.name == "_keep_upload":
+        continue
+    # 다른 도우미를 부르는 것도 괜찮다 (_pbx_read_upload → _pbx_open_upload).
+    _c = " ".join(calls(_n))
+    _okay = ["_keep_upload", "upload_store.keep"] + \
+            [h for h in HELPERS if h != _n.name]
+    ok(any(h in _c for h in _okay),
+       "도우미 %s 가 보관을 안 한다 — 이걸 부르는 창구도 다 새는 셈이다" % _n.name)
 
 if FAIL:
     print("실패 %d건" % len(FAIL))

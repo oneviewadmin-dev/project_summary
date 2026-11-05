@@ -14,17 +14,22 @@ class CalendarDeadlineRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final diff = event.diffDays(today);
-    final ddayText = diff == 0
-        ? 'D-day'
-        : diff > 0
-            ? 'D-$diff'
-            : 'D+${-diff}';
-    final ddayColor = diff <= 1
+    // 날짜 없는 지연 — 비고에 '지연' 이라고 적힌 양산품. 오늘 날짜로
+    // 넘어오지만 그건 자리일 뿐이라 'D-day' 로 보이면 거짓말이 된다.
+    final ddayText = event.undated
+        ? '지연'
+        : diff == 0
+            ? 'D-day'
+            : diff > 0
+                ? 'D-$diff'
+                : 'D+${-diff}';
+    final ddayColor = (event.undated || event.isLate || diff <= 1)
         ? const Color(0xFFE53935)
         : diff <= 3
             ? const Color(0xFFE97132)
             : const Color(0xFF7C8594);
-    final dateText = '${event.date.month}/${event.date.day}';
+    final dateText =
+        event.undated ? '날짜 없음' : '${event.date.month}/${event.date.day}';
 
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),

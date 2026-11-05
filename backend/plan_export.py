@@ -1,32 +1,6 @@
-"""연간 내보내기 — 사람이 쓰던 '업데이트 N주차 계획' 모양 그대로.
-
-주차별 계획 양식(weekly_template)은 **올리는** 양식이다. 한 달이 한 시트고
-왼쪽에 판가·재료비가 있다. 이건 **보는** 양식이다 — 한 해가 한 시트고,
-열두 달이 가로로 늘어서고, 돈 이야기가 없다.
-
-    A  B      C        D    E     F     G   H   I   J   | 1월      | 2월 …
-       묶음   파트넘버  PO   출하  잔여  9월 10월 11월 12월 | W02 W03 …
-                                        └ 전년도 실적 ┘   | 계획 실적…
-
-### 전년도 9~12월 (G~J)
-
-표 안에 없는 넉 달이다. 올해 1월부터 그리니까 작년 말 넉 달은 칸이
-없는데, 그 숫자를 보면서 올해를 읽던 자리라 따로 남긴다. OneView 에
-작년 주차 자료가 있으면 더해서 채우고, 없으면 빈 칸으로 둔다 — 없는
-숫자를 0 으로 적어 두면 '그 달에 하나도 안 나갔다' 로 읽힌다.
-
-### 달력은 OneView 것을 쓴다
-
-사람이 쓰던 파일은 1월을 W1~W5 로 적었는데 OneView 는 W02~W05 다
-(W01 은 나흘이 12월이라 12월로 친다). 보드·주차 입력·엑셀 올리기가 전부
-OneView 달력이라, 내보내기만 다르게 하면 받아서 다시 올렸을 때 첫 주가
-안 붙는다.
-
-### 빈 칸은 '-'
-
-사람이 쓰던 파일이 그렇다. 0 과 '아직 없음' 이 눈으로 구분된다.
-합계는 SUM 이라 '-' 를 건너뛴다 ('+' 로 더하면 #VALUE! 가 난다).
-"""
+# ============================================================
+#  연간 내보내기 — 사람이 쓰던 '업데이트 N주차 계획' 모양 그대로
+# ============================================================
 
 from __future__ import annotations
 
@@ -73,8 +47,8 @@ ROW_SUB = 4            # 계획/실적
 FIRST_ROW = 5
 
 
+# 그 해 열두 달 → [('2026-01', ['W02', ...]), ...]
 def months_of(year: int) -> list:
-    """그 해 열두 달 → [('2026-01', ['W02', ...]), ...]"""
     out = []
     for m in range(1, 13):
         ym = "%04d-%02d" % (year, m)
@@ -82,12 +56,8 @@ def months_of(year: int) -> list:
     return out
 
 
+# 유형으로 묶는다 → [(유형, [모델]), ...]
 def group_models(models: list) -> list:
-    """유형으로 묶는다 → [(유형, [모델]), ...]
-
-    순서는 등록된 순서 그대로다. 보기 좋으라고 이름순으로 다시 세우면,
-    사람이 몇 달째 같은 자리에서 보던 줄이 매번 움직인다.
-    """
     order, buckets = [], {}
     for m in models:
         if not isinstance(m, dict):
@@ -110,16 +80,16 @@ def _n(v):
     return int(x) if x == int(x) else x
 
 
+# 그 모델 · 그 달 · 그 주차 → (계획, 실적).
 def week_cell(m: dict, ym: str, wk: str) -> tuple:
-    """그 모델 · 그 달 · 그 주차 → (계획, 실적). 없으면 (None, None)."""
     got = ((m.get("weekly_plan") or {}).get(ym) or {}).get(wk)
     if not isinstance(got, dict):
         return (None, None)
     return (_n(got.get("plan")), _n(got.get("actual")))
 
 
+# 그 달 실적 합. 적힌 주차가 하나도 없으면 None (0 이 아니다).
 def month_actual(m: dict, ym: str):
-    """그 달 실적 합. 적힌 주차가 하나도 없으면 None (0 이 아니다)."""
     bucket = (m.get("weekly_plan") or {}).get(ym)
     if not isinstance(bucket, dict):
         return None
@@ -143,8 +113,8 @@ def _head(ws, r, c, text, fill=NAVY, size=10):
     return x
 
 
+# 달마다 (시작열, 주차열들, 월합계열) · 마지막 열
 def _layout(mons: list) -> tuple:
-    """달마다 (시작열, 주차열들, 월합계열) · 마지막 열"""
     plan, c = [], FIRST_MONTH_COL
     for ym, wks in mons:
         wcols = [c + i * 2 for i in range(len(wks))]
@@ -154,8 +124,8 @@ def _layout(mons: list) -> tuple:
     return plan, c - 1
 
 
+# 그 해에 주차 숫자가 하나라도 적힌 달.
 def months_with_weeks(models: list, year: int) -> list:
-    """그 해에 주차 숫자가 하나라도 적힌 달."""
     out = set()
     for m in models or []:
         if not isinstance(m, dict):
@@ -172,17 +142,9 @@ def months_with_weeks(models: list, year: int) -> list:
     return sorted(out)
 
 
+# 한 해치 주차별 계획·실적 엑셀 바이트.
 def build_year_export(project_label: str, year: int, models: list,
                       sheet_name: str = "", expand=None) -> bytes:
-    """한 해치 주차별 계획·실적 엑셀 바이트.
-
-    expand  주차를 펼쳐 둘 달 ['2026-09', ...]. 안 주면 주차 숫자가 적힌
-            달만 펼친다. 나머지 달은 주차 칸을 접어서 **월 합계 두 칸만**
-            보인다 — 쉰두 주를 다 늘어놓으면 눈이 어디를 봐야 할지 모른다.
-
-            접은 것뿐이라 지워지지 않는다. 엑셀에서 머리 위 [+] 를 누르면
-            그 자리에서 펼쳐진다 — 달을 바꿔 보려고 다시 뽑을 일이 없다.
-    """
     year = int(year)
     mons = months_of(year)
     if expand is None:
@@ -202,8 +164,9 @@ def build_year_export(project_label: str, year: int, models: list,
     act_f = PatternFill("solid", fgColor=WARM)
     calc_f = PatternFill("solid", fgColor=GREY)
     prev_f = PatternFill("solid", fgColor=PREV)
-
-    # ── 머리글 ───────────────────────────────────────────────────────
+    # -----------------------------------------------------------
+    # 머리글
+    # -----------------------------------------------------------
     ws.column_dimensions["A"].width = 3
     ws.merge_cells(start_row=ROW_TOP, start_column=COL_GROUP,
                    end_row=ROW_SUB, end_column=COL_GROUP)
@@ -251,8 +214,9 @@ def build_year_export(project_label: str, year: int, models: list,
     ws.row_dimensions[ROW_TOP].height = 30
     ws.row_dimensions[ROW_WEEK].height = 18
     ws.row_dimensions[ROW_SUB].height = 18
-
-    # ── 줄 ───────────────────────────────────────────────────────────
+    # -----------------------------------------------------------
+    # 줄
+    # -----------------------------------------------------------
     r = FIRST_ROW
     sum_rows = []
     for dev_type, ms in groups:
@@ -344,10 +308,7 @@ def build_year_export(project_label: str, year: int, models: list,
     if sum_rows:
         _total_row(ws, r, sum_rows, last)
 
-    # 주차 칸 접기 — 월 합계 두 칸은 남긴다.
-    #
-    # 접힌 달도 '그 달 계획·실적' 은 보인다. 주차만 안 보일 뿐이라
-    # 한 해를 훑다가 궁금한 달만 [+] 로 펼치면 된다.
+    # 주차 칸 접기 — 월 합계 두 칸은 남긴다
     for b in blocks:
         if not b["cols"] or b["month"] in open_set:
             continue

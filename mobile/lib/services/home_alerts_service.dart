@@ -21,6 +21,18 @@ class AlertProject {
   /// by_kind 로 올 때의 그 종류 건수. by_project 로 올 때는 0.
   final int count;
 
+  /// 사업부로 접었을 때 그 안에 든 프로젝트 수 (by_kind_div 에서만 온다).
+  /// '반도체사업부 238건' 만 보면 몇 군데가 모인 건지 알 수 없다.
+  final int projects;
+
+  /// 사업부 줄을 펼치면 보이는 프로젝트 (by_kind_div 의 items, 2026-11-05).
+  /// 서버가 정한다 — 비어 오면(옛 서버) 펼치지 않고 사업부 화면을 연다.
+  final List<AlertProject> items;
+
+  /// 그 프로젝트에 걸린 모델 이름 몇 개와 나머지 수 ('EFEM · CB 외 2')
+  final List<String> models;
+  final int more;
+
   const AlertProject({
     required this.key,
     required this.label,
@@ -30,6 +42,10 @@ class AlertProject {
     this.worstModel = '',
     this.issue = 0,
     this.count = 0,
+    this.projects = 0,
+    this.items = const [],
+    this.models = const [],
+    this.more = 0,
   });
 
   /// 경영진이 보는 것은 '문제 있냐 없냐' 다. 지연과 이슈가 그 둘이다.
@@ -44,6 +60,16 @@ class AlertProject {
         worstDays: (j['worst_days'] as num?)?.toInt() ?? 0,
         worstModel: (j['worst_model'] ?? '').toString(),
         count: (j['count'] as num?)?.toInt() ?? 0,
+        projects: (j['projects'] as num?)?.toInt() ?? 0,
+        items: [
+          for (final x in (j['items'] as List? ?? const []))
+            if (x is Map) AlertProject.fromJson(x),
+        ],
+        models: [
+          for (final x in (j['models'] as List? ?? const []))
+            if ((x ?? '').toString().isNotEmpty) x.toString(),
+        ],
+        more: (j['more'] as num?)?.toInt() ?? 0,
       );
 }
 
@@ -144,6 +170,11 @@ class HomeAlerts {
   /// 타일별 내역. '지연'·'이슈'·'임박'·'보류'·'정상' → 그 종류의 프로젝트들.
   /// 홈의 전체 현황 타일을 누르면 바로 아래 펼쳐지는 목록이다.
   final Map<String, List<AlertProject>> byKind;
+
+  /// 같은 내역을 사업부로 한 겹 접은 것 (2026-11-03).
+  /// 프로젝트로 세우면 121줄이라 어디가 문제인지 안 보인다.
+  /// Min: "이거 지금 사진에 보이는거 사업부별로 나눠줘"
+  final Map<String, List<AlertProject>> byKindDiv;
   final List<AlertModel> alerts;
   final List<AlertModel> holds;
   final List<AlertModel> poWaits;
@@ -168,6 +199,7 @@ class HomeAlerts {
     required this.alertsTotal,
     required this.byProject,
     this.byKind = const {},
+    this.byKindDiv = const {},
     required this.alerts,
     required this.holds,
     required this.poWaits,
@@ -192,7 +224,7 @@ class HomeAlerts {
         soon: soon, hold: hold,
         poWait: poWait, done: done, running: running, projects: projects,
         projectsWithAlert: projectsWithAlert, alertsTotal: alertsTotal,
-        byProject: byProject, byKind: byKind,
+        byProject: byProject, byKind: byKind, byKindDiv: byKindDiv,
         alerts: alerts, holds: holds, poWaits: poWaits,
         normal: normal, normals: normals,
         bloom: bloom, loaded: loaded,
@@ -203,7 +235,7 @@ class HomeAlerts {
   static const HomeAlerts empty = HomeAlerts(
     date: '', total: 0, delayed: 0, soon: 0, hold: 0, poWait: 0, done: 0,
     running: 0, projects: 0, projectsWithAlert: 0, alertsTotal: 0,
-    byProject: [], byKind: {},
+    byProject: [], byKind: {}, byKindDiv: {},
     alerts: [], holds: [], poWaits: [], normals: [], bloom: null,
     normal: 0, issue: 0, loaded: false,
   );
@@ -231,6 +263,13 @@ class HomeAlerts {
           .toList(),
       byKind: {
         for (final e in ((j['by_kind'] as Map?) ?? const {}).entries)
+          e.key.toString(): ((e.value as List?) ?? const [])
+              .whereType<Map>()
+              .map(AlertProject.fromJson)
+              .toList(),
+      },
+      byKindDiv: {
+        for (final e in ((j['by_kind_div'] as Map?) ?? const {}).entries)
           e.key.toString(): ((e.value as List?) ?? const [])
               .whereType<Map>()
               .map(AlertProject.fromJson)
@@ -264,7 +303,9 @@ class HomeAlertsService {
       {int limit = 300, void Function(HomeAlerts)? onFresh}) async {
     try {
       final got = await OfflineStore.fetch(
-          '$kApiBaseUrl/home/alerts?limit=$limit', 'home_alerts',
+          // division= 를 비우면 전 사업부다 (2026-11-02). 서버 기본값은
+          // 'semiconductor' 로 남겨 뒀다 — 안 올린 앱이 이 칸을 안 보낸다.
+          '$kApiBaseUrl/home/alerts?limit=$limit&division=', 'home_alerts_all',
           timeout: const Duration(seconds: 20),
           onFresh: onFresh == null ? null : (c) => onFresh(_parse(c)));
       return _parse(got);

@@ -6,18 +6,22 @@
 //
 // 열이 17개라 가로 스크롤이 필요하다. 열마다 폭을 고정하고, 각 열을 Column 으로
 // 세워서 행 높이를 맞춘다. (Table 위젯은 셀 병합이 안 돼서 3단 머리글을 못 만든다)
+import '../services/offline_store.dart';
 import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 
 import '../config/app_config.dart';
+import '../config/demo_board.dart';
+import 'plan_actual.dart';
 
 const double _kHeadH = 22;   // 머리글 한 줄 (x3 = 표 머리글 전체 높이)
 const double _kRowH = 52;    // 데이터 행 (양산 / 개발)
 const double _kTotalH = 32;  // 합계 행
 const double _kSecRowH = 38; // 섹션형 데이터 행 (행이 많아 낮게)
+// 계획·실적 두 칸 중 한 칸의 최소 폭. 숫자가 길면 _pairHalfW 가 늘린다.
+const double _kPairHalfMin = 42;
 
 const Color _navy = Color(0xFF0F2C59);
 const Color _line = Color(0xFFE5E7EB);
@@ -57,7 +61,9 @@ class WeeklyBoardCard extends StatefulWidget {
   /// (구분 열 = YFP · Corva KPE · 외 5종). 서버에 그런 API 가 아직 없어서
   /// 앱이 프로젝트별 보드를 받아 합쳐 만든다 — 그 결과를 여기로 넣는다.
   /// 표를 그리는 코드는 하나뿐이라 모양은 프로젝트 보드와 똑같다.
-  final Future<Map<String, dynamic>?> Function()? loader;
+  ///
+  /// 2026-11-04 — 달을 고를 수 있게 되면서 고른 달을 넘겨 받는다.
+  final Future<Map<String, dynamic>?> Function(String month)? loader;
 
   const WeeklyBoardCard({
     super.key,
@@ -75,25 +81,42 @@ class WeeklyBoardCard extends StatefulWidget {
 class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
   late Future<Map<String, dynamic>?> _future;
 
+  /// 보고 있는 달 'YYYY-MM'. 머리글의 달 고르기로 바꾼다 (2026-11-04).
+  late String _month;
+
   @override
   void initState() {
     super.initState();
+    final m = widget.month ?? '';
+    _month = m.isNotEmpty ? m : thisMonthKey();
     _future = _fetch();
+  }
+
+  void _setMonth(String m) {
+    if (m == _month) return;
+    setState(() {
+      _month = m;
+      _future = _fetch();
+    });
   }
 
   Future<Map<String, dynamic>?> _fetch() async {
     // 사업부 보드처럼 자료를 직접 만들어 넣는 경우
-    if (widget.loader != null) return widget.loader!();
+    if (widget.loader != null) return widget.loader!(_month);
     try {
-      final q = (widget.month == null || widget.month!.isEmpty)
-          ? ''
-          : '?month=${Uri.encodeComponent(widget.month!)}';
-      final res = await http
-          .get(Uri.parse('$kApiBaseUrl/projects/${Uri.encodeComponent(widget.projectKey!)}/weekly-board$q'))
+      final q = '?month=${Uri.encodeComponent(_month)}';
+      final res = await OfflineStore
+          .httpGet(Uri.parse('$kApiBaseUrl/projects/${Uri.encodeComponent(widget.projectKey!)}/weekly-board$q'))
           .timeout(const Duration(seconds: 10));
       if (res.statusCode != 200) return null;
       final d = jsonDecode(utf8.decode(res.bodyBytes));
       if (d is! Map<String, dynamic> || d['rows'] == null) return null;
+      // 숫자가 하나도 없는 사업부(블룸·자동차)는 보여주기용 예시를 채운다.
+      // 엑셀이 올라와 숫자가 들어오면 이 줄은 안 탄다. (버릴 코드 —
+      // app_config 의 kDemoBoardData 를 false 로)
+      if (kDemoBoardData && DemoBoard.boardIsEmpty(d)) {
+        DemoBoard.fillBoard(widget.projectKey ?? '', d);
+      }
       return d;
     } catch (_) {
       return null;
@@ -114,19 +137,16 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
 
   /// 주차 칸 하나를 [계획, 실적] 두 칸으로.
   ///
-  /// 아직 오지 않은 주의 실적 0 은 '아직 안 나갔다' 가 아니라 '아직 안 왔다'
-  /// 다. 0 으로 그리면 미달처럼 보인다 — 가운뎃점으로 비워 둔다.
-  /// 마감된 주에서 계획에 못 미치면 그 칸에 표시를 남긴다.
+  /// 2026-11-04 — Min: "계획이랑 실적 적힌거 색깔 다르게 해서 다 표기해주고"
+  /// 전에는 아직 안 온 주의 실적을 가운뎃점(·)으로 비우고 0 을 회색으로
+  /// 죽였다. 이제 모든 칸에 숫자를 적고, 계획은 파랑 · 실적은 초록으로
+  /// 가른다. 미달 표시(▼)는 마감된 주에만 붙으니 0 이 미달로 읽히지 않는다.
   List<_BCell> _weekPair(dynamic cell, String week, String nowWeek) {
     final m = (cell is Map) ? cell : const {};
-    final closed = m['closed'] == true;
     final short = (m['short'] is num) && (m['short'] as num) > 0;
-    final actual = (m['actual'] is num) ? (m['actual'] as num).round() : 0;
-    // 마감됐거나, 이번 주거나, 실적이 이미 들어왔으면 숫자를 그린다.
-    final show = closed || week == nowWeek || actual != 0;
     return [
-      _BCell(_n(m['plan'])),
-      _BCell(show ? _n(m['actual']) : '·', short: short),
+      _BCell(_n(m['plan'] ?? 0)),
+      _BCell(_n(m['actual'] ?? 0), short: short),
     ];
   }
 
@@ -171,6 +191,14 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
               // 표 폭이 화면보다 훨씬 넓다(약 980px). 가로 스크롤만으로는
               // 오른쪽에 주차가 더 있다는 걸 모른다. 오른쪽 끝을 흐리게 해서
               // 이어진다는 걸 보이고, 탭하면 전체를 확대해서 본다.
+              // 표를 어떻게 읽어야 하는지 서버가 한 줄로 적어 보내면 맨 위에
+              // 단다. 블룸이 그런 경우다 — 합계가 공정을 다 더한 값이라
+              // 출하량이 아닌데, 안 적으면 '72대 나갔다' 로 읽힌다.
+              _boardNote(d),
+              const Padding(
+                padding: EdgeInsets.only(bottom: 8),
+                child: PlanActualLegend(),
+              ),
               Stack(
                 children: [
                   SingleChildScrollView(
@@ -226,6 +254,28 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
     );
   }
 
+  // ── 표 위: 이 표를 어떻게 읽나 (서버가 적어 보낼 때만) ───────────
+  Widget _boardNote(Map<String, dynamic> d) {
+    final t = '${d['note'] ?? ''}'.trim();
+    if (t.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 9),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.info_outline_rounded,
+              size: 13, color: Color(0xFF9CA3AF)),
+          const SizedBox(width: 5),
+          Expanded(
+            child: Text(t,
+                style: const TextStyle(
+                    fontSize: 11, height: 1.45, color: Color(0xFF6B7280))),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ── 표 밑: 계획에 못 미친 주와 그 사유 ───────────────────────────
   //
   // 표에서는 합계 칸이 빨갛게 ▼ 로 '어느 주가' 를 말하고, 여기서 '왜' 를
@@ -233,7 +283,17 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
   // 미달이 늘 문제인 것은 아니다 — 엔클로저는 매출을 맞추려고 일부러 덜
   // 출하하기도 한다. 그런 주는 admin 에서 '참고' 로 적어 두면 회색으로
   // 내려가고 문제로 세지 않는다. 아무것도 안 적혀 있으면 '사유 미입력'.
+  /// 2026-10-26 — 보드 밑의 '계획 미달' 칸은 안 그린다.
+  ///
+  /// 표에서 이미 합계 칸이 빨갛게 ▼ 로 어느 주가 모자랐는지 말한다.
+  /// 그 밑에 같은 주를 또 상자로 늘어놓으니, 주차가 셋만 모자라도
+  /// 보드보다 그 칸이 길어져서 정작 표를 못 봤다.
+  ///
+  /// 지우지 않고 끈다. 사유를 다시 띄우려면 false 로 두면 된다.
+  final bool _hideShortfall = true;
+
   Widget _shortfallNote(Map<String, dynamic> d) {
+    if (_hideShortfall) return const SizedBox.shrink();
     final shorts = (d['shortfalls'] as List? ?? const []).cast<Map>();
     if (shorts.isEmpty) {
       final closed = (d['closed_weeks'] as List? ?? const []);
@@ -345,9 +405,9 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
               Row(
                 children: [
                   const SizedBox(width: 16),
-                  const Expanded(
-                    child: Text('주차 현황 보드',
-                        style: TextStyle(
+                  Expanded(
+                    child: Text('${widget.title ?? '주차 현황 보드'} · ${monthLabel(_month)}',
+                        style: const TextStyle(
                             fontSize: 15, fontWeight: FontWeight.w800)),
                   ),
                   IconButton(
@@ -422,6 +482,9 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
                         color: Color(0xFF9A3412))),
               ),
             ],
+            const Spacer(),
+            // 달 고르기 — 불러오는 동안에도 그대로 둔다
+            MonthPickerPill(month: _month, onChanged: _setMonth),
           ]),
           if (demo)
             const Padding(
@@ -485,13 +548,32 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
 
     List<String> col(String f) => [...flat.map((r) => _n(r[f])), _n(total[f])];
 
+    // ── 서버가 빼라고 적어 보낸 열 (블룸 · ESS — 일 보고에 없는 숫자)
+    //    자세한 까닭은 _weekTable 의 같은 자리에 적어 두었다.
+    final hide =
+        (d['hide_cols'] as List? ?? const []).map((e) => '$e').toSet();
+    bool show(String c) => !hide.contains(c);
+
+    // 계획·실적 칸 폭 (주차형일 때만 쓰인다)
+    final pairW = _pairHalfW([
+      for (final w in weeks) ...[
+        for (final r in flat) _weekPair((r['weeks'] as Map?)?[w], w, nowWeek),
+        _weekPair((total['weeks'] as Map?)?[w], w, nowWeek),
+      ],
+      for (final r in flat)
+        [_BCell(_n(r['month_plan'])), _BCell(_n(r['month_actual']))],
+      [_BCell(_n(total['month_plan'])), _BCell(_n(total['month_actual']))],
+    ]);
+
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         // 구분 — 섹션 이름을 한 칸으로 묶어 세로로 이어 보이게 한다
         if (hasSec)
           SizedBox(
-            width: 74,
+            // 2026-10-25 — 74 였다. ESS 품목 이름이 'SBB 1.5 (한국 함안)'
+            // 처럼 길어서 두 줄로도 잘렸다.
+            width: 104,
             child: Column(
               children: [
                 _cell('구분', _kHeadH * headSpan, head: true, align: TextAlign.left),
@@ -502,7 +584,8 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
                           ? '${sec['name']}'
                           : '${sec['name']}\n재고 ${sec['stock']}',
                       _kSecRowH * ((sec['rows'] as List? ?? const []).length),
-                      align: TextAlign.left, bold: true, size: 10),
+                      align: TextAlign.left, bold: true, size: 10,
+                      maxLines: 3),
                 _cell('', _kTotalH, total: true),
               ],
             ),
@@ -516,7 +599,8 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
               for (final r in flat)
                 _cell('${r['label']}', _kSecRowH,
                     align: TextAlign.left, bold: true, size: 10.5),
-              _cell('합계', _kTotalH, total: true, align: TextAlign.left),
+              _cell('${d['total_label'] ?? '합계'}', _kTotalH,
+                  total: true, align: TextAlign.left),
             ],
           ),
         ),
@@ -531,9 +615,16 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
               ],
             ),
           ),
-        _numCol2('PO 수량', col('po_qty'), 62, span: headSpan),
+        if (show('po_qty'))
+          _numCol2('PO 수량', col('po_qty'), 62, span: headSpan),
         _numCol2('실적', col('actual_total'), 56, span: headSpan),
-        _numCol2('잔량', col('remaining'), 56, span: headSpan),
+        if (show('remaining'))
+          _numCol2('잔량', col('remaining'), 56, span: headSpan),
+        // ── 재고 열 — 서버가 적어 보낼 때만 (블룸 · ESS)
+        //    공정재고는 공정마다, 출하대기 · 구매품대기는 품목마다 한 번.
+        for (final c in (d['stock_cols'] as List? ?? const []).cast<Map>())
+          _numCol2('${c['label'] ?? ''}', col('${c['field']}'), 50,
+              span: headSpan),
         for (final mon in months)
           _numCol2(
             _mon(mon),
@@ -546,8 +637,9 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
             span: headSpan,
           ),
         if (byWeek) ...[
-          _numCol2(_mon('${d['prev_month']}'), col('prev_month_actual'), 46,
-              span: headSpan),
+          if (show('prev_month_actual'))
+            _numCol2(_mon('${d['prev_month']}'), col('prev_month_actual'), 46,
+                span: headSpan),
           // 주차 묶음 — 위에 달을 얹고, 선 대신 색으로 묶는다.
           IntrinsicWidth(
             child: Column(
@@ -562,7 +654,8 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
                         ...flat.map((r) =>
                             _weekPair((r['weeks'] as Map?)?[w], w, nowWeek)),
                         _weekPair((total['weeks'] as Map?)?[w], w, nowWeek),
-                      ], w == nowWeek, titleH: _kHeadH, group: true),
+                      ], w == nowWeek,
+                          titleH: _kHeadH, group: true, halfW: pairW),
                   ],
                 ),
               ],
@@ -572,8 +665,9 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
             ...flat.map((r) =>
                 [_BCell(_n(r['month_plan'])), _BCell(_n(r['month_actual']))]),
             [_BCell(_n(total['month_plan'])), _BCell(_n(total['month_actual']))],
-          ], false),
-          if ((d['next_month'] ?? '').toString().isNotEmpty)
+          ], false, halfW: pairW),
+          if (show('next_month_plan') &&
+              (d['next_month'] ?? '').toString().isNotEmpty)
             _numCol2(_mon('${d['next_month']}'), col('next_month_plan'), 46,
                 span: headSpan),
         ],
@@ -622,9 +716,9 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
 
   // 섹션형의 계획/실적 두 칸 열 (머리글 3단: 제목 / 주차 / 계획·실적)
   Widget _secPairCol(String title, List<List<_BCell>> values, bool isNow,
-      {double titleH = _kHeadH * 2, bool group = false}) {
+      {double titleH = _kHeadH * 2, bool group = false, double? halfW}) {
     return Container(
-      width: 76,
+      width: math.max(76.0, (halfW ?? _kPairHalfMin) * 2),
       decoration: isNow
           ? const BoxDecoration(
               border: Border(
@@ -638,22 +732,24 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
           _cell(title, titleH, head: true, redHead: isNow, group: group),
           Row(children: [
             Expanded(child: _cell('계획', _kHeadH,
-                head: true, redHead: isNow, group: group)),
+                head: true, redHead: isNow, group: group, role: 'plan')),
             Expanded(child: _cell('실적', _kHeadH,
-                head: true, redHead: isNow, group: group)),
+                head: true, redHead: isNow, group: group, role: 'actual')),
           ]),
           for (var i = 0; i < values.length - 1; i++)
             Row(children: [
               Expanded(child: _cell(values[i][0].text, _kSecRowH,
-                  tint: isNow, group: group)),
+                  tint: isNow, group: group, role: 'plan')),
               Expanded(child: _cell(values[i][1].text, _kSecRowH,
-                  tint: isNow, group: group, short: values[i][1].short)),
+                  tint: isNow, group: group, short: values[i][1].short,
+                  role: 'actual')),
             ]),
           Row(children: [
             Expanded(child: _cell(values.last[0].text, _kTotalH,
-                total: true, redHead: isNow)),
+                total: true, redHead: isNow, role: 'plan')),
             Expanded(child: _cell(values.last[1].text, _kTotalH,
-                total: true, redHead: isNow, short: values.last[1].short)),
+                total: true, redHead: isNow, short: values.last[1].short,
+                role: 'actual')),
           ]),
         ],
       ),
@@ -667,6 +763,20 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
     final total = (d['total'] as Map?) ?? const {};
     final delta = (d['po_delta'] as Map?) ?? const {};
 
+    // ── 그리지 말라고 서버가 찍어 보낸 열 (2026-10-25)
+    //
+    // 사업부마다 들어오는 자료가 다르다. 블룸 일 보고에는 PO 수량도,
+    // 잔량도, 다음달 계획도 없다. 전에는 그런 열에 0 이 찍혔는데,
+    // 0 은 화면에서 'PO 가 0개' 로 읽힌다 — 사실은 '그런 숫자를 안 받는다'
+    // 이다. '-' 로 둬도 빈 열이 네 개 서서 표가 넓어지기만 한다.
+    //
+    // 그래서 서버가 hide_cols 로 열 이름을 적어 보내면 그 열은 아예 안
+    // 그린다. 적어 보내지 않으면(반도체·자동차) 지금까지와 똑같다.
+    final hide = (d['hide_cols'] as List? ?? const [])
+        .map((e) => '$e')
+        .toSet();
+    bool show(String col) => !hide.contains(col);
+
     List<String> col(String field) => [
           ...rows.map((r) => _n(r[field])),
           _n(total[field]),
@@ -675,35 +785,57 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
     // PO증감은 양산·개발 두 행에 걸친 한 칸이라 이력이 쌓이면 넘친다.
     // 글자를 잘라내는 대신 데이터 행 높이를 이력에 맞춰 늘린다.
     final nRows = rows.isEmpty ? 1 : rows.length;
-    final rowH = math.max(_kRowH, _deltaNeedH(delta) / nRows);
+    // PO증감 열을 안 그리면 그만큼 줄을 늘릴 이유도 없다.
+    final rowH = show('po_delta')
+        ? math.max(_kRowH, _deltaNeedH(delta) / nRows)
+        : _kRowH;
     final monLabel = _mon(d['month'] as String?);
+    // 계획·실적 칸은 표 안에서 가장 긴 숫자에 맞춰 한꺼번에 넓힌다.
+    final pairW = _pairHalfW([
+      for (final w in weeks) ...[
+        for (final r in rows) _weekPair((r['weeks'] as Map?)?[w], w, now),
+        _weekPair((total['weeks'] as Map?)?[w], w, now),
+      ],
+      for (final r in rows)
+        [_BCell(_n(r['month_plan'])), _BCell(_n(r['month_actual']))],
+      [_BCell(_n(total['month_plan'])), _BCell(_n(total['month_actual']))],
+    ]);
 
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _labelCol(rows, rowH),
-        _numCol('PO 수량', col('po_qty'), 62, rowH),
+        _labelCol(rows, rowH, totalLabel: '${d['total_label'] ?? '합계'}'),
+        if (show('po_qty')) _numCol('PO 수량', col('po_qty'), 62, rowH),
         _numCol('실적', col('actual_total'), 58, rowH),
-        _numCol('잔량', col('remaining'), 54, rowH),
-        _numCol(_mon(d['prev_month'] as String?), col('prev_month_actual'), 46,
-            rowH),
+        // ── 재고 열 — 서버가 적어 보낼 때만 그린다 (블룸 · ESS)
+        //
+        // 공정재고는 공정마다 적혀 와서 줄마다 값이 있고, 출하대기 ·
+        // 구매품대기는 품목 단위라 합계 줄에만 값이 있다. 값이 없는 칸은
+        // _n 이 '-' 로 그린다 — 0 으로 채우면 '대기 없음' 으로 읽힌다.
+        for (final c in (d['stock_cols'] as List? ?? const []).cast<Map>())
+          _numCol('${c['label'] ?? ''}', col('${c['field']}'), 50, rowH),
+        if (show('remaining')) _numCol('잔량', col('remaining'), 54, rowH),
+        if (show('prev_month_actual'))
+          _numCol(_mon(d['prev_month'] as String?), col('prev_month_actual'), 46,
+              rowH),
         // 주차는 어느 달 것인지 한 줄 얹고, 앞뒤를 굵은 선으로 끊는다.
-        _weekGroup(monLabel, weeks, rows, total, now, rowH),
+        _weekGroup(monLabel, weeks, rows, total, now, rowH, pairW),
         _pairCol('$monLabel 합계', [
           ...rows.map((r) =>
               [_BCell(_n(r['month_plan'])), _BCell(_n(r['month_actual']))]),
           [_BCell(_n(total['month_plan'])), _BCell(_n(total['month_actual']))],
-        ], false, rowH),
-        _numCol(_mon(d['next_month'] as String?), col('next_month_plan'), 46,
-            rowH),
-        _deltaCol(delta, rowH * nRows),
+        ], false, rowH, halfW: pairW),
+        if (show('next_month_plan'))
+          _numCol(_mon(d['next_month'] as String?), col('next_month_plan'), 46,
+              rowH),
+        if (show('po_delta')) _deltaCol(delta, rowH * nRows),
       ],
     );
   }
 
   /// 주차 묶음. 위에 달을 한 줄 얹어 '8월' 열과 눈으로 끊어 준다.
   Widget _weekGroup(String monLabel, List<String> weeks, List<Map> rows,
-      Map total, String now, double rowH) {
+      Map total, String now, double rowH, [double? halfW]) {
     return IntrinsicWidth(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -716,7 +848,7 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
                 _pairCol(w, [
                   ...rows.map((r) => _weekPair((r['weeks'] as Map?)?[w], w, now)),
                   _weekPair((total['weeks'] as Map?)?[w], w, now),
-                ], now == w, rowH, titleH: _kHeadH, group: true),
+                ], now == w, rowH, titleH: _kHeadH, group: true, halfW: halfW),
             ],
           ),
         ],
@@ -735,7 +867,12 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
   }
 
   // 구분 열 (머리글은 빈 칸, 3단 높이)
-  Widget _labelCol(List<Map> rows, double rowH) {
+  //
+  // totalLabel — 맨 아랫줄에 달 이름. 보통은 '합계' 다.
+  //   줄이 하나뿐인 보드(블룸: 출하 한 줄)는 서버가 그 줄을 아랫줄로
+  //   올리고 이름을 '출하' 로 보낸다. 안 그러면 '출하 10' 밑에 '합계 10'
+  //   이 똑같이 한 번 더 찍혀서, 다른 숫자인 줄 알고 들여다보게 된다.
+  Widget _labelCol(List<Map> rows, double rowH, {String totalLabel = '합계'}) {
     return SizedBox(
       width: 128,
       child: Column(
@@ -744,7 +881,7 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
           for (final r in rows)
             _cell('${r['label']}', rowH,
                 align: TextAlign.left, bold: true, size: 9.5),
-          _cell('합계', _kTotalH, total: true, align: TextAlign.left),
+          _cell(totalLabel, _kTotalH, total: true, align: TextAlign.left),
         ],
       ),
     );
@@ -766,36 +903,39 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
 
   // 계획/실적 두 칸짜리 열 (주차 또는 월 합계)
   Widget _pairCol(String title, List<List<_BCell>> values, bool isNow,
-      double rowH, {double titleH = _kHeadH * 2, bool group = false}) {
+      double rowH,
+      {double titleH = _kHeadH * 2, bool group = false, double? halfW}) {
     final border = isNow
         ? const Border(
             left: BorderSide(color: _red, width: 2),
             right: BorderSide(color: _red, width: 2))
         : null;
     return Container(
-      width: 84,
+      width: math.max(84.0, (halfW ?? _kPairHalfMin) * 2),
       decoration: BoxDecoration(border: border),
       child: Column(
         children: [
           _cell(title, titleH, head: true, redHead: isNow, group: group),
           Row(children: [
             Expanded(child: _cell('계획', _kHeadH,
-                head: true, redHead: isNow, group: group)),
+                head: true, redHead: isNow, group: group, role: 'plan')),
             Expanded(child: _cell('실적', _kHeadH,
-                head: true, redHead: isNow, group: group)),
+                head: true, redHead: isNow, group: group, role: 'actual')),
           ]),
           for (var i = 0; i < values.length - 1; i++)
             Row(children: [
               Expanded(child: _cell(values[i][0].text, rowH,
-                  tint: isNow, group: group)),
+                  tint: isNow, group: group, role: 'plan')),
               Expanded(child: _cell(values[i][1].text, rowH,
-                  tint: isNow, group: group, short: values[i][1].short)),
+                  tint: isNow, group: group, short: values[i][1].short,
+                  role: 'actual')),
             ]),
           Row(children: [
             Expanded(child: _cell(values.last[0].text, _kTotalH,
-                total: true, redHead: isNow)),
+                total: true, redHead: isNow, role: 'plan')),
             Expanded(child: _cell(values.last[1].text, _kTotalH,
-                total: true, redHead: isNow, short: values.last[1].short)),
+                total: true, redHead: isNow, short: values.last[1].short,
+                role: 'actual')),
           ]),
         ],
       ),
@@ -859,6 +999,48 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
   }
 
   /// 0 · - · · 처럼 '아무것도 없음' 을 뜻하는 칸
+  // ==== 계획·실적 두 칸의 한 칸 폭을 숫자 길이에 맞춰 구한다
+  //
+  // 2026-10-26 — 전에는 76 / 84 로 고정이었다. 좌우 여백 12 를 빼면 한 칸에
+  // 글자 자리가 26~30px 뿐이라, 다섯 자리까지만 들어갔다. PCB 처럼 수량이
+  // 큰 사업부에서 120,380 이 '120,3' / '80' 으로 두 줄로 끊겼다.
+  // 계획·실적을 같은 폭으로 맞추려고 좁힌 것이므로, 좁히는 대신 둘 다
+  // 한 줄에 들어갈 만큼 넓힌다. 표 전체에서 가장 긴 숫자 하나를 기준으로
+  // 삼아, 주차 열마다 폭이 달라져 표가 들쭉날쭉해지는 일도 막는다.
+  static double _pairHalfW(List<List<_BCell>> values) {
+    var need = _kPairHalfMin;
+    for (final row in values) {
+      for (final c in row) {
+        // +16 = 좌우 여백 12 + 굵은 글씨(w700) 여유. 13 이면 CURIE 의
+        // '1,740' 이 '1,74 / 0' 으로 끊겼다 (2026-11-04).
+        final w = _textW(c.short ? '${c.text} ▼' : c.text, 10.5) + 16;
+        if (w > need) need = w;
+      }
+    }
+    // 아무리 길어도 한 칸이 화면을 다 먹지는 않게 한다.
+    // 80 = 일곱 자리 + 쉼표 둘 + ' ▼' 가 겨우 들어가는 폭.
+    return math.min(need, 80.0);
+  }
+
+  // 숫자 글꼴은 tabularFigures 라 자리폭이 같다. 쉼표 · 공백 · ▼ 만 따로 센다.
+  static double _textW(String t, double fs) {
+    var w = 0.0;
+    for (final ch in t.split('')) {
+      if (ch == ',' || ch == '.') {
+        w += fs * 0.32;
+      } else if (ch == ' ') {
+        w += fs * 0.28;
+      } else if (ch == '-' || ch == '·') {
+        w += fs * 0.42;
+      } else if (ch == '▼' || ch == '▲') {
+        w += fs;
+      } else {
+        w += fs * 0.64;
+      }
+    }
+    return w;
+  }
+
   static bool _isZero(String t) {
     final v = t.replaceAll(RegExp(r'[\s,\$]'), '');
     return v.isEmpty || v == '0' || v == '-' || v == '·';
@@ -874,6 +1056,7 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
       bool group = false,
       double? size,
       int maxLines = 2,
+      String role = '',
       TextAlign align = TextAlign.center}) {
     Color bg = group ? _groupTint : Colors.white;
     Color fg = const Color(0xFF0F172A);
@@ -887,9 +1070,21 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
       fg = Colors.white;
     } else if (tint) {
       bg = const Color(0xFFFEF2F2);
-    } else if (_isZero(text)) {
+    } else if (role.isEmpty && _isZero(text)) {
       // 0 과 · 이 절반인 표다. 다 검게 찍으면 실제 숫자가 안 보인다.
       fg = _zeroInk;
+    }
+    // 계획 = 파랑 · 실적 = 초록 (2026-11-04). 짙은 바탕에서는 밝은 색.
+    // 0 도 같은 색으로 적는다 — 굵기만 낮춘다.
+    final roleZero = role.isNotEmpty && !head && _isZero(text);
+    if (role == 'plan') {
+      fg = (head || total)
+          ? kPlanInkOnDark.withValues(alpha: roleZero && total ? 0.6 : 1)
+          : (roleZero ? kPlanInkSoft : kPlanInk);
+    } else if (role == 'actual') {
+      fg = (head || total)
+          ? kActualInkOnDark.withValues(alpha: roleZero && total ? 0.6 : 1)
+          : (roleZero ? kActualInkSoft : kActualInk);
     }
     // 마감된 주인데 계획에 못 미친 칸. 숫자만 보면 지나친다.
     //
@@ -928,7 +1123,7 @@ class _WeeklyBoardCardState extends State<WeeklyBoardCard> {
             fontSize: size ?? (head || total ? 9.5 : 10.5),
             fontWeight: head || total || bold || short
                 ? FontWeight.w800
-                : FontWeight.w600,
+                : (roleZero ? FontWeight.w500 : (role.isNotEmpty ? FontWeight.w700 : FontWeight.w600)),
             color: fg,
             height: 1.15,
             // 숫자가 세로로 줄이 맞아야 크기 비교가 된다

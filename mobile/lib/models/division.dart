@@ -29,11 +29,16 @@ class DivisionProjectRef {
   // 모델 데이터 유무 (서버에서 계산됨).
   final bool hasModels;
 
+  // 고객사 묶음 [큰 묶음, 작은 묶음] — 예: ['해외', 'Lam'] (2026-11-04).
+  // 서버(division_columns.CUSTOMER_GROUPS)가 정한다. 묶지 않으면 null.
+  final List<String>? group;
+
   const DivisionProjectRef({
     required this.id,
     required this.label,
     required this.order,
     this.hasModels = false,
+    this.group,
   });
 
   // JSON → 모델 변환.
@@ -44,6 +49,7 @@ class DivisionProjectRef {
       label: (j['label'] ?? '').toString(),
       order: (j['order'] is int) ? j['order'] as int : 0,
       hasModels: j['has_models'] as bool? ?? false,
+      group: _pair(j['group']),
     );
   }
 }
@@ -66,12 +72,25 @@ class Division {
   // 이 사업부에 속한 프로젝트들. order 기준으로 정렬된 상태로 보관합니다.
   final List<DivisionProjectRef> projects;
 
+  // 고객사 묶음 순서 (2026-11-04) — [['국내',''], ['해외','Lam'], …].
+  // 비어 있으면 묶지 않는다. 서버가 보낸다 — 앱 배포 없이 바뀐다.
+  final List<List<String>> customerGroups;
+
+  // 서버가 정하는 글자 (2026-11-05 — 이번 주 뒤로 앱을 못 올린다).
+  //   ownerLabel  '고객사' · '프로젝트'   비어 있으면 앱의 옛 규칙(ownerLabelOf)
+  //   groupTitle  묶은 목록 위 작은 제목  ('국내 / 해외' · '고객사별' · '종류별')
+  final String ownerLabel;
+  final String groupTitle;
+
   const Division({
     required this.id,
     required this.label,
     required this.order,
     required this.projects,
     this.badgeShortLabel,
+    this.customerGroups = const [],
+    this.ownerLabel = '',
+    this.groupTitle = '',
   });
 
   // JSON → 모델 변환.
@@ -89,6 +108,19 @@ class Division {
       badgeShortLabel: j['badge_short_label']?.toString(),
       order: (j['order'] is int) ? j['order'] as int : 0,
       projects: list,
+      customerGroups: [
+        for (final g in (j['customer_groups'] as List? ?? const []))
+          if (_pair(g) != null) _pair(g)!,
+      ],
+      ownerLabel: (j['owner_label'] ?? '').toString(),
+      groupTitle: (j['group_title'] ?? '').toString(),
     );
   }
+}
+
+/// ['해외', 'Lam'] 모양만 받는다. 아니면 null.
+List<String>? _pair(dynamic v) {
+  if (v is! List || v.isEmpty) return null;
+  final a = v.map((e) => (e ?? '').toString()).toList();
+  return [a[0], a.length > 1 ? a[1] : ''];
 }

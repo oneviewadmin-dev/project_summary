@@ -432,7 +432,10 @@ C = (LIB / 'components' / 'home' / 'exec_revenue_card.dart').read_text(encoding=
 assert 'RevenueMonth' in C, '홈 카드가 아직 모델 계산값을 쓴다'
 # 실적과 예상을 한 줄로. 주간보고의 '실행계획' 은 더 이상 안 쓴다.
 assert '실적 / 타겟' in C and '상세 보기' in C, '홈 카드 문구가 예전 그대로다'
-assert '(반도체 기준)' in C, '전사 매출인 것처럼 보인다'
+# 2026-11-02 부터 전 사업부 합계다 (/revenue?division=).
+# Min: "반도체 기준이 아니라 이제 전체적인 사업부 다 내용도 포함"
+assert '(반도체 기준)' not in C, '전사를 더하는데 반도체 기준이라 적혀 있다'
+assert '(전 사업부)' in C, '무슨 범위인지 안 적혀 있다'
 # 짝은 타겟이다. 예상은 관리자 화면과 부서별 달성률에서만 쓴다.
 assert 'r.targetRate' in C and 'r.target' in C, '홈 카드가 아직 예상을 짝으로 쓴다'
 assert '타겟 미등록' in C, '타겟이 없는 달에 달성률을 지어낸다'
@@ -453,9 +456,13 @@ assert 'Fmt.moneyShort(r.actual)' in _num, '홈 카드에 실적 금액이 없�
 D = (LIB / 'screens' / 'revenue_detail_screen.dart').read_text(encoding='utf-8')
 assert 'RevenueService' in D, '매출 상세가 홈과 다른 값을 본다'
 # 사업부 한 줄 → 누르면 부서별
-assert '_openDiv' in D and 'r.lines' in D, '매출 상세가 부서별로 안 펴진다'
+# 2026-11-03 — '전사' 한 겹을 없애고 사업부가 바로 카드가 됐다.
+#   Min: "전사 걍 빼버리고 각각 사업부 리스트 두고"
+assert '_openKeys' in D and 'r.lines' in D, '매출 상세가 사업부별로 안 선다'
 # 접혀서 열리면 화면이 카드 두 장에 통째로 빈다.
-assert 'bool _openDiv = true;' in D, '매출 상세가 접힌 채로 열린다'
+# 사업부가 여섯이라 다 펴 놓으면 첫 화면이 길어진다. 접은 채로 열고,
+# 쪼갤 내용이 있는 사업부만 눌러서 편다.
+assert 'final Set<String> _openKeys' in D, '사업부마다 따로 못 편다'
 # 값이 왼쪽에 몰리지 않게 라벨/값을 양끝으로 붙인다.
 assert 'Widget kv(String k, String v)' in D, '총합 카드가 값을 왼쪽에 몰아 놓는다'
 assert '실행계획' not in D, '매출 상세가 아직 주간보고 실행계획을 말한다'
@@ -482,14 +489,15 @@ assert 'Widget _totalCard(OverviewSummary s, [RevenueMonth? rev])' in D
 assert '남은 타겟' in D, '타겟 기준인데 계획 대비라고 적는다'
 # 사업부가 하나뿐이라 비중이 100 인 것뿐인데 '100%' 라고 적으면
 # 달성률로 읽힌다. 아래 부서 줄은 68·5·28 이라 앞뒤가 안 맞아 보인다.
-_hd = D.split('Widget divisionCard()')[1].split('if (_openDiv)')[0]
+_hd = D.split('Widget divisionCard(RevenueGroup d)')[1].split('if (open && sub')[0]
 _hd = '\n'.join(ln for ln in _hd.split('\n') if not ln.strip().startswith('//'))
 assert "'100%'" not in _hd, '사업부 줄에 100% 가 다시 붙었다'
-assert '부서별 실적 · 비중' in D and '부서별 실적 / 예상 · 달성' in D, \
-    '부서 줄의 숫자가 무엇인지 안 적혀 있다'
-# 예상이 Commodity 별로 들어온 달은 부서마다 제 달성률이 있다
-assert 'r.hasEstimateGroups' in D, '부서별 달성률을 안 본다'
-assert 'g.estimate' in D and 'g.rate' in D, '부서 줄이 제 예상을 안 본다'
+# 2026-11-03 — '전사' 한 겹이 빠지면서 '부서별' 이라는 말도 같이 빠졌다.
+# 이제 사업부가 바로 카드고, 펴면 그 사업부를 쪼갠 '상세' 가 나온다.
+assert "Text('상세'," in D, '펼친 줄이 무엇인지 안 적혀 있다'
+# 예상이 Commodity 별로 들어온 달은 사업부마다 제 달성률이 있다
+assert 'r.hasEstimateGroups' in D, '사업부별 달성률을 안 본다'
+assert 'd.estimate' in D and 'd.rate' in D, '사업부 줄이 제 예상을 안 본다'
 A2 = (LIB / 'screens' / 'alert_list_screen.dart').read_text(encoding='utf-8')
 assert '_projectRow' in A2, '정상 모두 보기가 아직 품번을 늘어놓는다'
 ok += 1

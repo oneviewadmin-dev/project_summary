@@ -1,13 +1,6 @@
-"""하바플레이트 주간 보고 엑셀(W##.xlsx) 파서.
-
-한 시트 안에 아래 블록이 순서대로 들어 있는 구조를 읽는다.
-  1. 현황            : 양산/개발 총계
-  2. 양산모델        : 모델 / 소재 / 판가 / PO / 출하 / 잔량 / 재고 / 비고
-  3~5. 개발품        : 모델 / 소재 / 판가 / 개발단계 / 개발종류(HVM·RPM) / PO / 출하 / 비고
-  주차 매트릭스     : 파트번호별 월 실적 + 주차별 계획/실적 (W32~), 마지막에 total·개발 합계 행
-
-열 위치는 고정하지 않고 '머리글 라벨'로 찾는다. 시트가 조금 바뀌어도 견디게 하기 위함.
-"""
+# ============================================================
+#  하바플레이트 주간 보고 엑셀(W##.xlsx) 파서
+# ============================================================
 
 import week_calendar as _wcal
 import re
@@ -23,8 +16,8 @@ def _s(v):
     return "" if v is None else str(v).strip()
 
 
+# '-', 'N/A', '' → 0.
 def _num(v):
-    """'-', 'N/A', '' → 0. 소수는 반올림."""
     if v is None:
         return 0
     if isinstance(v, (int, float)):
@@ -57,13 +50,8 @@ def _date_text(v):
     return str(v).strip()
 
 
+# 셀 → 'YYYY-MM-DD'. 날짜가 아니면 ''.
 def parse_day(v, year=None):
-    """셀 → 'YYYY-MM-DD'. 날짜가 아니면 ''.
-
-    주간보고의 '고객요청일 · 가공 완료' 칸은 날짜일 때도 있고 '9/28 (6)',
-    '10/2 (5ea)', 'TBD', 'Done' 처럼 사람이 적어 둔 글자일 때도 있다.
-    날짜로 읽히는 것만 쓴다. 9999-12-31 은 '미정' 표기라 날짜로 치지 않는다.
-    """
     if v is None:
         return ""
     if isinstance(v, _dt.datetime):
@@ -87,8 +75,8 @@ def parse_day(v, year=None):
         return ""
 
 
+# W 번호가 가장 큰 시트를 정본으로 고른다
 def pick_sheet(wb, sheet_name=None):
-    """W 번호가 가장 큰 시트를 정본으로 고른다."""
     if sheet_name and sheet_name in wb.sheetnames:
         return wb[sheet_name]
     best, best_n = None, -1
@@ -106,8 +94,8 @@ def _grid(ws, max_row=None, max_col=None):
             for r in range(1, max_row + 1)]
 
 
+# start_row 아래에서 keys 를 모두 포함하는 머리글 행을 찾아 (행index, {라벨:열index}) 반환.
 def _find_header(grid, start_row, keys=("모델", "판가")):
-    """start_row 아래에서 keys 를 모두 포함하는 머리글 행을 찾아 (행index, {라벨:열index}) 반환."""
     for r in range(start_row, min(start_row + 8, len(grid))):
         cells = [_s(v) for v in grid[r]]
         joined = " ".join(cells)
@@ -120,8 +108,8 @@ def _find_header(grid, start_row, keys=("모델", "판가")):
     return None, {}
 
 
+# 라벨 후보 중 먼저 맞는 열 index.
 def _col(cols, *names):
-    """라벨 후보 중 먼저 맞는 열 index. 부분일치도 허용."""
     for n in names:
         if n in cols:
             return cols[n]
@@ -132,8 +120,8 @@ def _col(cols, *names):
     return None
 
 
+# ISO 주차 → 그 주차를 소유한 'YYYY-MM' (앱이 읽는 규칙과 동일).
 def _month_of_week(week_no, year):
-    """ISO 주차 → 그 주차를 소유한 'YYYY-MM' (앱이 읽는 규칙과 동일)."""
     try:
         return _wcal.month_of_week_no(week_no, year)
     except Exception:
@@ -238,8 +226,9 @@ def parse_workbook(wb, sheet_name=None, year=None):
     _read_model_block(2, "양산")
     for sec in (3, 4, 5):
         _read_model_block(sec, "개발")
-
-    # ── 주차 매트릭스 ──
+    # -----------------------------------------------------------
+    # 주차 매트릭스
+    # -----------------------------------------------------------
     weekly = {}
     monthly = {}
     summary = {}

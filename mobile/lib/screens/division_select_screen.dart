@@ -4,6 +4,7 @@ import '../design/design.dart';
 import '../models/division.dart';
 import '../services/divisions_service.dart';
 import '../services/dashboard_service.dart';
+import '../services/progress_service.dart';
 import '../services/favorites_service.dart';
 import '../components/home/search_filter_row.dart';
 import '../components/home/division_grid_card.dart';
@@ -25,6 +26,8 @@ class DivisionSelectScreen extends StatefulWidget {
 class _DivisionSelectScreenState extends State<DivisionSelectScreen> {
   late Future<List<Division>> _divisionsFuture;
   late Future<List<DashboardCard>> _dashboardFuture;
+  // 홈과 같은 잣대를 쓰려면 진행률 요약이 필요하다 (모델 수가 거기 있다).
+  late Future<ProgressSummary> _progressFuture;
   Set<String> _favoriteDivisions = <String>{};
   String _query = '';
 
@@ -33,7 +36,20 @@ class _DivisionSelectScreenState extends State<DivisionSelectScreen> {
     super.initState();
     _divisionsFuture = DivisionsService.fetchAll();
     _dashboardFuture = DashboardService.fetchCards();
+    _loadProgress();
     _loadFavorites();
+  }
+
+  /// 진행률 요약은 저장본을 먼저 주고 새 값이 뒤따라온다.
+  ///
+  /// onFresh 를 안 붙이면 저장본에 그대로 머문다 — 잔·특근이 43주차가
+  /// 올라왔는데 41주차를 들고 있던 것과 같은 자리다. 품목을 새로 올려도
+  /// 카드가 '진행 데이터 없음' 인 채로 남는다.
+  void _loadProgress() {
+    _progressFuture = ProgressService.fetch(onFresh: (v) {
+      if (!mounted) return;
+      setState(() => _progressFuture = Future.value(v));
+    });
   }
 
   // 즐겨찾기는 홈 화면과 같은 저장소를 써야 한다.
@@ -45,8 +61,16 @@ class _DivisionSelectScreenState extends State<DivisionSelectScreen> {
     setState(() => _favoriteDivisions = saved);
   }
 
-  DivisionStatus _statusOf(String divisionId, List<DashboardCard> cards) {
-    return computeDivisionStatus(divisionId, cards);
+  /// 홈 화면과 **같은 함수**를 쓴다 (models/dashboard.dart).
+  ///
+  /// Min: "목록에도 홈처럼 동일하게 반영되게끔 연결 되어야지"
+  ///
+  /// 전에는 여기서 computeDivisionStatus 만 불렀다. 그래서 홈에서는
+  /// '진행 중' 인 아리스타 · PCB · 자동차 · 네트워크가 목록에서는
+  /// '진행 데이터 없음' 으로 떴다 — 같은 사업부가 화면마다 달라 보였다.
+  DivisionStatus _statusOf(String divisionId, List<DashboardCard> cards,
+      Set<String> withModels) {
+    return divisionStatusWithModels(divisionId, cards, withModels);
   }
 
   Future<void> _toggleFavorite(String id) async {
@@ -119,6 +143,7 @@ class _DivisionSelectScreenState extends State<DivisionSelectScreen> {
               setState(() {
                 _divisionsFuture = DivisionsService.fetchAll();
                 _dashboardFuture = DashboardService.fetchCards();
+                _loadProgress();
               });
             },
           ),
@@ -127,7 +152,8 @@ class _DivisionSelectScreenState extends State<DivisionSelectScreen> {
       body: SafeArea(
         top: false,
         child: FutureBuilder<List<dynamic>>(
-          future: Future.wait([_divisionsFuture, _dashboardFuture]),
+          future: Future.wait(
+              [_divisionsFuture, _dashboardFuture, _progressFuture]),
           builder: (context, snap) {
             if (snap.connectionState == ConnectionState.waiting) {
               return const Center(child: CircularProgressIndicator());
@@ -139,6 +165,10 @@ class _DivisionSelectScreenState extends State<DivisionSelectScreen> {
             final cards = results.length > 1
                 ? results[1] as List<DashboardCard>
                 : const <DashboardCard>[];
+            final prog = results.length > 2
+                ? results[2] as ProgressSummary
+                : ProgressSummary.empty;
+            final withModels = divisionsWithModels(all, prog);
             final filtered =
                 all.where((d) => _matchDivision(d, _query)).toList();
 
@@ -238,7 +268,7 @@ class _DivisionSelectScreenState extends State<DivisionSelectScreen> {
                         divisionId: d.id,
                         label: d.label,
                         projectCount: d.projects.length,
-                        status: _statusOf(d.id, cards),
+                        status: _statusOf(d.id, cards, withModels),
                         isFavorite: true,
                         onTap: () => _openDivision(d),
                         onToggleFavorite: () => _toggleFavorite(d.id),
@@ -289,7 +319,7 @@ class _DivisionSelectScreenState extends State<DivisionSelectScreen> {
                       divisionId: d.id,
                       label: d.label,
                       projectCount: d.projects.length,
-                      status: _statusOf(d.id, cards),
+                      status: _statusOf(d.id, cards, withModels),
                       isFavorite: false,
                       onTap: () => _openDivision(d),
                       onToggleFavorite: () => _toggleFavorite(d.id),

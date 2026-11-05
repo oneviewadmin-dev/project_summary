@@ -1,19 +1,6 @@
-"""블룸 '대표님 일 보고 자료' 시트 파서.
-
-시트 모양 (2026-09 ver3 기준)
-
-    A      C          D      E        F           G     H    I    J/K      L~   ...
-    CODE   품목       출하   구매품   공정        공정  9월 합계  9/9 이전  날짜별 계획/실적
-                      대기   대기                 재고  계획 실적 계획 실적  (계획, 실적) x N
-
-  - 품목 하나가 세로로 병합돼 있고 그 안에 공정 행이 2~3개 붙는다
-    (NCT(박닌) / 조립(박장) / 출하). 공정 이름은 시트에 적힌 그대로 쓴다.
-  - 날짜 머리글은 주차 밴드(37주차·38주차) 아래 병합돼 있고, 그 아래가 계획/실적이다.
-  - 마지막 품목 아래에 ◆ 로 시작하는 자재 입고 메모가 붙는다.
-
-열 위치는 고정하지 않는다. '계획'이 여러 번 나오는 행을 찾아 하위 머리글로 삼고,
-그 위에서 날짜를 거슬러 올라가 찾는다. 시트가 옆으로 늘어나도 따라간다.
-"""
+# ============================================================
+#  블룸 '대표님 일 보고 자료' 시트 파서
+# ============================================================
 
 import datetime as _dt
 import re
@@ -27,13 +14,13 @@ _CNT_RE = re.compile(r"\s*[\(（]\s*\d[\d,]*\s*품목\s*[\)）]\s*$")
 _PAREN_RE = re.compile(r"\s*[\(（][^)）]*[\)）]\s*")
 
 
+# 품목 이름에서 '(N품목)' 꼬리를 뗀다
 def clean_item(name):
-    """품목 이름에서 '(N품목)' 꼬리를 뗀다."""
     return _CNT_RE.sub("", str(name or "")).strip()
 
 
+# 공정 비교용 키 — 'NCT(박닌)' 과 'NCT(박장)' 은 같은 공정 (공장만 바뀜).
 def step_key(step):
-    """공정 비교용 키 — 'NCT(박닌)' 과 'NCT(박장)' 은 같은 공정 (공장만 바뀜)."""
     return _PAREN_RE.sub("", str(step or "")).strip().upper()
 
 
@@ -41,8 +28,8 @@ def _s(v):
     return "" if v is None else str(v).strip()
 
 
+# 수량 칸. 빈 칸과 0 은 다르다 — 빈 칸은 None(아직 입력 전).
 def _num(v):
-    """수량 칸. 빈 칸과 0 은 다르다 — 빈 칸은 None(아직 입력 전)."""
     if v is None:
         return None
     if isinstance(v, bool):
@@ -78,18 +65,14 @@ def _as_date(v):
     return None
 
 
+# 'NCT(박닌)' -> 'NCT', '조립(박장)' -> '조립', '출하' -> '출하'.
 def step_group(step):
-    """'NCT(박닌)' -> 'NCT', '조립(박장)' -> '조립', '출하' -> '출하'.
-
-    화면에는 시트에 적힌 그대로 쓰고, 합계를 낼 때만 이걸 쓴다.
-    공장(박닌/박장)이 달라도 같은 공정으로 묶여야 총계가 맞는다.
-    """
     t = re.split(r"[(\uff08]", _s(step))[0].strip()
     return t or _s(step)
 
 
+# 병합 셀의 앵커 값을 범위 전체에 퍼뜨린 값 배열.
 def _grid(ws):
-    """병합 셀의 앵커 값을 범위 전체에 퍼뜨린 값 배열."""
     g = {}
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
@@ -103,8 +86,8 @@ def _grid(ws):
     return g
 
 
+# 그 시트가 다루는 가장 늦은 날짜.
 def _sheet_last_date(ws, g):
-    """그 시트가 다루는 가장 늦은 날짜. 어느 달 시트인지 가리는 데 쓴다."""
     last = None
     for r in range(1, min(ws.max_row, 16) + 1):
         for c in range(1, ws.max_column + 1):
@@ -114,13 +97,8 @@ def _sheet_last_date(ws, g):
     return last
 
 
+# '일 보고' 모양 시트 **전부** — 이른 달부터 [(시트, 마지막날)].
 def find_sheets(wb):
-    """'일 보고' 모양 시트 **전부** — 이른 달부터 [(시트, 마지막날)].
-
-    한 파일에 '9월 보고자료' 와 '10월 보고자료' 가 같이 온다. 한 장만
-    읽으면 10월 파일을 올리는 순간 9월 자료를 볼 길이 없어진다. 그래서
-    모양이 맞는 시트를 다 돌려주고, 어느 달을 볼지는 부르는 쪽이 정한다.
-    """
     named, shaped = [], []
     for name in wb.sheetnames:
         ws = wb[name]
@@ -139,18 +117,32 @@ def find_sheets(wb):
     return out
 
 
-def find_sheet(wb):
-    """'일 보고' 시트 한 장 — 가장 최근 날짜가 든 것.
-
-    시트 순서대로 먼저 걸리는 것을 집으면 10월 1일에 올리면서 9월 자료가
-    들어간다. 그래서 가장 늦은 날짜가 든 시트를 고른다.
-    """
+# '일 보고' 시트 한 장.
+def find_sheet(wb, month: str = ""):
     ss = find_sheets(wb)
-    return ss[-1][0] if ss else None
+    if not ss:
+        return None
+
+    if month:
+        # 시트 이름이 '10월 보고자료' 라 달 숫자로 먼저 맞춰 본다
+        try:
+            want_m = int(str(month)[5:7])
+        except (ValueError, IndexError):
+            want_m = None
+        if want_m:
+            for ws, last in ss:
+                if ("%d월" % want_m) in str(ws.title):
+                    return ws
+            # 이름으로 못 찾으면 시트 안의 날짜로 맞춘다
+            for ws, last in ss:
+                if last and last.month == want_m:
+                    return ws
+
+    return ss[-1][0]
 
 
+# (하위머리글행, 열지도, 날짜쌍) — 날짜쌍은 [(date, 계획열, 실적열)].
 def find_layout(ws, g):
-    """(하위머리글행, 열지도, 날짜쌍) — 날짜쌍은 [(date, 계획열, 실적열)]."""
     sub = None
     for r in range(1, min(ws.max_row, 16) + 1):
         if sum(1 for c in range(1, ws.max_column + 1)
@@ -174,18 +166,21 @@ def find_layout(ws, g):
         flat = "".join(uniq).replace("\n", "").replace(" ", "")
         if flat == "CODE" and "code" not in cols:
             cols["code"] = c
-        elif flat in ("품목", "제품명", "품명") and "item" not in cols:
-            cols["item"] = c
+        elif flat in ("고객사", "거래처", "customer") and "owner" not in cols:
+            # ESS 보고자료에는 품목 왼쪽에 고객사 열이 하나 더 있다.
+            # 블룸에는 없다 — 없으면 그냥 빈 글자로 둔다.
+            cols["owner"] = c
+        elif flat.startswith("품목") or flat in ("제품명", "품명"):
+            # '품목' 만 받던 때에는 ESS 의 '품목⏎(출하지역)' 을 못 찾아
+            # 품목이 0개로 읽혔다. 꼬리가 붙어도 받는다.
+            cols.setdefault("item", c)
         elif flat.startswith("재고출하대기") or flat == "출하대기":
             cols.setdefault("wait_ship", c)
         elif "구매품대기" in flat:
             cols.setdefault("wait_part", c)
         elif (flat.startswith("공정") and "재고" not in flat
               and "step" not in cols):
-            # '공정⏎구분' 은 납작하게 펴면 '공정구분' 이다. 예전에는 '공정' 과
-            # '공정명' 만 받아서 이 머리글을 통째로 놓쳤고, step 이 비면 모든
-            # 줄이 아래에서 걸러져 품목이 0개가 됐다. '공정재고' 는 다른
-            # 열이라 여기서 빼낸다.
+            # '공정⏎구분' 은 납작하게 펴면 '공정구분' 이다
             cols["step"] = c
         elif "공정재고" in flat:
             cols.setdefault("wip", c)
@@ -210,6 +205,12 @@ def find_layout(ws, g):
                 band = band or t
         if day:
             pairs.append((day, c, act))
+        elif "이전" in band:
+            # '10월05일 이전 데이터' — 날짜별로 안 적고 한 칸에 몰아 둔 지난 기간이다
+            cols.setdefault("prior_plan", c)
+            cols.setdefault("prior_label", band)
+            if act:
+                cols.setdefault("prior_actual", act)
         elif "합계" in band or "월" in band:
             cols.setdefault("total_plan", c)
             if act:
@@ -226,14 +227,10 @@ def find_layout(ws, g):
     return sub, cols, pairs
 
 
-def parse_daily(wb, sheet_name=None):
-    """{'sheet','title','report_date','dates','items':[...],'notes':[...]}
-
-    items = [{'item','code','wait_ship','wait_part','steps':[
-                {'step','wip','month_plan','month_actual','prior_plan',
-                 'prior_actual','note','days':{'YYYY-MM-DD':{'plan','actual'}}}]}]
-    """
-    ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else find_sheet(wb)
+# {'sheet','title','report_date','dates','items':[...],'notes':[...]}
+def parse_daily(wb, sheet_name=None, month=""):
+    ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames \
+        else find_sheet(wb, month)
     if ws is None:
         return {"sheet": None, "items": [], "dates": [], "notes": []}
     g = _grid(ws)
@@ -272,6 +269,9 @@ def parse_daily(wb, sheet_name=None):
         if name not in items:
             items[name] = {
                 "item": name,
+                # 고객사 — ESS 처럼 열이 있는 보고서만 채워진다
+                "owner": (_s(g.get((r, cols["owner"]))).replace("\n", " ").strip()
+                          if cols.get("owner") else ""),
                 "code": _s(g.get((r, cols["code"]))).replace("\n", " ").strip()
                         if cols.get("code") else "",
                 "wait_ship": _num(g.get((r, cols["wait_ship"]))) if cols.get("wait_ship") else None,
@@ -322,14 +322,11 @@ def parse_daily(wb, sheet_name=None):
     }
 
 
-# ── '금액 실적' 시트 ─────────────────────────────────────────────────
-#
-#   제품명 | CODE | 출하 국가 | 단가 USD | 영업 계획          | 예상실적
-#                                       | 09월 출하계획 | 09월 매출계획 USD | 09월 출하계획 | 09월 매출계획 USD | 09월 출하 완료 | 09월 매출완료 USD | 잔량
-#
-# '출하계획' · '매출계획' 이 두 번 나온다 (영업 계획 / 예상실적). 계획으로는
-# 뒤의 예상실적을 쓴다 — 시트의 '달성율' 도 그걸 분모로 쓴다.
-# 앞의 영업 계획은 sales_* 로 따로 둔다.
+# ============================================================
+#  '금액 실적' 시트
+# ============================================================
+# 제품명 | CODE | 출하 국가 | 단가 USD | 영업 계획 | 예상실적 | 09월 출하계획 | 09월 매출계획 USD | 09월 출하계획 | 09월 매출계획
+# USD | 09월 출하 완료 | 09월 매출완료 USD | 잔량
 
 def _norm(t):
     return re.sub(r"\s+", "", _s(t)).lower()
@@ -345,8 +342,8 @@ def find_money_sheet(wb):
     return None, None, None
 
 
+# {'sheet','month','items':[...],'total':{...},'stated_rate'} 또는 None.
 def parse_money(wb):
-    """{'sheet','month','items':[...],'total':{...},'stated_rate'} 또는 None."""
     ws, g, hr = find_money_sheet(wb)
     if ws is None:
         return None

@@ -6,10 +6,10 @@
 // 다른가' 는 어디에도 안 남아서 답할 수가 없었다.
 //
 // 이제 저장소의 CHANGELOG.md 를 버전별로 쌓고 /app/changelog 로 받는다.
+import '../services/offline_store.dart';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 
 import '../config/app_config.dart';
 import '../design/design.dart';
@@ -42,8 +42,8 @@ class _ChangelogScreenState extends State<ChangelogScreen> {
   }
 
   Future<List<ChangelogEntry>> _fetch() async {
-    final res = await http
-        .get(Uri.parse('$kApiBaseUrl/app/changelog'))
+    final res = await OfflineStore
+        .httpGet(Uri.parse('$kApiBaseUrl/app/changelog'))
         .timeout(const Duration(seconds: 12));
     if (res.statusCode != 200) {
       throw Exception('HTTP ${res.statusCode}');

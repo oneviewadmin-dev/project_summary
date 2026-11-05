@@ -1,9 +1,6 @@
-"""
-PPT에서 키워드 기반으로 차트/표/이미지를 자동 추출하는 모듈
-- 슬라이드 번호 의존 X
-- 키워드로 섹션 자동 매칭
-- 매주 PPT가 바뀌어도 자동 작동
-"""
+# ============================================================
+#  PPT에서 키워드 기반으로 차트/표/이미지를 자동 추출하는 모듈
+# ============================================================
 from pathlib import Path
 from pptx import Presentation
 from PIL import Image
@@ -11,7 +8,9 @@ import re
 
 # 실제 PPT 4개에서 뽑은 키워드 사전
 SECTION_KEYWORDS = {
-    # ===== 공통 섹션 =====
+    # -----------------------------------------------------------
+    # 공통 섹션
+    # -----------------------------------------------------------
     "양산": [
         "양산", "연간", "Aether GDX", "Aether",
         "양산종", "양산 14종", "양산 13종",
@@ -31,8 +30,9 @@ SECTION_KEYWORDS = {
         "주차 별", "쇼티지", "Shortage", "글로벌 쇼티지",
         "주 10대", "출하목표", "출하 목표",
     ],
-
-    # ===== 메이저 모듈 전용 =====
+    # -----------------------------------------------------------
+    # 메이저 모듈 전용
+    # -----------------------------------------------------------
     "챔버 진행현황": [
         "챔버", "Chamber", "PO 미접수", "PO미접수",
     ],
@@ -45,14 +45,16 @@ SECTION_KEYWORDS = {
     "플레이팅 셀": [
         "플레이팅", "플레이팅 셀", "Plating",
     ],
-
-    # ===== 반도체 장비 전용 =====
+    # -----------------------------------------------------------
+    # 반도체 장비 전용
+    # -----------------------------------------------------------
     "EFEM": ["EFEM", "efem", "이에프이엠"],
     "VTM": ["VTM", "vtm", "Vacuum Transfer"],
     "CEFEM": ["CEFEM", "cefem"],
     "QUAROS": ["QUAROS", "Quaros", "쿠아로스"],
-
-    # ===== 내재화 전용 =====
+    # -----------------------------------------------------------
+    # 내재화 전용
+    # -----------------------------------------------------------
     "CUP": ["CUP", "컵"],
     "자일란 코팅": ["자일란", "Xylan", "자일란코팅"],
     "톨론": ["톨론", "Torlon"],
@@ -64,13 +66,13 @@ SECTION_KEYWORDS = {
 }
 
 
+# 공백, 대소문자 정규화
 def normalize(text: str) -> str:
-    """공백, 대소문자 정규화"""
     return re.sub(r"\s+", " ", text or "").strip().lower()
 
 
+# 슬라이드 안의 모든 텍스트를 하나로 합침
 def extract_slide_text(slide) -> str:
-    """슬라이드 안의 모든 텍스트를 하나로 합침"""
     texts = []
     for shape in slide.shapes:
         if shape.has_text_frame:
@@ -85,8 +87,8 @@ def extract_slide_text(slide) -> str:
     return " ".join(texts)
 
 
+# 슬라이드 텍스트를 보고 어느 섹션인지 자동 판단
 def match_section(slide_text: str):
-    """슬라이드 텍스트를 보고 어느 섹션인지 자동 판단"""
     text_norm = normalize(slide_text)
     if not text_norm:
         return None
@@ -106,15 +108,15 @@ def match_section(slide_text: str):
     return max(scores, key=scores.get)
 
 
+# PPT 좌표(EMU) → 이미지 좌표(px) 변환
 def emu_to_px(emu_value: int, slide_dim_emu: int, image_dim_px: int) -> int:
-    """PPT 좌표(EMU) → 이미지 좌표(px) 변환"""
     if slide_dim_emu <= 0:
         return 0
     return int(emu_value / slide_dim_emu * image_dim_px)
 
 
+# 슬라이드에서 차트/표/이미지 도형 좌표 리스트 반환
 def find_chart_shapes(slide):
-    """슬라이드에서 차트/표/이미지 도형 좌표 리스트 반환"""
     targets = []
     for shape in slide.shapes:
         is_chart = getattr(shape, "has_chart", False)
@@ -135,6 +137,7 @@ def find_chart_shapes(slide):
     return targets
 
 
+# 슬라이드 이미지에서 해당 도형 영역만 잘라서 저장
 def crop_from_slide_image(
     slide_image_path: Path,
     shape_box: dict,
@@ -143,7 +146,6 @@ def crop_from_slide_image(
     output_path: Path,
     padding_ratio: float = 0.02,
 ) -> bool:
-    """슬라이드 이미지에서 해당 도형 영역만 잘라서 저장"""
     try:
         img = Image.open(slide_image_path)
         iw, ih = img.size
@@ -172,16 +174,13 @@ def crop_from_slide_image(
         return False
 
 
+# PPT를 읽어서 섹션별 차트를 자동 crop하고, {섹션명: [crop된 이미지의 상대경로 리스트]} 반환
 def extract_charts_from_pptx(
     pptx_path: Path,
     slides_image_dir: Path,
     output_dir: Path,
     doc_id: str,
 ) -> dict:
-    """
-    PPT를 읽어서 섹션별 차트를 자동 crop하고,
-    {섹션명: [crop된 이미지의 상대경로 리스트]} 반환
-    """
     prs = Presentation(str(pptx_path))
     slide_w = prs.slide_width
     slide_h = prs.slide_height

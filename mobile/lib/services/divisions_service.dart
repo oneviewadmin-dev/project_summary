@@ -3,6 +3,7 @@
 //
 // 화면(UI)에서 직접 http 를 호출하지 않게 하기 위한 얇은 래퍼입니다.
 
+import '../config/owner_label.dart';
 import '../models/division.dart';
 import 'offline_store.dart';
 
@@ -31,10 +32,15 @@ class DivisionsService {
     if (decoded is! Map) {
       throw Exception('DivisionsService: unexpected JSON shape');
     }
-    return (decoded['divisions'] as List? ?? const [])
+    final out = (decoded['divisions'] as List? ?? const [])
         .whereType<Map<String, dynamic>>()
         .map(Division.fromJson)
         .toList()
       ..sort((a, b) => a.order.compareTo(b.order));
+    // 서버가 정한 '고객사 / 프로젝트' 를 기억해 둔다 (ownerLabelOf 가 먼저 본다)
+    for (final d in out) {
+      if (d.ownerLabel.isNotEmpty) kServerOwnerLabels[d.id.toLowerCase()] = d.ownerLabel;
+    }
+    return out;
   }
 }

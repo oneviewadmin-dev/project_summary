@@ -1,14 +1,6 @@
-"""하바플레이트 'W35계획' 형태의 주간 현황 엑셀 파서.
-
-한 시트가 한 주차의 스냅샷이다. 시트 이름이 곧 주차(W35).
-
-    1. 현황            그룹별 총모델수 / PO수량 / 변동 / 출하수량 / PO잔량
-    2. 양산모델        모델별 판가 / PO 수량 / 출하수량 / PO 잔량
-    3~5. 개발품 …      모델별 (+ 개발단계 / 개발종류)
-    (마지막 표)        파트번호별 월별 실적 — 위와 중복이라 읽지 않는다
-
-섹션마다 열 위치가 다르므로 머리글 이름으로 찾는다.
-"""
+# ============================================================
+#  하바플레이트 'W35계획' 형태의 주간 현황 엑셀 파서
+# ============================================================
 
 import re
 import datetime as _dt
@@ -44,8 +36,8 @@ def _num(v):
         return None
 
 
+# 판가. 소수점을 살린다 — 3150.4 를 3150 으로 자르면 매출이 어긋난다
 def _money(v):
-    """판가. 소수점을 살린다 — 3150.4 를 3150 으로 자르면 매출이 어긋난다."""
     t = str(v if v is not None else "").replace(",", "").replace("$", "").strip()
     if t in ("", "-", "N/A", "n/a", "없음"):
         return None
@@ -60,8 +52,8 @@ def _key(t):
     return re.sub(r"\s+", "", str(t or "")).lower()
 
 
+# 머리글 행에서 원하는 열들을 이름으로 찾는다
 def _map_header(ws, r, want):
-    """머리글 행에서 원하는 열들을 이름으로 찾는다."""
     out = {}
     for c in range(1, ws.max_column + 1):
         t = _key(_s(ws, r, c))
@@ -75,11 +67,8 @@ def _map_header(ws, r, want):
     return out
 
 
-# ────────────────────────────────────────────────────────────────
-# 1. 현황
-# ────────────────────────────────────────────────────────────────
+# 그룹별 PO / 출하 / 변동 / 진행중·완료 종수.
 def parse_status(ws):
-    """그룹별 PO / 출하 / 변동 / 진행중·완료 종수."""
     hdr = None
     for r in range(1, min(ws.max_row, 15) + 1):
         line = _key("".join(_s(ws, r, c) for c in range(1, min(ws.max_column, 14) + 1)))
@@ -129,11 +118,8 @@ def parse_status(ws):
     return out
 
 
-# ────────────────────────────────────────────────────────────────
-# 2~5. 모델별 표
-# ────────────────────────────────────────────────────────────────
+# 번호가 붙은 섹션('2. 양산모델' …)의 모델 행만 읽는다
 def parse_models(ws):
-    """번호가 붙은 섹션('2. 양산모델' …)의 모델 행만 읽는다."""
     # 섹션 제목 행: 'N. ...'
     titles = []
     for r in range(1, ws.max_row + 1):
@@ -206,8 +192,8 @@ def sheet_week(name):
     return int(m.group(1)) if m else None
 
 
+# 주차 번호 → 그 주 월요일 날짜.
 def week_monday(week, today=None):
-    """주차 번호 → 그 주 월요일 날짜. 연도는 오늘 기준으로 정한다."""
     today = today or _dt.date.today()
     y = today.year
     try:
@@ -222,8 +208,8 @@ def week_monday(week, today=None):
         return today
 
 
+# 주차 순으로 [(주차, 시트명, 파싱결과)].
 def parse_workbook(wb):
-    """주차 순으로 [(주차, 시트명, 파싱결과)]."""
     out = []
     for name in wb.sheetnames:
         w = sheet_week(name)

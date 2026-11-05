@@ -1,3 +1,4 @@
+import 'offline_store.dart';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 
@@ -59,7 +60,7 @@ class NotificationsService {
 
   static Future<NotificationsResponse> list({int limit = 50}) async {
     final uri = Uri.parse('$_apiBase/notifications?limit=$limit');
-    final res = await http.get(uri);
+    final res = await OfflineStore.httpGet(uri);
     if (res.statusCode != 200) {
       throw Exception('알림 조회 실패: ${res.statusCode}');
     }

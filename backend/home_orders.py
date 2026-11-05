@@ -1,13 +1,6 @@
-"""사장님 지시사항 — 앱 홈 맨 위 노란 카드.
-
-줄마다 따로다. 어떤 건 '9/30까지', 어떤 건 '매일 점검', 어떤 건 기한이 없다.
-카드 하나에 등록일 하나만 붙이면 그 차이가 사라진다.
-
-  due_kind : date(날짜까지) · none(기한 없음) · daily(매일) · weekly(매주)
-  done     : 완료하면 앱에서 바로 내려간다 (admin 에는 남아서 되돌린다)
-
-정렬은 '지금 뭘 해야 하나' 순서다 — 기한 지남 → 기한 임박 → 반복 → 기한 없음.
-"""
+# ============================================================
+#  사장님 지시사항 — 앱 홈 맨 위 노란 카드
+# ============================================================
 from __future__ import annotations
 
 import datetime as _dt
@@ -46,8 +39,8 @@ def new_id() -> str:
     return "o_" + uuid.uuid4().hex[:10]
 
 
+# 화면에서 온 줄들을 저장할 모양으로.
 def normalize(items, today: str = "") -> list[dict]:
-    """화면에서 온 줄들을 저장할 모양으로. 빈 줄은 버린다."""
     today = _date(today) or _today()
     out = []
     for raw in (items or []):
@@ -90,8 +83,8 @@ def _md(iso: str) -> str:
     return f"{int(m)}/{int(d)}"
 
 
+# 앱에서 줄 뒤에 붙는 꼬리표. tone 이 색을 정한다
 def badge(item: dict, today: str) -> dict:
-    """앱에서 줄 뒤에 붙는 꼬리표. tone 이 색을 정한다."""
     kind = item.get("due_kind")
     if kind in ("daily", "weekly"):
         return {"text": KIND_LABEL[kind], "tone": "repeat"}
@@ -106,8 +99,8 @@ def badge(item: dict, today: str) -> dict:
     return {"text": f"{_md(item['created'])} 등록", "tone": "plain"}
 
 
+# 지남(0) → 기한 임박(1) → 반복(2) → 기한 없음(3).
 def _sort_key(item: dict, today: str):
-    """지남(0) → 기한 임박(1) → 반복(2) → 기한 없음(3)."""
     kind = item.get("due_kind")
     if kind == "date" and item.get("due"):
         n = _days_left(item["due"], today)
@@ -120,8 +113,8 @@ def _sort_key(item: dict, today: str):
     return (3, 0, "9999" if not item.get("created") else _neg_date(item["created"]))
 
 
+# 날짜를 거꾸로 정렬하려고 뒤집은 문자열.
 def _neg_date(iso: str) -> str:
-    """날짜를 거꾸로 정렬하려고 뒤집은 문자열."""
     try:
         d = _dt.date.fromisoformat(iso)
     except ValueError:
@@ -129,8 +122,8 @@ def _neg_date(iso: str) -> str:
     return str(99999999 - int(d.strftime("%Y%m%d")))
 
 
+# 앱 홈에 내려보낼 줄들 — 완료는 빼고, 급한 것부터.
 def for_app(items, today: str = "") -> list[dict]:
-    """앱 홈에 내려보낼 줄들 — 완료는 빼고, 급한 것부터."""
     today = _date(today) or _today()
     live = [i for i in normalize(items, today) if not i.get("done")]
     live.sort(key=lambda i: _sort_key(i, today))

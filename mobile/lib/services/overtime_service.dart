@@ -27,12 +27,25 @@ class OvertimeService {
     String week = '',
     String kind = 'overtime',
     String scope = 'total',
+    void Function(OvertimeWeek)? onFresh,
   }) async {
     final qs = _q({'w': week, 'kind': kind, 'scope': scope});
     try {
+      // onFresh 를 주면 저장본을 먼저 주고 새 값이 따라온다.
+      // 2026-11-03 — 전에는 이게 없어서, 서버가 8초 안에 답을 못 하면
+      // 저장본으로 떨어진 채 그대로 머물렀다. 43주차가 올라왔는데
+      // 카드는 41주차를 들고 있던 이유다.
       final got = await OfflineStore.fetch(
         '$_baseUrl/overtime/week$qs',
         'overtime_week_${week}_${kind}_$scope',
+        onFresh: onFresh == null
+            ? null
+            : (c) {
+                final d = c.data;
+                if (d is Map) {
+                  onFresh(OvertimeWeek.fromJson(d.cast<String, dynamic>()));
+                }
+              },
       );
       final d = got.data;
       if (d is! Map) return OvertimeWeek.empty;

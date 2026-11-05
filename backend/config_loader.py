@@ -1,16 +1,13 @@
 # /Users/minseo/Desktop/project_summary/backend/config_loader.py
-"""
-사업부/프로젝트/매핑/UI 설정 단일 진입점.
-
-원칙:
-- 4개 JSON 파일은 이 모듈을 통해서만 읽는다.
-- 외부 코드(main.py 등)는 절대 JSON을 직접 파싱하지 않는다.
-- 운영 변경은 JSON만 수정하면 끝나도록 한다.
-"""
+# ============================================================
+#  사업부/프로젝트/매핑/UI 설정 단일 진입점
+# ============================================================
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,6 +20,13 @@ PROJECTS_FILE = CONFIG_DIR / "projects.json"
 RULES_FILE = CONFIG_DIR / "mapping_rules.json"
 UI_FILE = CONFIG_DIR / "ui_settings.json"
 MODELS_FILE = CONFIG_DIR / "models.json"
+
+# ============================================================
+#  운영 중에 늘어나는 프로젝트
+# ============================================================
+# 사업부 양식에 처음 보는 프로젝트 이름이 적혀 오면 그 자리에서 만든다
+DATA_DIR = Path(os.getenv("DATA_DIR") or BASE_DIR)
+EXTRA_PROJECTS_FILE = DATA_DIR / "projects_extra.json"
 
 _lock = threading.Lock()
 _cache: dict[str, Any] = {
@@ -59,22 +63,115 @@ def _contains_any(haystack: str, needles: Iterable[str]) -> bool:
 
 # ----------------------------- 로딩 -----------------------------
 
+# 4개 JSON을 메모리에 로드. force=True면 캐시 무시하고 재로드.
 def load(force: bool = False) -> None:
-    """4개 JSON을 메모리에 로드. force=True면 캐시 무시하고 재로드."""
     with _lock:
         if _cache["loaded"] and not force:
             return
         _cache["divisions"] = _read_json(DIVISIONS_FILE)
         _cache["projects"] = _read_json(PROJECTS_FILE)
+        _merge_extra_projects(_cache["projects"])
         _cache["rules"] = _read_json(RULES_FILE)
         _cache["ui"] = _read_json(UI_FILE)
         _cache["models"] = _read_json(MODELS_FILE) if MODELS_FILE.exists() else {"models": []}
         _cache["loaded"] = True
 
 
+# 운영 중 JSON 수정 후 반영하고 싶을 때 사용.
 def reload() -> None:
-    """운영 중 JSON 수정 후 반영하고 싶을 때 사용."""
     load(force=True)
+
+
+# /data 에 쌓인 프로젝트를 설정에 얹는다
+def _merge_extra_projects(base: dict) -> None:
+    try:
+        if not EXTRA_PROJECTS_FILE.exists():
+            return
+        extra = json.loads(EXTRA_PROJECTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    rows = (extra or {}).get("projects") or []
+    have = {p.get("id") for p in base.get("projects", [])}
+    for p in rows:
+        if isinstance(p, dict) and p.get("id") and p["id"] not in have:
+            base.setdefault("projects", []).append(p)
+            have.add(p["id"])
+
+
+# 프로젝트 하나를 /data 에 더하고 바로 쓸 수 있게 한다
+def add_project(row: dict) -> dict:
+    pid = str((row or {}).get("id") or "").strip()
+    if not pid:
+        raise ValueError("프로젝트 id 가 비었습니다")
+    if get_project(pid):
+        return get_project(pid)
+
+    data = {"projects": []}
+    try:
+        if EXTRA_PROJECTS_FILE.exists():
+            data = json.loads(EXTRA_PROJECTS_FILE.read_text(encoding="utf-8")) or data
+    except Exception:
+        data = {"projects": []}
+    data.setdefault("projects", []).append(row)
+
+    EXTRA_PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = EXTRA_PROJECTS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(EXTRA_PROJECTS_FILE)      # 쓰다 만 파일이 남지 않게
+    reload()
+    return row
+
+
+# 이 프로젝트가 **양식이 만든 것**인가.
+def is_runtime_project(project_id: str) -> bool:
+    pid = str(project_id or "").strip()
+    if not pid:
+        return False
+    try:
+        if not EXTRA_PROJECTS_FILE.exists():
+            return False
+        data = json.loads(EXTRA_PROJECTS_FILE.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return False
+    return any(isinstance(p, dict) and p.get("id") == pid
+               for p in (data.get("projects") or []))
+
+
+# 양식이 만든 프로젝트를 켜고 끈다
+def set_project_visible(project_id: str, visible: bool, why: str = "") -> bool:
+    pid = str(project_id or "").strip()
+    if not pid:
+        return False
+    try:
+        if not EXTRA_PROJECTS_FILE.exists():
+            return False
+        data = json.loads(EXTRA_PROJECTS_FILE.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return False
+
+    hit = None
+    for p in (data.get("projects") or []):
+        if isinstance(p, dict) and p.get("id") == pid:
+            hit = p
+            break
+    if hit is None:
+        return False
+    if bool(hit.get("visible", True)) == bool(visible):
+        return False
+
+    hit["visible"] = bool(visible)
+    if visible:
+        hit.pop("hidden_by", None)
+        hit.pop("hidden_at", None)
+    else:
+        hit["hidden_by"] = why or "division_form"
+        hit["hidden_at"] = _dt.date.today().isoformat()
+
+    tmp = EXTRA_PROJECTS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(EXTRA_PROJECTS_FILE)      # 쓰다 만 파일이 남지 않게
+    reload()
+    return True
 
 
 # ----------------------------- 조회 헬퍼 -----------------------------
@@ -120,8 +217,8 @@ def get_ui_settings() -> dict:
 
 # ----------------------------- 규칙 적용 -----------------------------
 
+# merge 규칙: 특정 키워드가 보이면 강제로 다른 project로 귀속.
 def _apply_merge_rules(project_id: str | None, text: str) -> str | None:
-    """merge 규칙: 특정 키워드가 보이면 강제로 다른 project로 귀속."""
     load()
     for rule in _cache["rules"].get("rules", []):
         if rule.get("type") != "merge":
@@ -131,8 +228,8 @@ def _apply_merge_rules(project_id: str | None, text: str) -> str | None:
     return project_id
 
 
+# split 규칙: 특정 project로 분류되려면 반드시 만족해야 하는 조건.
 def _violates_split_rule(project_id: str, text: str) -> bool:
-    """split 규칙: 특정 project로 분류되려면 반드시 만족해야 하는 조건."""
     load()
     for rule in _cache["rules"].get("rules", []):
         if rule.get("type") != "split":
@@ -148,8 +245,8 @@ def _violates_split_rule(project_id: str, text: str) -> bool:
     return False
 
 
+# alias 규칙: 별칭으로 직접 매칭.
 def _alias_hit_project(text: str) -> str | None:
-    """alias 규칙: 별칭으로 직접 매칭."""
     load()
     for rule in _cache["rules"].get("rules", []):
         if rule.get("type") != "alias":
@@ -158,8 +255,8 @@ def _alias_hit_project(text: str) -> str | None:
             return rule.get("project_id")
     return None
 
+# models.json 사전을 이용한 직접 매칭.
 def _model_hit_project(text: str) -> str | None:
-    """models.json 사전을 이용한 직접 매칭. 가장 신뢰도 높음."""
     load()
     models = _cache["models"].get("models", []) if _cache["models"] else []
     items = sorted(
@@ -177,14 +274,8 @@ def _model_hit_project(text: str) -> str | None:
     return None
 # ----------------------------- 분류기 -----------------------------
 
+# 카드 텍스트(제목 + 헤드라인 등)를 받아 project_id를 추정한다
 def classify_project(text: str, hint_division_id: str | None = None) -> str | None:
-    """
-    카드 텍스트(제목 + 헤드라인 등)를 받아 project_id를 추정한다.
-    1) alias 규칙 우선
-    2) 프로젝트 keywords / aliases / label 매칭
-    3) merge 규칙으로 후보 보정
-    4) split 규칙 위반 시 그 후보는 거절
-    """
     if not text:
         return None
     load()
@@ -238,8 +329,8 @@ def classify_project(text: str, hint_division_id: str | None = None) -> str | No
     return project_id
 
 
+# 텍스트에서 사업부를 직접 추정. 보통은 project_id로부터 derive 하는 게 더 정확.
 def classify_division(text: str) -> str | None:
-    """텍스트에서 사업부를 직접 추정. 보통은 project_id로부터 derive 하는 게 더 정확."""
     pid = classify_project(text)
     if pid:
         p = get_project(pid)

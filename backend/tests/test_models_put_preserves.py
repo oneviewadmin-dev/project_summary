@@ -54,7 +54,10 @@ ok += 1
 # 6. 백업을 들여다보고 되돌릴 수단이 있다
 assert '@app.get("/admin/models/backups")' in SRC
 assert '@app.post("/admin/models/restore")' in SRC
-assert 'projects 를 주면 그 프로젝트만' in SRC, '통째 복원만 되면 위험하다'
+# 2026-11-05 — 설명 글 대신 코드로 본다: payload 의 projects 로 그 프로젝트만 되돌린다
+_rs = SRC[SRC.index('@app.post("/admin/models/restore")'):]
+_rs = _rs[:_rs.index('\n@app.', 10)]
+assert 'payload.get("projects")' in _rs, '통째 복원만 되면 위험하다'
 ok += 1
 
 print(f'전부 통과 ({ok}/7)')

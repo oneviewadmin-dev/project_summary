@@ -4,8 +4,8 @@
 // 또한, "즐겨찾기한 project_key 들" 만 필터해서 가져오는 헬퍼도 제공합니다.
 // 이 헬퍼는 홈 화면의 즐겨찾기 영역에서 사용합니다.
 
+import 'offline_store.dart';
 import 'dart:convert';
-import 'package:http/http.dart' as http;
 
 import '../models/project_summary.dart';
 
@@ -19,7 +19,7 @@ class ProjectsService {
   // /projects 응답의 'projects' 배열을 모델 리스트로 변환합니다.
   static Future<List<ProjectSummary>> fetchAll() async {
     final uri = Uri.parse('$_baseUrl/projects');
-    final res = await http.get(uri);
+    final res = await OfflineStore.httpGet(uri);
 
     if (res.statusCode != 200) {
       throw Exception('ProjectsService: HTTP ${res.statusCode}');

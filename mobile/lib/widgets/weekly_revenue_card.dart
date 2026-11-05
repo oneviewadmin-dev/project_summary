@@ -13,10 +13,25 @@ import 'package:flutter/material.dart';
 import '../design/design.dart';
 import '../models/weekly_revenue.dart';
 import '../utils/format.dart';
+import 'plan_actual.dart';
 
 class WeeklyRevenueCard extends StatefulWidget {
   final WeeklyRevenue rev;
-  const WeeklyRevenueCard({super.key, required this.rev});
+
+  /// 달 고르기 (2026-11-04). [onMonthChanged] 가 없으면 고르기를 안 그린다.
+  final String? month;
+  final ValueChanged<String>? onMonthChanged;
+
+  /// 다른 달을 받는 중 — 표를 흐리게
+  final bool loading;
+
+  const WeeklyRevenueCard({
+    super.key,
+    required this.rev,
+    this.month,
+    this.onMonthChanged,
+    this.loading = false,
+  });
 
   @override
   State<WeeklyRevenueCard> createState() => _WeeklyRevenueCardState();
@@ -54,11 +69,24 @@ class _WeeklyRevenueCardState extends State<WeeklyRevenueCard> {
             children: [
               Text('주차별 매출', style: AppText.h2),
               const SizedBox(width: 6),
-              Text(Fmt.monthShort(rev.month),
-                  style: AppText.caption.copyWith(color: AppColors.textMute)),
+              if (widget.onMonthChanged == null)
+                Text(Fmt.monthShort(rev.month),
+                    style: AppText.caption.copyWith(color: AppColors.textMute)),
+              const Spacer(),
+              if (widget.onMonthChanged != null)
+                MonthPickerPill(
+                  month: widget.month ?? rev.month,
+                  onChanged: widget.onMonthChanged!,
+                ),
             ],
           ),
           const SizedBox(height: 12),
+          AnimatedOpacity(
+            opacity: widget.loading ? 0.35 : 1,
+            duration: const Duration(milliseconds: 150),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
 
           // 1) 이번 달 요약
           Row(
@@ -81,6 +109,7 @@ class _WeeklyRevenueCardState extends State<WeeklyRevenueCard> {
                 child: _Kpi(
                   label: '계획 기준 예상',
                   value: Fmt.moneyShort(rev.combinedPlanRevenue),
+                  color: kPlanInk,
                 ),
               ),
               // 구분선에 글자가 붙지 않게 양옆으로 띄운다.
@@ -107,9 +136,9 @@ class _WeeklyRevenueCardState extends State<WeeklyRevenueCard> {
           const SizedBox(height: 8),
           Row(
             children: [
-              _legend(AppColors.statusGray, '계획'),
+              _legend(kPlanInk, '계획'),
               const SizedBox(width: 12),
-              _legend(AppColors.summaryNormal, '실적'),
+              _legend(kActualInk, '실적'),
             ],
           ),
 
@@ -136,6 +165,9 @@ class _WeeklyRevenueCardState extends State<WeeklyRevenueCard> {
               ),
             ),
           ],
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -228,14 +260,14 @@ class _WeeklyRevenueCardState extends State<WeeklyRevenueCard> {
                 barRods: [
                   BarChartRodData(
                     toY: _weekPlan(rev.weeks[i]).toDouble(),
-                    color: AppColors.statusGray,
+                    color: kPlanInk,
                     width: 10,
                     borderRadius: const BorderRadius.vertical(
                         top: Radius.circular(3)),
                   ),
                   BarChartRodData(
                     toY: _weekActual(rev.weeks[i]).toDouble(),
-                    color: AppColors.summaryNormal,
+                    color: kActualInk,
                     width: 10,
                     borderRadius: const BorderRadius.vertical(
                         top: Radius.circular(3)),
@@ -307,6 +339,29 @@ class _WeeklyRevenueCardState extends State<WeeklyRevenueCard> {
           if (i == 2) color = AppColors.summaryInProgress;
           if (i == 4) color = AppColors.summaryCaution;
           if (i == 5) color = AppColors.summaryNormal;
+        }
+        final style = TextStyle(
+          fontSize: 12,
+          fontWeight:
+              (header || total || i == 0) ? FontWeight.w700 : FontWeight.w400,
+          color: color ?? AppColors.textMain,
+          fontFeatures: const [FontFeature.tabularFigures()],
+        );
+        // '계획 / 실적' 칸은 두 숫자의 색을 가른다 (계획 파랑 · 실적 초록)
+        if (!header && (i == 1 || i == 3) && e.value.contains(' / ')) {
+          final p = e.value.split(' / ');
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+            child: Text.rich(
+              TextSpan(style: style, children: [
+                TextSpan(text: p[0], style: const TextStyle(color: kPlanInk)),
+                const TextSpan(
+                    text: ' / ', style: TextStyle(color: Color(0xFF9CA3AF))),
+                TextSpan(text: p[1], style: const TextStyle(color: kActualInk)),
+              ]),
+              textAlign: TextAlign.right,
+            ),
+          );
         }
         return Padding(
           padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),

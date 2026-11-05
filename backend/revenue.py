@@ -46,8 +46,8 @@ DEFAULT_COMMODITIES = [
 ]
 
 
+# 줄바꿈·겹공백을 없앤 이름. 엑셀은 같은 줄을 파일마다 다르게 접는다
 def norm(s) -> str:
-    """줄바꿈·겹공백을 없앤 이름. 엑셀은 같은 줄을 파일마다 다르게 접는다."""
     return " ".join(str(s or "").split())
 
 
@@ -72,7 +72,7 @@ def _open(raw: bytes):
         Font.family.max = 1000
     except Exception:
         pass
-    return openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+    return openpyxl.load_workbook(io.BytesIO(raw), data_only=True, keep_links=False)
 
 
 def _sheet(wb):
@@ -86,12 +86,8 @@ def _sheet(wb):
     return wb.worksheets[0]
 
 
+# 세부 한 줄이 어느 묶음인지.
 def _group_of(div: str, cust: str) -> str:
-    """세부 한 줄이 어느 묶음인지.
-
-    엑셀은 사업부 칸을 한 번만 적고 아래로 이어 쓴다. 그래서 텍슨
-    사이트 줄들이 '우주항공' 아래에 붙어 있는데, 실제로는 내부거래다.
-    """
     d, c = norm(div), norm(cust)
     if "Texon" in c or "Seojin" in c:
         return "internal"
@@ -104,8 +100,8 @@ def _group_of(div: str, cust: str) -> str:
     return "semi"
 
 
+# 주간보고 시트 한 장에서 주차별 '실적' 만 꺼낸다
 def parse_weekly(raw: bytes, year_hint: int = None) -> dict:
-    """주간보고 시트 한 장에서 주차별 '실적' 만 꺼낸다."""
     wb = _open(raw)
     ws = _sheet(wb)
     grid = list(ws.iter_rows(values_only=True))
@@ -150,14 +146,10 @@ def parse_weekly(raw: bytes, year_hint: int = None) -> dict:
                 continue
             out.setdefault("%04d-%02d" % (year, int(m.group(1))), []).append(w)
         return out
-
-    # ── 줄 읽기 ───────────────────────────────────────────
+    # -----------------------------------------------------------
+    # 줄 읽기
+    # -----------------------------------------------------------
     def actual_row(i):
-        """i 줄에서 시작하는 한 덩이의 '실적' 행. 없으면 None.
-
-        덩이는 '사업계획' 에서 시작해 다음 '사업계획' 전까지다. 그 열은
-        읽지 않지만 덩이를 가르는 표시라서 찾기는 해야 한다.
-        """
         for k in range(i, min(i + 6, len(grid))):
             lab = norm(grid[k][5] if len(grid[k]) > 5 else "")
             if k > i and lab == "사업계획":
@@ -206,8 +198,8 @@ def parse_weekly(raw: bytes, year_hint: int = None) -> dict:
             "totals": totals, "lines": lines}
 
 
+# [합 계] 블록의 줄 이름 → 키.
 def _total_key(c2: str, c3: str) -> str:
-    """[합 계] 블록의 줄 이름 → 키."""
     t = norm(c3) or norm(c2)
     if t.startswith("반도체"):
         return "semi"
@@ -224,12 +216,10 @@ def _total_key(c2: str, c3: str) -> str:
     return ""
 
 
-# ── 예상 매출 ─────────────────────────────────────────────
-#
-# Estimate 파일은 Commodity 로 적혀 있고 보고서 묶음은 사업부로 나뉜다.
-# 이름으로 이어 붙인다. 사이트 이름(구미·화성·용인·USA)이나 Internal 이
-# 들어간 것은 내부거래다 — 주간보고에서 텍슨 줄을 내부거래로 보내는 것과
-# 같은 규칙이다.
+# ============================================================
+#  예상 매출
+# ============================================================
+# Estimate 파일은 Commodity 로 적혀 있고 보고서 묶음은 사업부로 나뉜다
 _EST_RULES = (
     ("internal", ("internal", "gumi", "구미", "hwaseong", "화성",
                   "yongin", "용인", "usa", "texon", "텍슨")),
@@ -238,8 +228,8 @@ _EST_RULES = (
 )
 
 
+# Commodity 이름이 어느 묶음인지.
 def estimate_group(name: str) -> str:
-    """Commodity 이름이 어느 묶음인지. 모르면 반도체로 본다."""
     t = norm(name).lower()
     for key, words in _EST_RULES:
         if any(w in t for w in words):
@@ -247,13 +237,8 @@ def estimate_group(name: str) -> str:
     return "semi"
 
 
+# Estimate 파일에서 그 달 예상 매출을 꺼낸다
 def parse_estimate(raw: bytes) -> dict:
-    """Estimate 파일에서 그 달 예상 매출을 꺼낸다.
-
-    'Sum' 시트가 `Commodity | 금액` 두 칸이다. 이름이 빈 채로 숫자만
-    있는 마지막 줄은 그 시트가 스스로 낸 합계라서 항목으로 세지 않고,
-    우리가 더한 값과 맞는지 대조만 한다.
-    """
     wb = _open(raw)
     ws = None
     for w in wb.worksheets:
@@ -296,14 +281,9 @@ def _by_group(items) -> dict:
     return out
 
 
+# 그 달 예상 매출을 넣는다. 다 더한 값이 0 이면 그 달을 지운다
 def set_estimate(store: dict, month: str, items=None, source: str = "",
                  total=None) -> dict:
-    """그 달 예상 매출을 넣는다. 다 더한 값이 0 이면 그 달을 지운다.
-
-    합계는 항목을 더해서 낸다 — 따로 받으면 둘이 어긋났을 때 어느 쪽이
-    맞는지 알 수 없다. 항목이 아예 없을 때만 total 을 쓴다 (묶음별
-    예상이 없는 달이 되고, 그때는 부서별 달성률을 지어내지 않는다).
-    """
     if not MONTH_RE.match(str(month or "")):
         raise ValueError("달은 2026-09 모양이어야 합니다.")
     est = store.setdefault("estimates", {})
@@ -329,13 +309,8 @@ def set_estimate(store: dict, month: str, items=None, source: str = "",
             "groups": rec["groups"], "removed": False}
 
 
+# 그 달 타겟.
 def set_target(store: dict, month: str, total, source: str = "") -> dict:
-    """그 달 타겟.
-
-    예상과 다른 숫자다. 예상은 지금 그렇게 될 것 같은 값이고, 타겟은
-    그렇게 만들기로 한 값이다. 둘을 한 칸에 담으면 목표를 낮춰 잡았는지
-    전망이 나빠진 건지 구분이 안 된다. 0 이면 지운다.
-    """
     if not MONTH_RE.match(str(month or "")):
         raise ValueError("달은 2026-09 모양이어야 합니다.")
     tg = store.setdefault("targets", {})
@@ -357,22 +332,21 @@ def _estimate_of(store: dict, month: str) -> dict:
     return ((store.get("estimates") or {}).get(month) or {})
 
 
-# ── 저장 ──────────────────────────────────────────────────
+# ============================================================
+#  저장
+# ============================================================
 def blank() -> dict:
     return {"version": 3, "updated_at": None, "years": {},
             "estimates": {}, "targets": {}, "sources": {}}
 
 
+# 파일이 있는데 못 읽는다. 빈 값으로 갈아엎으면 안 된다
 class RevenueFileBroken(Exception):
-    """파일이 있는데 못 읽는다. 빈 값으로 갈아엎으면 안 된다."""
+    pass
 
 
+# 없으면 빈 것, 깨졌으면 예외.
 def load(path) -> dict:
-    """없으면 빈 것, 깨졌으면 예외.
-
-    깨진 걸 빈 것으로 돌려주면 다음 저장이 멀쩡한 파일을 빈 값으로
-    덮어쓴다. 한 번 그러면 되돌릴 방법이 없다.
-    """
     import os
     if not os.path.exists(path):
         return blank()
@@ -390,11 +364,8 @@ def load(path) -> dict:
     return d
 
 
+# version 2 까지는 사업계획·실행계획도 같이 담겨 있었다
 def _drop_plan_columns(store: dict) -> None:
-    """version 2 까지는 사업계획·실행계획도 같이 담겨 있었다.
-
-    남겨 두면 언젠가 화면에 새어 나온다. 읽을 때 털어낸다.
-    """
     if store.get("version") == 3:
         return
     for y in (store.get("years") or {}).values():
@@ -410,8 +381,8 @@ def _drop_plan_columns(store: dict) -> None:
 _SAVE_LOCK = _threading.Lock()
 
 
+# 같은 이름의 임시 파일을 여럿이 동시에 쓰면 서로를 덮어쓴다
 def save(path, store: dict) -> None:
-    """같은 이름의 임시 파일을 여럿이 동시에 쓰면 서로를 덮어쓴다."""
     import os
     store["updated_at"] = _dt.datetime.now().isoformat(timespec="seconds")
     tmp = "%s.%d.%d.tmp" % (path, os.getpid(), _threading.get_ident())
@@ -421,11 +392,8 @@ def save(path, store: dict) -> None:
         os.replace(tmp, path)
 
 
+# 그 해를 통째로 갈아 끼운다. 파일 한 장이 한 해 전체다
 def apply_weekly(store: dict, parsed: dict, filename: str = "") -> dict:
-    """그 해를 통째로 갈아 끼운다. 파일 한 장이 한 해 전체다.
-
-    예상은 이 파일에서 오지 않으므로 건드리지 않는다.
-    """
     y = str(parsed.get("year"))
     before = _grand(store, y)
     store.setdefault("years", {})[y] = {
@@ -459,8 +427,8 @@ def _sum(rec: dict, key: str, weeks) -> int:
     return round(sum(float(got.get(w) or 0) for w in weeks))
 
 
+# 그 달의 묶음별 실적 + 사람이 넣은 예상.
 def month_view(store: dict, month: str) -> dict:
-    """그 달의 묶음별 실적 + 사람이 넣은 예상. 홈·상세·admin 이 같이 쓴다."""
     year = str(month)[:4]
     y = (store.get("years") or {}).get(year) or {}
     weeks = _months_of(y, month)

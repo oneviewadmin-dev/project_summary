@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../design/design.dart';
 import '../models/calendar_event.dart';
 import '../models/dashboard.dart';
+import '../services/calendar_service.dart';
 import '../services/dashboard_service.dart';
 import '../components/calendar/calendar_summary_banner.dart';
 import '../components/calendar/calendar_category_filter.dart';
@@ -34,6 +35,9 @@ class _CalendarScreenState extends State<CalendarScreen> {
   };
 
   List<CalendarEvent> _events = [];
+
+  /// 날짜 없는 지연 (calendar_service.dart 주석 참고)
+  List<CalendarEvent> _undated = [];
   final Set<String> _doneIds = {};
 
   bool _loading = true;
@@ -58,11 +62,24 @@ class _CalendarScreenState extends State<CalendarScreen> {
       _error = null;
     });
     try {
-      final cards = await DashboardService.fetchCards();
-      final events = _cardsToEvents(cards);
+      // 운영 자료에서 모은 일정을 먼저 본다 (2026-11-04).
+      // 이 주소가 없는 옛 서버면 예전처럼 주간보고 카드 글자에서 뽑는다.
+      final feed = await CalendarService.fetch();
+      List<CalendarEvent> events;
+      List<CalendarEvent> undated = const [];
+      if (feed.loaded) {
+        events = feed.events
+            .map((e) => _doneIds.contains(e.id) ? e.copyWith(isDone: true) : e)
+            .toList();
+        undated = feed.undated;
+      } else {
+        final cards = await DashboardService.fetchCards();
+        events = _cardsToEvents(cards);
+      }
       if (!mounted) return;
       setState(() {
         _events = events;
+        _undated = undated;
         _loading = false;
       });
     } catch (e) {
@@ -185,8 +202,22 @@ class _CalendarScreenState extends State<CalendarScreen> {
       ..sort((a, b) => a.title.compareTo(b.title));
   }
 
+  /// 마감 목록 — 일정 지연을 맨 위에, 그다음 7일 안의 것.
+  ///
+  /// 예전에는 오늘부터 7일만 봤다. 그러면 이미 지난 '일정 지연' 이 목록에서
+  /// 빠져서, 가장 먼저 봐야 할 것이 캘린더 어디에도 안 보였다.
+  /// 날짜 없는 지연도 여기 선다 — 홈의 '일정 지연' 수와 맞추려고.
   List<CalendarEvent> get _deadline7 {
+    final late = [
+      ..._undated.where((e) => _filter.contains(e.category)),
+      ..._filtered.where((e) => e.isLate || e.status == 'soon'),
+    ]..sort((a, b) {
+        if (a.isLate != b.isLate) return a.isLate ? -1 : 1;
+        return a.date.compareTo(b.date);
+      });
+    final ids = late.map((e) => e.id).toSet();
     final list = _filtered.where((e) {
+      if (ids.contains(e.id)) return false;
       final d = e.diffDays(_today);
       return d >= 0 && d <= 7;
     }).toList()
@@ -194,7 +225,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
         if (a.isDone != b.isDone) return a.isDone ? 1 : -1;
         return a.date.compareTo(b.date);
       });
-    return list;
+    return [...late, ...list];
   }
 
   List<CalendarEvent> get _dayEventsVisible =>
@@ -422,17 +453,20 @@ class _CalendarScreenState extends State<CalendarScreen> {
                                 ),
                               const SizedBox(height: 8),
                               Row(
-                                children: const [
+                                // 제목이 일정 지연 유무에 따라 바뀌어서 const 로 둘 수 없다
+                                children: [
                                   Text(
-                                    'D-7 이내 마감 전체',
-                                    style: TextStyle(
+                                    _deadline7.any((e) => e.isLate)
+                                        ? '일정 지연 · D-7 이내 마감'
+                                        : 'D-7 이내 마감 전체',
+                                    style: const TextStyle(
                                       fontSize: 13,
                                       fontWeight: FontWeight.w800,
                                       color: AppColors.headerNavy,
                                     ),
                                   ),
-                                  Spacer(),
-                                  Text(
+                                  const Spacer(),
+                                  const Text(
                                     '미확인 우선',
                                     style: TextStyle(
                                       fontSize: 11,
@@ -460,7 +494,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
                                         padding: const EdgeInsets.symmetric(
                                             vertical: 20),
                                         child: Text(
-                                          'D-7 이내 마감이 없습니다',
+                                          '일정 지연도, D-7 이내 마감도 없습니다',
                                           style: TextStyle(
                                             fontSize: 12,
                                             color: Colors.grey[600],

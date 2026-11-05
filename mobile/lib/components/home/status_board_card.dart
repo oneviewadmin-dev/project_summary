@@ -93,16 +93,38 @@ class _StatusBoardCardState extends State<StatusBoardCard> {
     }
   }
 
-  List<AlertProject> _rowsOf(_Kind k) =>
-      widget.alerts.byKind[_key[k]] ?? const <AlertProject>[];
+  /// 사업부로 묶은 줄. 전에는 프로젝트였다 — 121줄이라 '모두 보기' 를
+  /// 눌러도 Smac · 파워박스 · SM … 이 끝없이 늘어설 뿐이었다 (2026-11-03).
+  /// 서버가 아직 안 올라간 폰에서는 by_kind_div 가 비어 오므로,
+  /// 그때는 전처럼 프로젝트로 보여 준다 — 목록이 통째로 비는 것보다 낫다.
+  /// 줄을 세는 단위. 사업부로 묶여 오면 '사업부', 옛 서버라 프로젝트로
+  /// 오면 '곳'. 세는 단위가 다른데 같은 말을 쓰면 숫자가 거짓이 된다.
+  String get _unit =>
+      (widget.alerts.byKindDiv[_key[_sel]] ?? const []).isNotEmpty
+          ? '사업부'
+          : '곳';
+
+  List<AlertProject> _rowsOf(_Kind k) {
+    final d = widget.alerts.byKindDiv[_key[k]];
+    if (d != null && d.isNotEmpty) return d;
+    return widget.alerts.byKind[_key[k]] ?? const <AlertProject>[];
+  }
 
   /// 마지막으로 넘어간 방향. 1이면 오른쪽에서 들어오고 -1이면 왼쪽에서
   /// 들어온다. 민 방향과 글이 움직이는 방향이 어긋나면 뒤로 간 건지
   /// 앞으로 간 건지 알 수가 없다.
   int _dir = 1;
 
+  /// 펼쳐 둔 사업부 줄 (2026-11-05).
+  /// Min: "일정 지연이나 집중관리에 있는 사업부 누르면 어떤 프로젝트의
+  ///      일정 지연이나 집중관리 해야 되는건지 보였으면 좋겠어"
+  /// 사업부 줄을 누르면 그 아래로 프로젝트가 펼쳐지고, 프로젝트를 누르면
+  /// 그 프로젝트 화면으로 간다. 종류(타일)를 바꾸면 접는다.
+  final Set<String> _open = {};
+
   void _select(_Kind k) {
     if (k == _sel) return;
+    _open.clear();
     setState(() {
       _dir = k.index > _sel.index ? 1 : -1;
       _sel = k;
@@ -166,9 +188,13 @@ class _StatusBoardCardState extends State<StatusBoardCard> {
         const Text('전체 현황',
             style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800)),
         const SizedBox(width: 5),
-        // 임시. 지금 숫자는 반도체사업부 것만이라 그렇다고 적어 둔다.
-        // 다른 사업부 자료가 들어오면 이 꼬리표를 뗀다.
-        const Text('(반도체 기준)',
+        // 2026-11-02 부터 전 사업부 합계다 (/home/alerts?division=).
+        // Min: "반도체 기준이 아니라 이제 전체적인 사업부 다 내용도 포함"
+        //
+        // 꼬리표를 그냥 떼지 않고 '(전 사업부)' 로 바꿔 둔다. 세는 범위가
+        // 어디까지인지 카드에 적혀 있지 않으면, 숫자가 적어 보일 때
+        // '빠진 사업부가 있나' 를 다시 확인할 길이 없다.
+        const Text('(전 사업부)',
             style: TextStyle(fontSize: 11.5, color: AppColors.textHint)),
         const Spacer(),
         Text(a.fromCache && a.savedAt != null
@@ -217,7 +243,7 @@ class _StatusBoardCardState extends State<StatusBoardCard> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                  '${_long[_sel] ?? _label[_sel]} ${_countOf(_sel)}건 · ${rows.length}곳',
+                  '${_long[_sel] ?? _label[_sel]} ${_countOf(_sel)}건 · ${rows.length}${_unit}',
                   style: const TextStyle(
                       fontSize: 12, fontWeight: FontWeight.w700,
                       color: AppColors.textMute)),
@@ -242,7 +268,7 @@ class _StatusBoardCardState extends State<StatusBoardCard> {
                     onPressed: widget.onTapAll == null
                         ? null
                         : () => widget.onTapAll!(_key[_sel]!),
-                    child: Text('모두 보기 (${rows.length}곳)',
+                    child: Text('모두 보기 (${rows.length}${_unit})',
                         style: const TextStyle(
                             fontSize: 12.5,
                             fontWeight: FontWeight.w700,
@@ -301,6 +327,102 @@ class _StatusBoardCardState extends State<StatusBoardCard> {
   }
 
   Widget _row(AlertProject p) {
+    // 서버가 프로젝트를 같이 보내 주면(사업부 줄) 눌러서 펼친다.
+    // 아니면(프로젝트 줄 · 옛 서버) 전처럼 바로 연다.
+    if (p.items.isEmpty) return _plainRow(p);
+    final c = _color[_sel]!;
+    final open = _open.contains(p.key);
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      InkWell(
+        onTap: () => setState(() {
+          if (!_open.remove(p.key)) _open.add(p.key);
+        }),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 9),
+          child: Row(children: [
+            Container(
+              width: 7, height: 7,
+              decoration: BoxDecoration(color: c, shape: BoxShape.circle),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(p.label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w700,
+                      color: AppColors.textMain)),
+            ),
+            const SizedBox(width: 8),
+            Text('${p.count}건',
+                style: TextStyle(
+                    fontSize: 12.5, fontWeight: FontWeight.w800, color: c)),
+            AnimatedRotation(
+              turns: open ? 0.25 : 0,
+              duration: const Duration(milliseconds: 180),
+              child: const Icon(Icons.chevron_right,
+                  size: 18, color: AppColors.statusGray),
+            ),
+          ]),
+        ),
+      ),
+      if (open) ...[
+        for (final it in p.items) _subRow(it, c),
+        // 사업부 화면으로 가는 길도 남겨 둔다 (전에는 줄을 누르면 바로 갔다)
+        Align(
+          alignment: Alignment.centerRight,
+          child: TextButton(
+            onPressed: widget.onTapProject == null
+                ? null
+                : () => widget.onTapProject!(p.key, p.label),
+            child: Text('${p.label} 화면으로',
+                style: const TextStyle(
+                    fontSize: 12, fontWeight: FontWeight.w700,
+                    color: AppColors.summaryInProgress)),
+          ),
+        ),
+      ],
+    ]);
+  }
+
+  /// 펼친 사업부 아래의 프로젝트 한 줄 — 누르면 그 프로젝트 화면
+  Widget _subRow(AlertProject it, Color c) {
+    final names = it.models.join(' · ') + (it.more > 0 ? ' 외 ${it.more}' : '');
+    return InkWell(
+      onTap: widget.onTapProject == null
+          ? null
+          : () => widget.onTapProject!(it.key, it.label),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(17, 6, 0, 6),
+        child: Row(children: [
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(it.label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                      fontSize: 13, fontWeight: FontWeight.w600,
+                      color: AppColors.textMain)),
+              if (names.isNotEmpty)
+                Text(names,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        fontSize: 11, color: AppColors.textHint)),
+            ]),
+          ),
+          const SizedBox(width: 8),
+          Text('${it.count}건',
+              style: TextStyle(
+                  fontSize: 12, fontWeight: FontWeight.w700, color: c)),
+          const Icon(Icons.chevron_right, size: 16, color: AppColors.statusGray),
+        ]),
+      ),
+    );
+  }
+
+  Widget _plainRow(AlertProject p) {
     final c = _color[_sel]!;
     return InkWell(
       onTap: widget.onTapProject == null

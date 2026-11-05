@@ -34,6 +34,7 @@ import 'overtime_screen.dart';
 import '../services/revenue_service.dart';
 import '../services/home_alerts_service.dart';
 import '../services/offline_store.dart';
+import '../services/offline_prefetch.dart';
 import '../services/automotive_service.dart';
 import '../models/automotive.dart';
 import 'division_projects_screen.dart';
@@ -47,6 +48,7 @@ import 'chat_screen.dart';
 import 'settings_screen.dart';
 import '../services/settings_service.dart';
 import '../services/data_version_service.dart';
+import '../config/owner_label.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -125,6 +127,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       _refresh();
+      // 앞으로 돌아왔을 때도 오프라인용 자료를 새로 받아 둔다 (30분에 한 번까지)
+      _divisionsFuture.then(OfflinePrefetch.run).catchError((_) {});
       // 꺼 둔 사이에 바뀌었을 수 있다. 방금 전부 받았으니 기준만 다시 잡는다.
       _lastDataVersion = null;
       _checkDataVersion();
@@ -306,17 +310,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     // 바로 보이는 편이 낫다 — 새 값은 잠시 뒤 조용히 갈아 끼운다.
     _divisionsFuture = DivisionsService.fetchAll(onFresh: (v) => _swap(() {
           _divisionsFuture = Future.value(v);
+          _markDivisionsWithModels();
         }));
     _dashboardFuture = DashboardService.fetchCards(onFresh: (v) => _swap(() {
           _dashboardFuture = Future.value(v);
         }));
     _progressFuture = ProgressService.fetch(onFresh: (v) => _swap(() {
           _progressFuture = Future.value(v);
+          _markDivisionsWithModels();
         }));
     _overviewFuture = OverviewService.fetch(onFresh: (v) => _swap(() {
           _overviewFuture = Future.value(v);
         }));
-    _overtimeFuture = OvertimeService.fetchWeek();
+    // 2026-11-03 — 여기만 onFresh 가 없었다. 그래서 서버가 8초 안에
+    // 답을 못 하면 저장본으로 떨어진 채 **그대로 머물렀다** —
+    // 43주차가 올라왔는데 카드는 41주차를 들고 있던 이유다.
+    // Min: "잔특근 43주차가 제일 최신인데 반영 안 되어 있는지"
+    _overtimeFuture = OvertimeService.fetchWeek(onFresh: (v) => _swap(() {
+          _overtimeFuture = Future.value(v);
+        }));
     _revenueFuture = RevenueService.fetch(onFresh: (v) => _swap(() {
           _revenueFuture = Future.value(v);
         }));
@@ -325,8 +337,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           _bloom = v.bloom;
         }));
     _rememberBloom();
+    // 2026-11-04 — 위의 onFresh 에서만 세고 있었다. onFresh 는 '저장본을
+    // 먼저 줬을 때' 만 불린다 — 저장본이 없으면(새로 깔았거나 업데이트
+    // 직후) 새 값이 곧바로 오고 onFresh 는 안 불린다. 그래서 한 번도 안
+    // 세고, 주간보고가 있는 반도체·ESS 만 '진행 중' 으로 남았다.
+    // Min: "이거 왜 매칭이 안되는거야...?" (목록은 진행 중, 홈은 진행 데이터 없음)
+    // 저장본이든 새 값이든 받은 것으로 한 번은 꼭 센다.
+    _markDivisionsWithModels();
     _loadFavDivisions();
     _loadAuto();
+    // 오프라인용으로 프로젝트 자료를 뒤에서 미리 받아 둔다 (30분에 한 번까지).
+    // 홈이 먼저 받게 몇 초 기다렸다가 시작한다.
+    Future.delayed(const Duration(seconds: 6), () async {
+      try {
+        OfflinePrefetch.run(await _divisionsFuture);
+      } catch (_) {}
+    });
   }
 
   /// 뒤에서 받아온 값으로 갈아 끼운다. 화면이 이미 없어졌으면 아무것도
@@ -399,6 +425,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _loadAuto(force: true);
     });
     _loadFavDivisions(); // 사업부 즐겨찾기 Set 로딩
+    // 새로 받은 자료로 다시 센다 — 여기는 onFresh 가 없어서 안 하면 옛 값에 머문다
+    _markDivisionsWithModels();
     await Future.wait([
       _divisionsFuture, _dashboardFuture, _progressFuture,
       _overviewFuture, _revenueFuture, _alertsFuture,
@@ -475,8 +503,38 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// 블룸은 모델이 없고 일 보고 보드로 움직인다. /home/alerts 가 같이 준다.
   BloomBrief? _bloom;
 
+  /// 모델이 한 종이라도 등록된 사업부 (2026-11-03).
+  ///
+  /// Min: "전체 사업부별 카드에 시스템 빼곤 다 진행중이여서"
+  ///
+  /// 카드의 '진행 중' 은 /dashboard 의 주간보고 카드만 보고 정했다.
+  /// 주간보고를 내는 건 반도체뿐이라, 프로젝트가 27개씩 있는 아리스타 ·
+  /// PCB · 자동차 · 네트워크가 전부 '진행 데이터 없음' 이었다.
+  ///
+  /// 사업부마다 예외를 두지 않는다 (그 예외를 2026-10-23 에 거뒀다).
+  /// 어느 사업부든 같은 잣대 하나를 더 본다 — 모델이 등록돼 있으면
+  /// 진행 중이다.
+  final Set<String> _divWithModels = <String>{};
+
+  Future<void> _markDivisionsWithModels() async {
+    try {
+      final divs = await _divisionsFuture;
+      final prog = await _progressFuture;
+      // 규칙은 models/dashboard.dart 한 곳에 있다 — 목록 화면도 같은 것을 쓴다.
+      final hit = divisionsWithModels(divs, prog);
+      if (!mounted ||
+          (hit.length == _divWithModels.length &&
+              hit.containsAll(_divWithModels))) return;
+      setState(() {
+        _divWithModels
+          ..clear()
+          ..addAll(hit);
+      });
+    } catch (_) {}
+  }
+
   DivisionStatus _divisionStatus(String divisionId, List<DashboardCard> cards) {
-    final s = computeDivisionStatus(divisionId, cards);
+    final s = divisionStatusWithModels(divisionId, cards, _divWithModels);
     // 2026-10-23 — 블룸·자동차만 '진행 데이터 없음' 을 면하게 해 주던
     // 예외를 거둔다. 주차 자료가 없으면 어느 사업부든 똑같이 보인다.
     if (kSameFrameForAll) return s;
@@ -762,6 +820,27 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
+  /// 홈 '전체 현황' 줄을 눌렀을 때 (2026-11-03).
+  ///
+  /// 2026-11-03 부터 그 줄은 프로젝트가 아니라 **사업부**다
+  /// (Min: "이거 지금 사진에 보이는거 사업부별로 나눠줘").
+  /// 그래서 프로젝트 화면이 아니라 그 사업부의 프로젝트 목록으로 간다.
+  /// 사업부를 못 찾으면 전처럼 프로젝트로 연다 — 서버가 아직 안 올라간
+  /// 폰은 여기로 프로젝트 키를 보내기 때문이다.
+  Future<void> _openStatusRow(String key, [String name = '']) async {
+    List<Division> divs = const [];
+    try {
+      divs = await _divisionsFuture;
+    } catch (_) {}
+    for (final d in divs) {
+      if (d.id == key) {
+        await _openDivision(d);
+        return;
+      }
+    }
+    _openProject(key, name);
+  }
+
   // 사업부 카드 클릭 시 사업부 내 프로젝트 목록 화면으로 진입.
   // 사업부 카드에서 여는 예전 '즉시 확인' 화면. 홈 상단은 AlertListScreen 을 쓴다.
   // ignore: unused_element
@@ -907,7 +986,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             alerts: aSnap.data ?? HomeAlerts.empty,
                             loading: aSnap.connectionState ==
                                 ConnectionState.waiting,
-                            onTapProject: _openProject,
+                            onTapProject: _openStatusRow,
                             onTapAll: (filter) => Navigator.of(context).push(
                               MaterialPageRoute(
                                   builder: (_) =>
@@ -1771,7 +1850,7 @@ class _HomeSearchPanelState extends State<_HomeSearchPanel> {
                     rows.add(_row(
                       icon: Icons.apartment_rounded,
                       title: d.label,
-                      sub: '프로젝트 ${d.projects.length}개',
+                      sub: '${ownerLabelOf(d.id)} ${d.projects.length}개',
                       onTap: () {
                         widget.onClose();
                         widget.onTapDivision(d);

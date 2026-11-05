@@ -1,29 +1,6 @@
-"""'월별 매입 현황 분석' 엑셀 읽기.
-
-시트 모양이 달마다 조금씩 달라서 좌표를 박지 않는다. 대신
-  1) 월이 적힌 머리줄을 찾아 '어느 열이 몇 월인지' 를 만들고
-  2) 왼쪽 라벨을 보며 줄을 해석한다.
-
-라벨은 보통 세 칸이다 — [매입] [원소재] [매입액]. 마지막 칸이 '무슨
-값인지'(매입액·지급액·잔액), 그 앞 칸이 '어느 항목인지'(원소재·소모품…).
-항목 이름은 미리 정해 두지 않는다. 실제 파일에는 '조립자재' 처럼 우리가
-모르는 항목이 있고, 모르는 항목을 앞 항목에 밀어 넣으면 원소재 숫자가
-0 으로 덮인다.
-
-'합계' 줄은 값을 읽지 않는다 — 우리가 더해서 확인하는 쪽이 낫다.
-못 알아본 줄은 버리지 않고 warnings 로 올려 보낸다. 조용히 빠진 줄이
-제일 위험하다.
-
-월 오른쪽의 '합계 · 해외 · 국내' 세 열은 누적이다. 해외/국내는 달별로
-안 나눠져 있고 거기에만 있다. 그래서 달에 섞지 않고 summary 로 따로
-낸다. 그 오른쪽 '비고' 는 줄마다의 비고로, 어느 줄에 달린 것인지까지
-같이 낸다 (revenue · item:raw:buy · stock:wip …). 비고보다 더 오른쪽에
-적어 둔 메모('추가 분석 필요' 목록 같은 것)는 누적 비고에 모아 둔다 —
-버리면 적어 둔 사람만 손해다.
-
-재고·외상매출·총매입액 줄은 이름으로 알아본다. 그 블록의 '구분' 칸이
-'합계' 라서, 구분 칸만 보고 건너뛰면 통째로 빠진다.
-"""
+# ============================================================
+#  '월별 매입 현황 분석' 엑셀 읽기
+# ============================================================
 from __future__ import annotations
 
 import datetime as _dt
@@ -107,13 +84,39 @@ def _num(v):
     return -f if neg else f
 
 
+# 다듬은 글자 n 안에 words 중 하나라도 들어 있는가.
+def _has_any(n: str, words) -> bool:
+    for w in words:
+        if _norm(w) in n:
+            return True
+    return False
+
+
+# 다듬은 글자 n 이 words 중 하나와 정확히 같은가.
+def _equals_any(n: str, words) -> bool:
+    for w in words:
+        if _norm(w) == n:
+            return True
+    return False
+
+
+# 읽지 않고 건너뛸 줄인가 (머리글·안내문·합계 같은 것).
 def _is_skip(s) -> bool:
     n = _norm(s)
     if not n:
         return False
-    if any(_norm(w) in n for w in SKIP_IN):
+    # -----------------------------------------------------------
+    # 1. 일부만 들어 있어도 건너뛰는 말
+    # -----------------------------------------------------------
+    if _has_any(n, SKIP_IN):
         return True
-    return n in {_norm(k) for k in SKIP_EQ}
+    # -----------------------------------------------------------
+    # 2. 글자가 통째로 같아야 건너뛰는 말
+    # -----------------------------------------------------------
+    skip_exact = set()
+    for k in SKIP_EQ:
+        skip_exact.add(_norm(k))
+    return n in skip_exact
 
 
 def _month_of(v, year: int):
@@ -135,8 +138,10 @@ def _known_key(label):
     n = _norm(label)
     if not n:
         return None
+    # ITEM_KEYS = [('출하대기', ('출하 대기', '출하대기')), …]
+    # 앞에 적힌 것부터 본다 — 먼저 맞는 것이 이긴다.
     for key, words in ITEM_KEYS:
-        if any(_norm(w) in n for w in words):
+        if _has_any(n, words):
             return key
     return None
 
@@ -145,40 +150,62 @@ def _metric(label):
     n = _norm(label)
     if not n:
         return None
+    # -----------------------------------------------------------
+    # 1. 글자가 똑같은 것을 먼저 찾는다
+    # -----------------------------------------------------------
+    #    '매입' 은 '총매입액' 안에도 들어 있다. 포함부터 보면 둘이 섞여서
+    #    '매입' 줄이 '총매입액' 으로 들어간다.
     for key, words in METRICS.items():
-        if any(_norm(w) == n for w in words):
+        if _equals_any(n, words):
             return key
+    # -----------------------------------------------------------
+    # 2. 똑같은 게 없으면 포함으로 한 번 더
+    # -----------------------------------------------------------
+    #    '매입액(원)' 처럼 뒤에 뭐가 붙은 경우를 잡는다.
     for key, words in METRICS.items():
-        if any(_norm(w) in n for w in words):
+        if _has_any(n, words):
             return key
     return None
 
 
+# 라벨이 words 중 하나를 품고 있는가.
 def _match(label, words):
     n = _norm(label)
-    return bool(n) and any(_norm(w) in n for w in words)
+    if not n:
+        return False
+    return _has_any(n, words)
 
 
+# 재고·미수금·총매입액·비율 줄인지.
 def _special(label):
-    """재고·미수금·총매입액·비율 줄인지. ('stock', 키) 또는 (키, None)."""
     n = _norm(label)
     if not n:
         return None
+    # -----------------------------------------------------------
+    # 1. 재고 줄인가 → ('stock', 어느 재고인지)
+    # -----------------------------------------------------------
     for key, words in STOCK_KEYS:
-        if any(_norm(w) in n for w in words):
+        if _has_any(n, words):
             return ("stock", key)
+    # -----------------------------------------------------------
+    # 2. 미수금·총매입액·비율 같은 곁줄인가 → (그 키, None)
+    # -----------------------------------------------------------
     for key, words in SIDE_KEYS:
-        if any(_norm(w) in n for w in words):
+        if _has_any(n, words):
             return (key, None)
+
     return None
 
 
+# 비고는 줄바꿈을 지킨다 — 몇 건인지 눈으로 세야 하니까.
 def _note_txt(v) -> str:
-    """비고는 줄바꿈을 지킨다 — 몇 건인지 눈으로 세야 하니까."""
     if v is None:
         return ""
     t = str(v).replace("\r\n", "\n").replace("\r", "\n").replace(" ", " ")
-    lines = [ln.rstrip() for ln in t.split("\n")]
+    # 줄 끝 공백만 떼고 줄 구조는 그대로 둔다
+    lines = []
+    for ln in t.split("\n"):
+        lines.append(ln.rstrip())
     while lines and not lines[0]:
         lines.pop(0)
     while lines and not lines[-1]:
@@ -186,13 +213,8 @@ def _note_txt(v) -> str:
     return "\n".join(lines)
 
 
+# bytes · 파일객체 · 경로를 다 받는다
 def _open_book(data):
-    """bytes · 파일객체 · 경로를 다 받는다.
-
-    서버에서 BytesIO 로 열다가 TypeError 가 난 적이 있어(환경 차이),
-    실패하면 임시 파일로 한 번 더 해 본다. 다른 화면들이 경로로 여는
-    방식은 그 서버에서 잘 돈다.
-    """
     if isinstance(data, (bytes, bytearray, memoryview)):
         raw = bytes(data)
     elif hasattr(data, "read"):
@@ -201,16 +223,16 @@ def _open_book(data):
             raise ValueError("파일을 바이트로 읽지 못했습니다.")
         raw = bytes(raw)
     else:
-        return load_workbook(data, data_only=True)
+        return load_workbook(data, data_only=True, keep_links=False)
 
     try:
-        return load_workbook(io.BytesIO(raw), data_only=True)
+        return load_workbook(io.BytesIO(raw), data_only=True, keep_links=False)
     except Exception:
         fd, path = tempfile.mkstemp(suffix=".xlsx")
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(raw)
-            return load_workbook(path, data_only=True)
+            return load_workbook(path, data_only=True, keep_links=False)
         finally:
             try:
                 os.unlink(path)
@@ -226,8 +248,8 @@ def _grid(ws, max_row=400, max_col=40):
     return out
 
 
+# 월이 2개 이상 있는 줄을 머리줄로 본다
 def _header(rows, year: int):
-    """월이 2개 이상 있는 줄을 머리줄로 본다."""
     best, best_i = {}, -1
     for i, row in enumerate(rows[:40]):
         cols, seen = {}, set()
@@ -241,26 +263,45 @@ def _header(rows, year: int):
     return best_i, best
 
 
+# 머리줄에서 월 오른쪽에 있는 합계·해외·국내·비고 열을 찾는다
 def _side_cols(row, after: int):
-    """머리줄에서 월 오른쪽에 있는 합계·해외·국내·비고 열을 찾는다.
-
-    이 엑셀은 해외/국내를 달마다 안 나누고 4~8월 누적에만 적는다. 그 세
-    열이 '누적' 한 칸이 되고, 그 오른쪽 비고가 줄마다의 비고다.
-    """
-    regions, note = {}, None
-    want = {r: {_norm(w) for w in words} for r, words in REGION_WORDS.items()}
+    regions = {}      # {'해외': 열번호, '국내': 열번호, ...}
+    note = None       # 비고 열 번호
+    # -----------------------------------------------------------
+    # 1. 찾을 말을 미리 다듬어 둔다
+    # -----------------------------------------------------------
+    #    REGION_WORDS = {'해외': ('해외', 'overseas'), '국내': (...)}
+    #    돌 때마다 다듬으면 같은 일을 열 수만큼 반복한다.
+    want = {}
+    for r, words in REGION_WORDS.items():
+        normed = set()
+        for w in words:
+            normed.add(_norm(w))
+        want[r] = normed
+    # -----------------------------------------------------------
+    # 2. 월 열 오른쪽을 한 칸씩 본다
+    # -----------------------------------------------------------
     for j in range(after + 1, len(row)):
         n = _norm(row[j])
         if not n:
             continue
-        if note is None and any(_norm(w) in n for w in NOTE_WORDS):
+
+        # ── 2-1. 비고 열을 아직 못 찾았으면 먼저 그것부터
+        if note is None and _has_any(n, NOTE_WORDS):
             note = j
             continue
+
+        # ── 2-2. 비고를 이미 찾았으면 그 오른쪽은 지역 열이 아니다
+        #        (비고 뒤는 사람이 적어 둔 메모 영역이다)
         if note is not None:
             continue
+
+        # ── 2-3. 지역 열인가. 먼저 찾은 열을 쓴다 — 같은 말이 또 나오면
+        #        오른쪽 것은 보통 소계라 덮어쓰면 안 된다.
         for r, ns in want.items():
             if n in ns and r not in regions:
                 regions[r] = j
+
     return regions, note
 
 
@@ -280,7 +321,11 @@ def parse_workbook(data, year=None, sheet=None) -> dict:
     blank = lambda: {"revenue": None, "items": {}, "prepaid": None,      # noqa: E731
                      "actual_paid": None, "invest": None, "stock": {},
                      "receivable": None, "total_buy": None}
-    acc = {m: blank() for m in months_keys}
+    # 달마다 빈 그릇을 하나씩 만들어 둔다. 표를 훑으면서 여기에 채운다.
+    #   acc = {'2026-04': {빈 그릇}, '2026-05': {빈 그릇}, ...}
+    acc = {}
+    for m in months_keys:
+        acc[m] = blank()
     # 누적 — 달을 더해서 만들지 않는다. 표의 합계/해외/국내 열을 그대로 담는다.
     sacc = blank()
     notes, extra = {}, []
@@ -289,8 +334,8 @@ def parse_workbook(data, year=None, sheet=None) -> dict:
 
     order, labels, keymap = [], {}, {}
 
+    # 항목 이름 → 키. 모르는 이름도 그대로 받는다
     def item_key(label):
-        """항목 이름 → 키. 모르는 이름도 그대로 받는다."""
         n = _norm(label)
         if n in keymap:
             return keymap[n]
@@ -312,8 +357,8 @@ def parse_workbook(data, year=None, sheet=None) -> dict:
             return "sum:%s" % arg
         return t
 
+    # 한 칸 넣기. region=None 이면 그 달, 아니면 누적의 그 지역.
     def put(bucket, target, v, region=None):
-        """한 칸 넣기. region=None 이면 그 달, 아니면 누적의 그 지역."""
         t, arg = target
         if t == "sum":
             return                      # 합계 줄은 우리가 더해서 확인한다
@@ -345,11 +390,34 @@ def parse_workbook(data, year=None, sheet=None) -> dict:
 
     for ri in range(hi + 1, len(rows)):
         row = rows[ri]
-        parts = [t for t in
-                 (_txt(row[j]) if j < len(row) else "" for j in label_cols) if t]
-        vals = {m: (_num(row[j]) if j < len(row) else None) for j, m in cols.items()}
-        regs = {r: (_num(row[j]) if j < len(row) else None)
-                for r, j in regions.items()}
+        # -----------------------------------------------------------
+        # 1. 이 줄의 라벨 조각들 (왼쪽 라벨 열들에서 글자만 모은다)
+        # -----------------------------------------------------------
+        #    줄이 짧아 그 열이 아예 없는 경우가 있어 길이를 먼저 본다.
+        parts = []
+        for j in label_cols:
+            if j < len(row):
+                t = _txt(row[j])
+                if t:
+                    parts.append(t)
+        # -----------------------------------------------------------
+        # 2. 달마다의 숫자 {'2026-04': 120, '2026-05': None, ...}
+        # -----------------------------------------------------------
+        vals = {}
+        for j, m in cols.items():
+            if j < len(row):
+                vals[m] = _num(row[j])
+            else:
+                vals[m] = None
+        # -----------------------------------------------------------
+        # 3. 지역별 숫자 {'해외': 50, '국내': 70}
+        # -----------------------------------------------------------
+        regs = {}
+        for r, j in regions.items():
+            if j < len(row):
+                regs[r] = _num(row[j])
+            else:
+                regs[r] = None
         note = (_note_txt(row[note_col])
                 if (note_col is not None and note_col < len(row)) else "")
         # 비고 오른쪽에 적어 둔 메모(‘추가 분석 필요’ 목록 같은 것)도 챙긴다
@@ -359,11 +427,31 @@ def parse_workbook(data, year=None, sheet=None) -> dict:
                 t = _note_txt(row[j])
                 if t:
                     side.append(t)
-
-        group = parts[-2] if len(parts) >= 2 else None
-        metric = parts[-1] if parts else None
-        has_val = (any(v is not None for v in vals.values())
-                   or any(v is not None for v in regs.values()))
+        # -----------------------------------------------------------
+        # 4. 라벨 조각에서 '묶음'과 '항목'을 가른다
+        # -----------------------------------------------------------
+        #    왼쪽부터 ['구매품', '출하대기'] 처럼 들어오면
+        #    뒤에서 두 번째가 묶음, 마지막이 항목이다.
+        group = None
+        if len(parts) >= 2:
+            group = parts[-2]
+        metric = None
+        if parts:
+            metric = parts[-1]
+        # -----------------------------------------------------------
+        # 5. 이 줄에 숫자가 하나라도 있는가
+        # -----------------------------------------------------------
+        #    하나도 없으면 머리글이나 빈 줄이라 값으로 다루지 않는다.
+        has_val = False
+        for v in vals.values():
+            if v is not None:
+                has_val = True
+                break
+        if not has_val:
+            for v in regs.values():
+                if v is not None:
+                    has_val = True
+                    break
 
         def stash(*texts):
             for t in texts:
@@ -456,6 +544,8 @@ def parse_workbook(data, year=None, sheet=None) -> dict:
     for m, mv in acc.items():
         items = items_of(mv["items"])
         stock = stock_of(mv["stock"])
+        # 아무것도 안 들어온 달은 내보내지 않는다.
+        # 품목도 없고 매출도 없고 재고도 없으면 그 달은 표에 없던 것이다.
         if not items and mv["revenue"] is None and not stock:
             continue
         one = {"revenue": mv["revenue"], "items": items,
@@ -468,12 +558,23 @@ def parse_workbook(data, year=None, sheet=None) -> dict:
 
     if not out:
         raise ValueError("읽을 수 있는 숫자가 없습니다. 시트를 확인해 주세요.")
-
+    # -----------------------------------------------------------
+    # 누적(합계) 칸 만들기
+    # -----------------------------------------------------------
+    #    해외/국내 열이 있는 표에만 누적이 있다. 그 열이 없으면 만들지 않는다.
     summary = None
-    s_items, s_stock = items_of(sacc["items"]), stock_of(sacc["stock"])
-    if regions and (s_items or s_stock or any(
-            sacc.get(k) for k in ("revenue", "prepaid", "actual_paid",
-                                  "invest", "receivable", "total_buy"))):
+    s_items = items_of(sacc["items"])
+    s_stock = stock_of(sacc["stock"])
+
+    # 누적에 숫자가 하나라도 들어왔는지 본다
+    has_side = False
+    for k in ("revenue", "prepaid", "actual_paid", "invest",
+              "receivable", "total_buy"):
+        if sacc.get(k):
+            has_side = True
+            break
+
+    if regions and (s_items or s_stock or has_side):
         summary = {"revenue": sacc["revenue"], "items": s_items,
                    "prepaid": sacc["prepaid"], "actual_paid": sacc["actual_paid"],
                    "invest": sacc["invest"], "stock": s_stock,
@@ -490,24 +591,29 @@ def parse_workbook(data, year=None, sheet=None) -> dict:
             "items": [{"key": k, "label": labels.get(k, k)} for k in order]}
 
 
+# 엑셀에 없는 달은 그대로 둔다. 있는 달은 숫자를 통째로 바꾼다
 def merge(old: dict, new: dict) -> dict:
-    """엑셀에 없는 달은 그대로 둔다. 있는 달은 숫자를 통째로 바꾼다.
-
-    비고는 엑셀에 없고 화면에서만 적어 둔 것이 있어서, 새로 읽은 달에
-    비고가 없으면 있던 비고를 지킨다.
-    """
     out = dict(old or {})
     for m, mv in (new or {}).items():
         mv = dict(mv or {})
         prev = out.get(m)
-        if not mv.get("notes") and isinstance(prev, dict) and prev.get("notes"):
+        # -----------------------------------------------------------
+        # 비고는 새로 올린 파일에 없으면 예전 것을 지킨다
+        # -----------------------------------------------------------
+        #    비고는 사람이 손으로 적는 칸이라, 엑셀에 안 적혀 왔다고 해서
+        #    지워 버리면 적어 둔 내용이 사라진다.
+        keep_note = False
+        if not mv.get("notes"):
+            if isinstance(prev, dict) and prev.get("notes"):
+                keep_note = True
+        if keep_note:
             mv["notes"] = prev["notes"]
         out[m] = mv
     return out
 
 
+# 누적도 숫자는 새 걸로, 비고는 합친다 (같은 줄이면 새 것).
 def merge_summary(old, new):
-    """누적도 숫자는 새 걸로, 비고는 합친다 (같은 줄이면 새 것)."""
     if not isinstance(new, dict):
         return old if isinstance(old, dict) else None
     out = dict(new)

@@ -10,3 +10,10 @@ backend/*.bak_*
 backend/main.py.bak*
 backend/_backup_*/
 .git/
+
+# 이미지에 안 들어가는 큰 폴더 — 빌드 때 올리지 않는다 (2026-11-05)
+_to_delete/
+backups/
+Claude outputs/
+_scratch/
+mobile/

@@ -1,28 +1,6 @@
-"""블룸 일 보고 자료 — 빈 엑셀 양식.
-
-기준은 '블룸_보고자료_Update_10_01_ver4_1.xlsx' 의 '10월 보고자료' 시트다.
-그 모양을 그대로 만든다. 사람이 쓰던 파일이 기준이지 새로 짜낸 모양이
-아니라서, 받는 분들이 지금 쓰던 대로 채우면 된다.
-
-    A        B      C        D      E      F   G   │ H  I │ J  K │ ...
-    품목     재고            공정    공정    10월 합계│ 1일   │ 2일   │
-             출하   구매품    구분    재고    계획 실적│계획실적│계획실적│
-             대기   대기
-
-머리글이 세 줄인 게 핵심이다.
-  1행  제목
-  2행  품목 / 재고(병합) / 공정구분 / 공정재고 / N월 합계(병합) / 주차(병합)
-  3행  출하대기 / 구매품대기 / 날짜
-  4행  계획 / 실적
-
-파서(bloom_daily_import)가 이 세 줄을 납작하게 펴서 열을 찾는다. 그래서
-'공정⏎구분' 은 '공정구분' 으로 읽힌다 — 머리글 글자를 바꾸면 파서가 못
-찾으니 양식과 파서를 같이 고쳐야 한다. 테스트가 둘을 묶어 둔다.
-
-품목 칸은 세 줄(공정 NCT·조립·출하)을 세로 병합한다. 품목이 한 줄만
-쓰는 경우(BOP Assy 는 NCT 가 없다)가 있어서 공정 수는 품목마다 다를 수
-있다 — 양식은 세 줄로 깔고, 안 쓰는 줄은 비워 두면 된다.
-"""
+# ============================================================
+#  블룸 일 보고 자료 — 빈 엑셀 양식
+# ============================================================
 
 from __future__ import annotations
 
@@ -79,12 +57,8 @@ def _h(ws, r, c, text, fill=HEAD, size=10):
     return x
 
 
+# 블룸 일 보고 자료 빈 양식.
 def build_bloom_template(month: str = "", items=None) -> bytes:
-    """블룸 일 보고 자료 빈 양식.
-
-    month  'YYYY-MM'. 없으면 이번 달.
-    items  품목 이름 목록. 주면 왼쪽 칸을 채워 둔다 (숫자 칸은 비운다).
-    """
     month = (month or _dt.date.today().strftime("%Y-%m")).strip()
     try:
         m = int(month[5:7])
@@ -108,15 +82,17 @@ def build_bloom_template(month: str = "", items=None) -> bytes:
     day_c0 = nf + 3                     # 첫 날짜 계획
     last_c = day_c0 + len(days) * 2 - 1
     note_c = last_c + 1
-
-    # ── 1행 제목
+    # -----------------------------------------------------------
+    # 1행 제목
+    # -----------------------------------------------------------
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=7)
     t = ws.cell(1, 1, "블룸 계획 대비 실적 보고(%d/%02d)" % (m, 1))
     t.font = Font(name=KFONT, bold=True, size=16, color=NAVY)
     t.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[1].height = 42
-
-    # ── 2~4행 왼쪽 고정 칸
+    # -----------------------------------------------------------
+    # 2~4행 왼쪽 고정 칸
+    # -----------------------------------------------------------
     for i, (_t, _m2, w) in enumerate(FIXED, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     # 품목 · 공정구분 · 공정재고 — 2~4행 세로 병합
@@ -131,16 +107,18 @@ def build_bloom_template(month: str = "", items=None) -> bytes:
     for c, label in ((2, "출하\n대기"), (3, "구매품 \n대기")):
         ws.merge_cells(start_row=HDR_MID, start_column=c, end_row=HDR_SUB, end_column=c)
         _h(ws, HDR_MID, c, label)
-
-    # ── N월 합계
+    # -----------------------------------------------------------
+    # N월 합계
+    # -----------------------------------------------------------
     ws.merge_cells(start_row=HDR_TOP, start_column=sum_c,
                    end_row=HDR_MID, end_column=sum_c + 1)
     _h(ws, HDR_TOP, sum_c, "%d월 합계" % m)
     for j, lab in enumerate(("계획", "실적")):
         _h(ws, HDR_SUB, sum_c + j, lab)
         ws.column_dimensions[get_column_letter(sum_c + j)].width = 9.5
-
-    # ── 날짜 — 주차로 묶고 그 아래 날짜, 그 아래 계획/실적
+    # -----------------------------------------------------------
+    # 날짜 — 주차로 묶고 그 아래 날짜, 그 아래 계획/실적
+    # -----------------------------------------------------------
     c = day_c0
     wk_start, wk_no = c, _iso_week(days[0])
     for i, d in enumerate(days):
@@ -170,8 +148,9 @@ def build_bloom_template(month: str = "", items=None) -> bytes:
 
     for r in (HDR_TOP, HDR_MID, HDR_SUB):
         ws.row_dimensions[r].height = 29.25
-
-    # ── 본문 — 품목 하나가 공정 세 줄
+    # -----------------------------------------------------------
+    # 본문 — 품목 하나가 공정 세 줄
+    # -----------------------------------------------------------
     body = Font(name=KFONT, size=10)
     f_soft = PatternFill("solid", fgColor=SOFT)
     f_plan = PatternFill("solid", fgColor=PLAN)

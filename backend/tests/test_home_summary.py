@@ -72,8 +72,16 @@ for need in ('@app.get("/admin/home/summary")',
              '@app.post("/admin/home/division-target")',
              'DIV_TARGET_FILE = DATA_DIR / "division_targets.json"'):
     assert need in SRC, f'{need} 가 없다'
+# 2026-10-27 — '모델 판가 × 출하' 하나였던 것을 둘로 갈랐다.
+# 매출 관리에서 달을 골라도 숫자가 안 바뀌던 것을 고치면서 생긴 구분이라,
+# 화면에서 어느 쪽인지 알 수 있어야 한다.
+#
+# 2026-11-03 — '판가 × 출하 (누계)' 는 뺐다. 누계는 달과 상관없는 값이라
+# 11월 3일에 11월 실적이 $1187만으로 떴다. 이제 그 달 자료가 없으면 0 이고,
+# 출처도 빈 글자다 — 적을 출처가 없는 게 맞다.
+#   Min: "왜 누계로 되는거야...누구 마음대로"
 for src_label in ('"주간보고"', '"보고자료 금액"', '"보고자료 계획"',
-                  '"모델 판가 × 출하"', '"직접 입력"'):
+                  '"판가 × 그 달 실적"', '"직접 입력"'):
     assert src_label in SRC, f'{src_label} 출처 표기가 없다'
 ok += 1
 

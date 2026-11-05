@@ -113,6 +113,14 @@ class RevenueMonth {
 
   /// 예상이 묶음별로 나뉘어 들어왔는지. 금액만 넣은 달은 false.
   final bool hasEstimateGroups;
+  /// 서버가 센 범위. '전사' 또는 사업부 이름 (2026-11-03).
+  /// 화면이 '반도체' 를 못 박고 있어서, 전사로 넓힌 뒤에도 자동차 ·
+  /// 네트워크가 반도체 안에 들어가 보였다.
+  final String scope;
+
+  /// 목표도 실적도 없는 사업부 이름 (2026-11-04). 줄로는 안 세우고 이름만
+  /// 알린다 — 안 보이면 '목표가 없다' 는 것을 알 길이 없다.
+  final List<String> noTarget;
   final bool loaded;
   final bool fromCache;
   final DateTime? savedAt;
@@ -135,6 +143,8 @@ class RevenueMonth {
     this.hasData = false,
     this.hasEstimate = false,
     this.hasEstimateGroups = false,
+    this.scope = '',
+    this.noTarget = const [],
     this.loaded = true,
     this.fromCache = false,
     this.savedAt,
@@ -150,7 +160,12 @@ class RevenueMonth {
   List<RevenueGroup> get lines {
     final out = <RevenueGroup>[...groups];
     if (internal != null) out.add(internal!);
-    return out.where((g) => g.actual > 0).toList();
+    // 2026-11-04 — 실적이 있는 줄만 남겼더니, 달이 막 시작해 실적이 전부
+    // 0 인 11월은 사업부 목록이 통째로 비었다. 목표가 있으면 실적이 0 이어도
+    // 세운다 — 이번 달에 무엇을 하기로 했는지가 그 줄의 뜻이다.
+    // Min: "사업부 밑에 리스트는 있어야 되지 않을까? 그래도 어떤 목표들이
+    //       있는지를 알아야지"
+    return out.where((g) => g.actual > 0 || g.estimate > 0).toList();
   }
 
   /// 실적 큰 것부터. 홈 카드는 이 순서로 보여준다.
@@ -167,6 +182,8 @@ class RevenueMonth {
         target: target, targetRate: targetRate, targetLeft: targetLeft,
         hasTarget: hasTarget,
         hasEstimate: hasEstimate, hasEstimateGroups: hasEstimateGroups,
+        scope: scope,
+        noTarget: noTarget,
         fromCache: fromCache ?? this.fromCache,
         savedAt: savedAt ?? this.savedAt,
       );
@@ -198,6 +215,11 @@ class RevenueMonth {
       asOf: (j['as_of'] ?? '').toString(),
       groups: groups,
       internal: internal,
+      scope: (j['scope'] ?? '').toString(),
+      noTarget: ((j['no_target'] as List?) ?? const [])
+          .map((e) => e.toString())
+          .where((e) => e.isNotEmpty)
+          .toList(),
       hasData: j['has_data'] == true && groups.isNotEmpty,
       hasEstimate: j['has_estimate'] == true,
       hasEstimateGroups: j['has_estimate_groups'] == true,
@@ -210,10 +232,14 @@ class RevenueService {
   /// 라서, 카드가 예전 방식(모델 계산)으로 그린다.
   static Future<RevenueMonth> fetch(
       {String month = '', void Function(RevenueMonth)? onFresh}) async {
-    final q = month.isEmpty ? '' : '?month=$month';
+    // division= 를 빈 값으로 보내면 전 사업부 합계다 (2026-11-02).
+    // 서버 기본값은 아직 'semiconductor' 다 — 안 올린 앱의 숫자가 말없이
+    // 바뀌면 안 되니까. 그래서 여기서 또박또박 비워 보낸다.
+    // Min: "반도체 기준이 아니라 이제 전체적인 사업부 다 내용도 포함"
+    final q = month.isEmpty ? '?division=' : '?month=$month&division=';
     try {
       final got = await OfflineStore.fetch(
-          '$kApiBaseUrl/revenue$q', 'revenue${month.isEmpty ? '' : '_$month'}',
+          '$kApiBaseUrl/revenue$q', 'revenue_all${month.isEmpty ? '' : '_$month'}',
           timeout: const Duration(seconds: 20),
           onFresh: onFresh == null ? null : (c) => onFresh(_parse(c)));
       return _parse(got);

@@ -6,9 +6,13 @@
 import 'package:flutter/material.dart';
 
 import '../design/typography.dart';
+import '../models/division.dart';
+import '../services/divisions_service.dart';
 import '../services/home_alerts_service.dart';
 import '../utils/status_words.dart';
+import 'division_projects_screen.dart';
 import 'project_overview_screen.dart';
+import '../config/owner_label.dart';
 
 class AlertListScreen extends StatefulWidget {
   /// '문제' = 지연+이슈 (홈에서 들어오는 기본) · '' = 전부
@@ -26,11 +30,39 @@ class _AlertListScreenState extends State<AlertListScreen> {
   late Future<HomeAlerts> _future;
   late String _filter;
 
+  /// 줄을 눌렀을 때 사업부 화면으로 보내려면 사업부 객체가 있어야 한다.
+  /// 못 받아도 화면은 떠야 하니 빈 목록으로 둔다 (그때는 전처럼 프로젝트로 연다).
+  List<Division> _divisions = const [];
+
+  /// 칩으로 보여주는 다섯 가지. 화면에 쓰는 말은 StatusWords 가 정한다
+  /// (정상 · 일정 지연 · 집중관리 · 특이사항 · PO 대기).
+  ///
+  /// 2026-11-03 — '문제' 와 '전체' 를 뺐다.
+  /// Min: "지금 위에 탭/pill을 정상, 일정지연, 집중관리, 특이사항,
+  ///       PO 대기 로만 보이게 변경햐줘"
+  ///
+  /// '문제' 는 지연+특이사항을 합친 것이고 '전체' 는 그 위에 임박까지
+  /// 더한 것이라, 같은 건이 칩 세 개에 겹쳐 세어졌다 — 18 · 18 · 19 가
+  /// 나란히 서서 어느 것이 무엇인지 알 수 없었다.
+  static const List<String> _kChips = ['정상', '지연', '임박', '이슈', 'PO 대기'];
+
   @override
   void initState() {
     super.initState();
-    _filter = widget.initialFilter;
+    // 칩에 없는 값으로 열리면 아무 칩도 안 눌린 빈 화면이 된다 — 첫 칩으로.
+    // (홈 카드는 정상 · 지연 · 이슈 · 임박 만 넘긴다. 전부 칩에 있다.)
+    final want = widget.initialFilter.trim();
+    _filter = _kChips.contains(want) ? want : _kChips.first;
     _future = HomeAlertsService.fetch();
+    _loadDivisions();
+  }
+
+  Future<void> _loadDivisions() async {
+    try {
+      final d = await DivisionsService.fetchAll();
+      if (!mounted) return;
+      setState(() => _divisions = d);
+    } catch (_) {}
   }
 
   /// 칩 하나가 보여줄 목록. 보류·PO 대기는 지연 목록과 별개다.
@@ -199,17 +231,31 @@ class _AlertListScreenState extends State<AlertListScreen> {
     );
   }
 
-  /// 정상은 프로젝트 한 줄씩 건수만.
+  /// 한 줄에 '어디가 몇 건'.
   ///
   /// 품번을 192줄 늘어놓아도 읽을 사람이 없다. '어디가 몇 건' 만 보고,
-  /// 자세한 건 프로젝트로 들어가서 본다.
+  /// 자세한 건 눌러서 들어가 본다.
+  ///
+  /// 2026-11-03 — 프로젝트로 세우면 125줄이다 (Smac 113 · 파워박스 80 ·
+  /// SM 78 …). 홈 카드는 이미 사업부로 접어서 보여주는데 여기만 프로젝트로
+  /// 늘어놓으니, 같은 '정상 1191' 을 눌렀는데 화면마다 다른 것이 나왔다.
+  /// Min: "전체 사업부 들어가면 여기서도 사업부로 보였으면 좋겠는데"
   Widget _projectRow(AlertProject p, Color tint) {
+    Division? div;
+    for (final d in _divisions) {
+      if (d.id == p.key) {
+        div = d;
+        break;
+      }
+    }
     return GestureDetector(
       onTap: () => Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => ProjectOverviewScreen(
-          projectKey: p.key,
-          projectName: p.label,
-        ),
+        builder: (_) => div != null
+            ? DivisionProjectsScreen(division: div)
+            : ProjectOverviewScreen(
+                projectKey: p.key,
+                projectName: p.label,
+              ),
       )),
       child: Container(
         margin: const EdgeInsets.only(bottom: 10),
@@ -227,10 +273,24 @@ class _AlertListScreenState extends State<AlertListScreen> {
           ),
           const SizedBox(width: 11),
           Expanded(
-            child: Text(p.label,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: AppText.bodyStrong.copyWith(fontSize: 14.5)),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(p.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: AppText.bodyStrong.copyWith(fontSize: 14.5)),
+                // '반도체사업부 238건' 만 보면 몇 군데가 모인 건지 모른다
+                if (p.projects > 0)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text('${ownerLabelOf(p.key)} ${p.projects}곳',
+                        style: const TextStyle(
+                            fontSize: 12, color: Color(0xFF7C8594))),
+                  ),
+              ],
+            ),
           ),
           Text('${p.count}건',
               style: TextStyle(
@@ -248,8 +308,7 @@ class _AlertListScreenState extends State<AlertListScreen> {
       appBar: AppBar(
         backgroundColor: Colors.white,
         elevation: 0,
-        title: Text(
-            _filter.isEmpty ? '전체 현황' : StatusWords.of(_filter),
+        title: Text(StatusWords.of(_filter),
             style: AppText.bodyStrong.copyWith(fontSize: 17)),
         iconTheme: const IconThemeData(color: Color(0xFF111827)),
       ),
@@ -266,8 +325,12 @@ class _AlertListScreenState extends State<AlertListScreen> {
                     style: TextStyle(color: Color(0xFFDC2626))));
           }
           final list = _listFor(a);
+          // 사업부로 접은 것이 있으면 그것을 쓴다. 서버가 못 주는 옛 버전에
+          // 붙어도 화면이 비지 않게 프로젝트 목록으로 떨어진다.
           final byProject = (_filter == '정상')
-              ? (a.byKind['정상'] ?? const <AlertProject>[])
+              ? (a.byKindDiv['정상']?.isNotEmpty == true
+                  ? a.byKindDiv['정상']!
+                  : (a.byKind['정상'] ?? const <AlertProject>[]))
               : const <AlertProject>[];
           return Column(children: [
             Container(
@@ -276,29 +339,25 @@ class _AlertListScreenState extends State<AlertListScreen> {
               padding: const EdgeInsets.fromLTRB(16, 10, 8, 10),
               child: SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
+                // 칩 글자는 사람이 읽는 말, 걸러내는 값은 서버가 쓰는 말.
+                //
+                // 2026-11-03 — '문제' 와 '전체' 를 뺐다 (_kChips 주석 참고).
                 child: Row(children: [
-                  _chip('문제', a.blocked, _filter == '문제',
-                      () => setState(() => _filter = '문제'),
-                      const Color(0xFFDC2626)),
-                  // 칩 글자는 사람이 읽는 말, 걸러내는 값은 서버가 쓰는 말
                   _chip(StatusWords.normal, a.normal, _filter == '정상',
                       () => setState(() => _filter = '정상'),
                       const Color(0xFF196B24)),
                   _chip(StatusWords.delayed, a.delayed, _filter == '지연',
                       () => setState(() => _filter = '지연'),
                       const Color(0xFFDC2626)),
-                  _chip(StatusWords.issue, a.issue, _filter == '이슈',
-                      () => setState(() => _filter = '이슈'),
-                      const Color(0xFFEA580C)),
                   _chip(StatusWords.soon, a.soon, _filter == '임박',
                       () => setState(() => _filter = '임박'),
                       const Color(0xFFF59E0B)),
+                  _chip(StatusWords.issue, a.issue, _filter == '이슈',
+                      () => setState(() => _filter = '이슈'),
+                      const Color(0xFFEA580C)),
                   _chip('PO 대기', a.poWait, _filter == 'PO 대기',
                       () => setState(() => _filter = 'PO 대기'),
                       const Color(0xFFB45309)),
-                  _chip('전체', a.alertsTotal, _filter.isEmpty,
-                      () => setState(() => _filter = ''),
-                      const Color(0xFF0E2841)),
                 ]),
               ),
             ),

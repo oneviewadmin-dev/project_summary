@@ -57,6 +57,18 @@ def grab(name):
 code = grab("_load_models")
 ok("global _seed_warned" in code, "씨앗 경고가 한 번만 나오게 막는 장치가 없다")
 
+# ── 캐시는 '씨앗으로 간다' 블록 밖에 있어야 한다 (2026-11-03) ────
+# 읽은 것을 한 벌 들고 있게 바꿨다 (OOM 때문에). 그 코드를 아래
+# try 안에 두면, 캐시가 한 번 삐끗했을 때 except 가 그걸 '파일을 못
+# 읽었다' 로 받아서 조용히 몇 달 전 씨앗 자료를 서비스한다 —
+# 화면은 멀쩡한데 숫자만 옛날인, 아무도 못 알아채는 상태다.
+# '씨앗으로 간다' 는 아래 except 가 하는 일이다. 캐시를 돌려주는 자리가
+# 그보다 뒤에 있으면, 캐시가 삐끗했을 때 그 except 에 걸린다.
+_fall = code.find("를 읽지 못했습니다")
+_cache = code.find('return _MODELS_CACHE["data"]')
+ok(_cache > 0, "읽은 것을 안 들고 있는다")
+ok(0 < _cache < _fall, "캐시가 삐끗하면 씨앗으로 떨어진다")
+
 
 def run(models_exists, seed_exists, models_body=None, seed_body=None):
     """_load_models 를 임시 폴더에서 돌린다 → (결과, 찍힌 로그)"""
@@ -68,7 +80,10 @@ def run(models_exists, seed_exists, models_body=None, seed_body=None):
     if seed_exists:
         sf.write_text(json.dumps(seed_body), encoding="utf-8")
     g = {"json": json, "os": os, "Path": Path,
-         "MODELS_FILE": mf, "SEED_MODELS_FILE": sf, "_seed_warned": False}
+         "MODELS_FILE": mf, "SEED_MODELS_FILE": sf, "_seed_warned": False,
+         # 2026-11-03 — 읽은 것을 한 벌 들고 있는다 (OOM 때문에).
+         # 시험마다 새 걸로 둬야 앞 시험의 자료가 안 묻어 온다.
+         "_MODELS_CACHE": {"key": None, "data": None}}
     exec(compile(code, "<load>", "exec"), g)
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -100,7 +115,8 @@ d = Path(tempfile.mkdtemp())
 (d / "models.seed.json").write_text(json.dumps(SEED), encoding="utf-8")
 g = {"json": json, "os": os, "Path": Path,
      "MODELS_FILE": d / "models.json", "SEED_MODELS_FILE": d / "models.seed.json",
-     "_seed_warned": False}
+     "_seed_warned": False,
+     "_MODELS_CACHE": {"key": None, "data": None}}
 exec(compile(code, "<load>", "exec"), g)
 buf = io.StringIO()
 with redirect_stdout(buf):

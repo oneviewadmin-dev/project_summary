@@ -1,24 +1,6 @@
-"""자동차사업부 '양산주요제품' 엑셀 파서.
-
-한 제품이 두 줄이다. 위가 비용, 아래가 비율(%)이다. 연도별 값도 두 줄에 나뉜다.
-위가 물량, 아래가 매출(억원)이다. 고객사는 여러 줄에 걸쳐 병합돼 있다.
-
-    고객사 제품명 ... 재료비 부품비 주조비 ... 판가 | 현재단계 SOP | 총 2026 2027 ...
-    셰플러 SVCT   ... 23488  1200  10768 ... 36531 | 양산   2024.4 | 물량 729100 116755 ...
-                  ... 46.4%  2.3%  21.3% ...       |               | 매출 354.3  56.7   ...
-
-원가는 다섯 덩어리로 묶는다. 화면이 그렇게 보여주고, 엑셀 여덟 칸은 이렇게 접힌다.
-    재료비 = 재료비 + 부품비 + 포장
-    공정비 = 주조비 + 가공비
-    관리이윤 · 감가상각 · 물류 는 그대로
-(SVCT 23,488+1,200+1,142 = 25,830 / 10,768+6,347 = 17,115. 발레오도 7,510 / 6,663.)
-
-판가는 '=27.06*1350' 처럼 외화 단가 × 환율로 들어 있다. 값만 읽으면 그 둘을
-잃어버리므로 수식도 같이 본다. 1650 이면 EUR, 아니면 USD 로 본다 (발레오=프랑스).
-
-비율(%) 행과 합계·공정비 열은 읽지 않는다. 원본에서 계산된 값이라
-어긋나 있을 수 있고, 화면이 어차피 다시 계산한다.
-"""
+# ============================================================
+#  자동차사업부 '양산주요제품' 엑셀 파서
+# ============================================================
 
 from __future__ import annotations
 
@@ -66,8 +48,8 @@ def _num(v):
         return None
 
 
+# 병합 셀이면 왼쪽 위 값을 돌려준다 (고객사처럼 세로 병합된 칸).
 def _merged_value(ws, r, c):
-    """병합 셀이면 왼쪽 위 값을 돌려준다 (고객사처럼 세로 병합된 칸)."""
     v = ws.cell(r, c).value
     if v is not None:
         return v
@@ -77,8 +59,8 @@ def _merged_value(ws, r, c):
     return None
 
 
+# '고객사' 와 '제품명' 이 같이 있는 행 → (행번호, {이름: 열}, {연도: 열})
 def _find_header(ws, max_scan=12):
-    """'고객사' 와 '제품명' 이 같이 있는 행 → (행번호, {이름: 열}, {연도: 열})"""
     for r in range(1, min(ws.max_row, max_scan) + 1):
         cols, years = {}, {}
         for c in range(1, ws.max_column + 1):
@@ -103,13 +85,8 @@ def _find_header(ws, max_scan=12):
     return None
 
 
+# 워크북 → {'sheet', 'years', 'rows'[]}.
 def parse(wb, wb_formula=None, sheet=None):
-    """워크북 → {'sheet', 'years', 'rows'[]}. 못 읽으면 None.
-
-    wb          값 워크북 (data_only=True). 숫자는 여기서 읽는다.
-    wb_formula  수식 워크북. 판가의 '외화 단가 × 환율' 을 살리는 데만 쓴다.
-                값 워크북만 주면 판가는 원화 한 덩어리로 들어간다.
-    """
     names = [sheet] if sheet else list(wb.sheetnames)
     for nm in names:
         if nm not in wb.sheetnames:
@@ -228,8 +205,8 @@ def _clean(d):
     return {k: v for k, v in d.items() if v not in (None, "", {}, [])}
 
 
+# 어느 시트가 읽히는지만 훑는다 (같은 표의 개정본이 여러 장 있다).
 def sheets(wb, wb_formula=None):
-    """어느 시트가 읽히는지만 훑는다 (같은 표의 개정본이 여러 장 있다)."""
     out = []
     for nm in wb.sheetnames:
         try:
@@ -245,9 +222,8 @@ def sheets(wb, wb_formula=None):
     return out
 
 
+# 별칭 → 등록된 표기. 엑셀에 '스탈란티스' 로 적혀 있어도 화면에는 등록된 '스텔란티스' 로 나가게 하려고 쓴다
 def name_labels(projects):
-    """별칭 → 등록된 표기. 엑셀에 '스탈란티스' 로 적혀 있어도 화면에는
-    등록된 '스텔란티스' 로 나가게 하려고 쓴다."""
     out = {}
     for p in projects:
         lab = _s(p.get("label"))
@@ -260,25 +236,13 @@ def name_labels(projects):
     return out
 
 
+# 등록된 고객사 이름이면 등록 표기로 바꾼다
 def canonical(name, labels):
-    """등록된 고객사 이름이면 등록 표기로 바꾼다.
-
-    모르는 이름은 손대지 않는다. 최종고객사 칸에는 기아자동차·현대자동차·CEER·PSA
-    처럼 프로젝트가 아닌 회사도 들어온다.
-    """
     return labels.get(_key(name).lower(), _s(name))
 
 
+# 고객사 이름 → 프로젝트 키.
 def match_projects(rows, projects):
-    """고객사 이름 → 프로젝트 키.
-
-    라벨과 별칭을 공백·대소문자만 지워서 맞춘다. 비슷한 이름 추측은 하지 않는다.
-    '고압주조' 와 '저압주조' 도 한 글자 차이라, 닮았다고 이어 붙이면 엉뚱한
-    고객사 밑으로 제품이 들어간다. 못 찾은 고객사는 미리보기에서 그대로 보여주고
-    (엑셀 '스탈란티스' ↔ 등록 '스텔란티스' 처럼) 별칭으로 명시해 해결한다.
-
-    projects: [{'id','label','aliases':[...]}]
-    """
     idx = {}
     for p in projects:
         for nm in [p.get("label")] + list(p.get("aliases") or []):

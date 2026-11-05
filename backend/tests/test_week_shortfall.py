@@ -139,7 +139,59 @@ for t in ('"closed_weeks"', '"shortfalls"', '"week_reasons"'):
     assert t in SRC, f'보드 응답에 {t} 가 없다'
 assert '"row": "합계"' in SRC, '미달을 합계로 적지 않는다'
 assert '/admin/projects/{project_key}/week-reason' in SRC, '사유를 적을 곳이 없다'
-assert 'col_mode != "week"' in SRC, '월 단위 보드(챔버)에도 주차 미달을 붙였다'
+# 월 단위 보드(챔버)에는 '주차 미달'이라는 개념이 없다.
+#
+# 예전에는 `col_mode != "week"` 라는 글자가 있는지로 봤는데, 같은 뜻을
+# 다른 모양으로 써도(if col_mode == "week": … else: …) 통과하지 못했다.
+# 글자가 아니라 **구조**를 본다 — _spec_board 안에서
+# _mark_board_shortfalls 를 부르는 자리가 'col_mode 가 week 인가' 를
+# 따지는 if 안에 들어 있어야 한다.
+import ast as _ast
+
+_tree = _ast.parse(SRC)
+_spec = None
+for _n in _ast.walk(_tree):
+    if isinstance(_n, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and _n.name == '_spec_board':
+        _spec = _n
+        break
+assert _spec is not None, '_spec_board 함수가 없어졌다'
+
+
+def _calls_shortfall(node):
+    """이 가지 안에서 _mark_board_shortfalls 를 부르는가."""
+    for x in _ast.walk(node):
+        if isinstance(x, _ast.Call) and _ast.unparse(x.func).endswith('_mark_board_shortfalls'):
+            return True
+    return False
+
+
+def _checks_week(test):
+    """이 if 조건이 col_mode 와 'week' 를 견주는가."""
+    t = _ast.unparse(test)
+    return 'col_mode' in t and 'week' in t
+
+
+_guarded = False
+for _n in _ast.walk(_spec):
+    if isinstance(_n, _ast.If) and _checks_week(_n.test):
+        # 조건이 맞는 쪽(또는 아닌 쪽)에서만 미달을 계산하면 된다
+        if _calls_shortfall(_n) :
+            _guarded = True
+            break
+assert _guarded, '월 단위 보드(챔버)에도 주차 미달을 붙였다'
+
+# 부르는 자리가 if 밖에도 있으면 안 된다 — 가지 안의 호출만 세어 확인
+_in_if = 0
+for _n in _ast.walk(_spec):
+    if isinstance(_n, _ast.If) and _checks_week(_n.test):
+        for _x in _ast.walk(_n):
+            if isinstance(_x, _ast.Call) and _ast.unparse(_x.func).endswith('_mark_board_shortfalls'):
+                _in_if += 1
+_all = 0
+for _x in _ast.walk(_spec):
+    if isinstance(_x, _ast.Call) and _ast.unparse(_x.func).endswith('_mark_board_shortfalls'):
+        _all += 1
+assert _all == _in_if, '주차 미달을 if 밖에서도 계산한다'
 ok += 1
 
 # ── 홈: 주차 미달도 이슈. 단 '참고' 는 빼고 ──
@@ -170,9 +222,22 @@ assert 'class _BCell' in W and '_weekPair' in W, '앱 표가 미달을 모른다
 assert "▼" in W and "short ?" in W, '미달 칸에 표시가 없다'
 assert 'short: values.last[1].short' in W, '앱 합계 행이 미달을 안 받는다'
 assert W.count('short: values.last[1].short') == 2, '한쪽 표만 고쳤다'
-assert '_shortfallNote' in W and '계획 미달' in W, '표 밑 사유가 없다'
-assert '사유 미입력' in W or '아직 적히지 않았습니다' in W, '사유 없을 때 말이 없다'
-assert "week == nowWeek || actual != 0" in W, '앞으로 올 주를 0 으로 그린다'
+# 2026-10-26 — 보드 밑의 '계획 미달' 칸은 안 그린다.
+#
+# 표에서 이미 합계 칸이 빨갛게 ▼ 로 어느 주가 모자랐는지 말한다. 그
+# 밑에 같은 주를 또 상자로 늘어놓으니, 주차가 셋만 모자라도 보드보다
+# 그 칸이 길어져서 정작 표를 못 봤다. 지우지는 않았다 — 되살릴 자리는
+# 그대로 두고 스위치만 끈다.
+assert '_shortfallNote' in W, '사유 칸을 지웠다 — 되살릴 자리가 없다'
+assert 'final bool _hideShortfall = true;' in W, '사유 칸을 끄지 않았다'
+assert 'if (_hideShortfall) return const SizedBox.shrink();' in W, \
+    '스위치가 실제로 그리기를 막지 않는다'
+assert '사유 미입력' in W or '아직 적히지 않았습니다' in W, \
+    '되살렸을 때 사유 없을 때 할 말이 없다'
+# 2026-11-04 — Min: "계획이랑 실적 적힌거 색깔 다르게 해서 다 표기해주고"
+# 앞으로 올 주도 · 로 비우지 않고 숫자를 적는다. 0 이 미달로 읽히지 않게
+# ▼ 표시는 마감된 주(서버의 short)에만 붙는다.
+assert "_BCell(_n(m['actual'] ?? 0), short: short)" in W, '실적 칸을 다 표기하지 않는다'
 ok += 1
 
 print(f'전부 통과 · {ok}개 항목')

@@ -1,27 +1,6 @@
-"""전사 사업부별 잔업·특근 현황.
-
-매입 현황과 다르게 **주 단위**다. 엑셀이 W39(9/21~9/27) 처럼 한 주씩
-들어오고, 사업부 시트에는 요일별 값이 있다. 그래서 담는 모양도
-
-    사업부 → 주차(2026-W39) → 요일(mon…sun)
-
-이다. 월로 접으면 요일을 잃는데, 요일이 이 자료의 핵심이다 —
-평일은 '잔업', 일요일은 '특근'으로 아예 다른 지표다.
-
-지표가 하나가 아니다.
-  - 잔업률  : 월~토. 일요일 칸은 'X' (해당 없음)
-  - 특근률  : 일요일.  평일 칸은 'X' (해당 없음)
-각각 전체 / 직접 / 간접으로 또 갈린다.
-
-'X' 를 0 으로 바꾸면 안 된다. 0 은 '아무도 안 나왔다', X 는 '그 날은
-이 지표가 없다' 이다. 평균을 낼 때 X 를 0 으로 세면 잔업률이 6/7 로
-줄어든다. 그래서 None 으로 두고, 평균에서 아예 뺀다.
-
-비율은 저장한 값을 그대로 쓰지 않고 인원으로 다시 낸다 —
-    잔업률 = Σ잔업인원(월~토) / Σ가용인원(월~토)
-엑셀의 합계 줄과 대조해 보면 이 방식이 맞다 (PCB 107.5/441 = 24.4%).
-전사도 같은 식의 가중평균이다 (8,727/12,485 = 69.9%).
-"""
+# ============================================================
+#  전사 사업부별 잔업·특근 현황
+# ============================================================
 from __future__ import annotations
 
 import datetime as _dt
@@ -71,8 +50,8 @@ def _note(v) -> str:
     return "\n".join(lines)[:MAX_NOTE]
 
 
+# 빈 칸과 'X' 는 None. 0 과 구별해야 한다
 def num(v):
-    """빈 칸과 'X' 는 None. 0 과 구별해야 한다."""
     if v is None or isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
@@ -108,16 +87,16 @@ def div_key(v, fallback: str = "") -> str:
     return t if _KEY_RE.match(t) else fallback
 
 
-# ── 한 요일 ───────────────────────────────────────────────────
-
-
+# ============================================================
+#  한 요일
+# ============================================================
 def _people(raw, keys) -> dict:
     raw = raw if isinstance(raw, dict) else {}
     return {k: num(raw.get(k)) for k in keys}
 
 
+# 요일 한 칸. 없는 값은 None 으로 남긴다
 def normalize_day(raw) -> dict:
-    """요일 한 칸. 없는 값은 None 으로 남긴다."""
     raw = raw if isinstance(raw, dict) else {}
     out = {
         "headcount": _people(raw.get("headcount"), ("total", "day", "night")),
@@ -205,16 +184,10 @@ def save(path: Path, data: dict) -> dict:
     return out
 
 
-# ── 집계 ─────────────────────────────────────────────────────
-
-
+# ============================================================
+#  집계
+# ============================================================
 def _r(x, nd=0):
-    """엑셀의 ROUND 와 같게 — 0.5 는 올린다.
-
-    파이썬 기본 round() 는 은행가 반올림이라 164.5 를 164 로 내린다.
-    사업부마다 1명씩 어긋나면 전사 합계가 엑셀과 안 맞고, 그러면
-    보는 사람이 어느 쪽을 믿어야 할지 모른다.
-    """
     q = _D(1) if nd <= 0 else _D(1).scaleb(-nd)
     v = _D(repr(float(x))).quantize(q, rounding=_HALF_UP)
     return int(v) if nd <= 0 else float(v)
@@ -230,8 +203,8 @@ def _kind_days(kind: str) -> tuple:
     return WEEKDAYS if kind == "overtime" else (SUNDAY,)
 
 
+# 사업부 한 주. 인원은 요일 평균, 비율은 인원 합으로 다시 낸다
 def division_week(div: dict) -> dict:
-    """사업부 한 주. 인원은 요일 평균, 비율은 인원 합으로 다시 낸다."""
     days = div.get("days") or {}
     have = [d for d in DAYS if d in days]
 
@@ -299,9 +272,8 @@ def _scope_base(day: dict, scope: str):
     return (day.get("available") or {}).get("total")
 
 
+# 전사. 사업부 값을 평균 내지 않고 인원을 더해서 다시 나눈다 — 인원이 30명인 곳과 3,000명인 곳을 같은 무게로 세면 안 된다
 def _sum_div(rows: list) -> dict:
-    """전사. 사업부 값을 평균 내지 않고 인원을 더해서 다시 나눈다 —
-    인원이 30명인 곳과 3,000명인 곳을 같은 무게로 세면 안 된다."""
     def add(path):
         tot, any_ = 0.0, False
         for r in rows:
@@ -339,15 +311,10 @@ def _sum_div(rows: list) -> dict:
     }
 
 
-# ── 검산 ─────────────────────────────────────────────────────
-#
-# 엑셀에도 '일치확인' 열이 있지만 그 값을 믿지 않고 우리가 다시 센다.
-# W39 는 파일이 OK 라고 한 네트워크에서 '일요일 주간+야간이 가용보다 4명
-# 적다' 가 하나 더 나왔다.
-#
-# 반드시 **요일 원본값**으로 센다. 주 평균으로 세면 요일마다 따로 반올림한
-# 차이 때문에 멀쩡한 사업부가 1명씩 틀린 것처럼 나온다 (W39 에서 시스템·
-# 헬스케어·자동차휠 셋이 그랬다).
+# ============================================================
+#  검산
+# ============================================================
+# 엑셀에도 '일치확인' 열이 있지만 그 값을 믿지 않고 우리가 다시 센다
 AUDITS = (
     ("avail_shift", "주간+야간 ≠ 가용", ("available", "day"), ("available", "night"),
      ("available", "total")),
@@ -369,8 +336,8 @@ def _dig(day: dict, path):
     return cur
 
 
+# 한 사업부의 안 맞는 곳. 없으면 빈 리스트.
 def audit_division(div: dict) -> list:
-    """한 사업부의 안 맞는 곳. 없으면 빈 리스트."""
     days = (div or {}).get("days") or {}
     out = []
     for code, label, a, b, total in AUDITS:
@@ -418,9 +385,9 @@ def prev_week(data: dict, wk: str) -> str:
     return earlier[-1] if earlier else ""
 
 
+# 전사 화면 한 판. 주차 하나, 지표 하나, 범위 하나.
 def for_app(data: dict, wk: str = "", kind: str = "overtime",
             scope: str = "total") -> dict:
-    """전사 화면 한 판. 주차 하나, 지표 하나, 범위 하나."""
     kind = kind if kind in KINDS else "overtime"
     scope = scope if scope in SCOPES else "total"
     weeks = sorted(data.get("weeks") or {})
@@ -504,8 +471,8 @@ def for_app(data: dict, wk: str = "", kind: str = "overtime",
     }
 
 
+# 사업부 한 곳 — 요일별까지.
 def for_division(data: dict, key: str, wk: str = "") -> dict:
-    """사업부 한 곳 — 요일별까지."""
     key = div_key(key)
     weeks = sorted(data.get("weeks") or {})
     wk = week_key(wk) or (weeks[-1] if weeks else "")
@@ -548,12 +515,8 @@ def for_division(data: dict, key: str, wk: str = "") -> dict:
             "has_data": True}
 
 
+# 관리 화면 한 판 — 고칠 원본과, 보여 줄 집계를 같이 준다
 def for_admin(data: dict, wk: str = "") -> dict:
-    """관리 화면 한 판 — 고칠 원본과, 보여 줄 집계를 같이 준다.
-
-    집계를 화면에서 다시 계산하게 두면 앱과 숫자가 갈린다. 가중평균과
-    반올림 규칙이 한 군데에만 있어야 한다.
-    """
     weeks = sorted(data.get("weeks") or {})
     wk = week_key(wk) or (weeks[-1] if weeks else "")
     week = (data.get("weeks") or {}).get(wk) or {}
@@ -583,8 +546,8 @@ def for_admin(data: dict, wk: str = "") -> dict:
             "scopes": [{"key": s, "label": SCOPE_LABEL[s]} for s in SCOPES]}
 
 
+# 주차 하나를 통째로 갈아끼운다. 다른 주는 건드리지 않는다
 def put_week(data: dict, wk: str, payload: dict) -> dict:
-    """주차 하나를 통째로 갈아끼운다. 다른 주는 건드리지 않는다."""
     out = normalize(data)
     key = week_key(wk)
     if not key:

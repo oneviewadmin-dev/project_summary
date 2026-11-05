@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import '../config/app_config.dart';
 import '../design/typography.dart';
 import 'model_list_screen.dart';
@@ -9,6 +8,7 @@ import 'model_cost_list_screen.dart';
 import '../models/weekly_revenue.dart';
 import '../widgets/weekly_revenue_card.dart';
 import '../widgets/weekly_board_card.dart';
+import '../widgets/plan_actual.dart';
 import '../utils/issue_text.dart';
 import '../utils/status_words.dart';
 import '../design/colors.dart';
@@ -66,6 +66,24 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
   late Future<Map<String, dynamic>> _planFuture;
   late Future<List<Map<String, String>>> _summaryFuture;
 
+  // ── 주차별 매출 — 달 고르기 (2026-11-04)
+  //    전에는 build 안에서 매번 새로 받았다. 달을 바꿀 때와 당겨서
+  //    새로고침할 때만 받는다. 받는 동안에는 지난 표를 흐리게 둔다.
+  String _revMonth = thisMonthKey();
+  Future<WeeklyRevenue?>? _revFuture;
+  WeeklyRevenue? _lastRev;
+
+  Future<WeeklyRevenue?> _revFor(String month) =>
+      fetchWeeklyRevenue(widget.projectKey, month: month);
+
+  void _setRevMonth(String m) {
+    if (m == _revMonth) return;
+    setState(() {
+      _revMonth = m;
+      _revFuture = _revFor(m);
+    });
+  }
+
   @override
   void initState() {
     super.initState();
@@ -116,8 +134,8 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
 
   Future<List<Map<String, String>>> _fetchIssuesSummary() async {
     try {
-      final res = await http
-          .get(Uri.parse('$kApiBaseUrl/projects/${widget.projectKey}/issues/summary'))
+      final res = await OfflineStore
+          .httpGet(Uri.parse('$kApiBaseUrl/projects/${widget.projectKey}/issues/summary'))
           .timeout(const Duration(seconds: 12));
       if (res.statusCode != 200) return const [];
       final d = jsonDecode(utf8.decode(res.bodyBytes));
@@ -190,7 +208,7 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
             return const Center(child: CircularProgressIndicator());
           }
           if (snap.hasError) {
-            return Center(child: Text('로드 실패: ${snap.error}'));
+            return Center(child: Padding(padding: const EdgeInsets.all(24), child: Text(OfflineStore.errorText(snap.error), textAlign: TextAlign.center, style: const TextStyle(fontSize: 13.5, height: 1.5, color: Color(0xFF6B7280)))));
           }
           final data = snap.data ?? {};
           final models = (data['models'] as List? ?? []).cast<Map<String, dynamic>>();
@@ -274,6 +292,7 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
                 _modelsFuture = _fetchModels();
                 _planFuture = _fetchWeeklyPlan();
                 _summaryFuture = _fetchIssuesSummary();
+                _revFuture = _revFor(_revMonth);
               });
               if (_bloomFrame) await _loadBloom();
             },
@@ -377,9 +396,21 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
                 _buildWeeklyPlanSection(),
                 // ── 주차별 매출 현황 (어느 사업부든 같은 자리)
                 if (!_autoFrame) FutureBuilder<WeeklyRevenue?>(
-                  future: fetchWeeklyRevenue(widget.projectKey),
+                  future: _revFuture ??= _revFor(_revMonth),
                   builder: (context, snap) {
                     if (snap.connectionState == ConnectionState.waiting) {
+                      // 달을 바꾸는 중이면 지난 표를 흐리게 두고 달 고르기는 그대로
+                      if (_lastRev != null) {
+                        return Padding(
+                          padding: const EdgeInsets.only(top: 16),
+                          child: WeeklyRevenueCard(
+                            rev: _lastRev!,
+                            month: _revMonth,
+                            onMonthChanged: _setRevMonth,
+                            loading: true,
+                          ),
+                        );
+                      }
                       return const SizedBox(height: 80,
                           child: Center(child: CircularProgressIndicator(strokeWidth: 2)));
                     }
@@ -391,14 +422,27 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
                     }
                     final rev = snap.data;
                     if (rev == null) {
-                      return const Padding(
-                        padding: EdgeInsets.all(16),
-                        child: Text('주차별 매출 데이터 없음',
-                            style: TextStyle(color: Color(0xFF9CA3AF), fontSize: 12)));
+                      // 고른 달에 자료가 없어도 달 고르기는 남긴다 — 안 그러면
+                      // 되돌아갈 길이 없다.
+                      return Padding(
+                        padding: const EdgeInsets.only(top: 16),
+                        child: Row(children: [
+                          const Expanded(
+                            child: Text('주차별 매출 데이터 없음',
+                                style: TextStyle(color: Color(0xFF9CA3AF), fontSize: 12)),
+                          ),
+                          MonthPickerPill(month: _revMonth, onChanged: _setRevMonth),
+                        ]),
+                      );
                     }
+                    _lastRev = rev;
                     return Padding(
                       padding: const EdgeInsets.only(top: 16),
-                      child: WeeklyRevenueCard(rev: rev),
+                      child: WeeklyRevenueCard(
+                        rev: rev,
+                        month: _revMonth,
+                        onMonthChanged: _setRevMonth,
+                      ),
                     );
                   },
                 ),
@@ -638,7 +682,10 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
   /// 어느 쪽도 아니면(품목 등) 예전처럼 목록으로 간다.
   void _openCheckRow(_CheckRow r, List<Map<String, dynamic>> models) {
     final m = r.model;
-    final g = (m['display_group'] ?? m['group'] ?? '').toString();
+    // 어디로 넘길지는 구분이 아니라 **틀**이 정한다 (2026-10-28).
+    // 아리스타 개발은 '개발' 묶음에 있지만 양산처럼 모델 상세로 간다 —
+    // 공정 13단계는 반도체 것이라 PCB 에는 맞는 단계가 하나도 없다.
+    final g = frameOf(m);
     final id = (m['id'] ?? m['name'] ?? '').toString();
     if (g == '개발' && id.isNotEmpty) {
       Navigator.of(context).push(MaterialPageRoute(
@@ -1071,6 +1118,9 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
     'enclosure',
     'powerbox',
     'major_module',
+    // CURIE (Space X) — 2026-11-04 Min: "CURIE (Space X) 주차 현황 보드 추가"
+    // 서버가 이미 섹션형 보드(버스바/시트메탈류 · 키스톤 …)를 만들어 준다.
+    'spacex',
   };
 
   /// 자동차사업부인가. 프로젝트 키가 전부 auto_ 로 시작해 고객사가 늘어도 따라온다.
@@ -1090,11 +1140,38 @@ class _ProjectOverviewScreenState extends State<ProjectOverviewScreen> {
     if (_autoFrame) return const SizedBox.shrink();
     // 블룸은 사업부 화면에서도 같은 보드를 띄운다. 프로젝트에 들어왔을 때
     // 다른 표가 뜨면 같은 주차 계획이 두 모양이 된다 — 보드로 통일한다.
-    final boardHere = _boardProjects.contains(widget.projectKey.toLowerCase()) ||
-        (kDivisionBoardOn.contains('bloom') && _isBloomItem);
-    if (boardHere) {
-      return WeeklyBoardCard(projectKey: widget.projectKey);
-    }
+    //
+    // 자동차도 보드로 둔다. 예전에는 이 자리에 엑셀 이미지를 올렸는데
+    // 올린 적이 없어 늘 비어 있었다 — 들어가면 반도체와 같은 표가 뜬다.
+    final k = widget.projectKey.toLowerCase();
+    // 보드를 띄울 조건 세 가지 — 하나라도 맞으면 보드다.
+    //   · _boardProjects   : 반도체처럼 프로젝트 키를 직접 적어 둔 곳
+    //   · projectBoardOn   : 일 보고로 그리는 곳 (블룸 품목 · ESS)
+    //   · auto_ 로 시작    : 자동차 프로젝트 전부
+    //
+    // 2026-10-25 — 전에는 두 번째 줄이 kDivisionBoardOn('사업부 화면에
+    // 보드를 띄우나') 를 봤다. 그래서 사업부 화면의 보드를 내리자 여기
+    // 프로젝트 화면의 보드까지 같이 꺼졌다. 자리마다 스위치를 따로 둔다.
+    final boardLocal = _boardProjects.contains(k) ||
+        projectBoardOn(k) ||
+        k.startsWith('auto_');
+    // 2026-11-05 — 서버(/models/detail 의 board)가 정한다. 이번 주 뒤로 앱을
+    // 못 올려서, 보드를 켜고 끄는 건 서버(division_columns.UI)에서 한다.
+    // 서버가 안 알려 주는 옛 버전이거나 아직 못 받았으면 위의 옛 규칙.
+    return FutureBuilder<Map<String, dynamic>>(
+      future: _modelsFuture,
+      builder: (context, ms) {
+        final b = ms.data?['board'];
+        final boardHere = b is bool ? b : boardLocal;
+        if (boardHere) {
+          return WeeklyBoardCard(projectKey: widget.projectKey);
+        }
+        return _weeklyPlanImage();
+      },
+    );
+  }
+
+  Widget _weeklyPlanImage() {
     return FutureBuilder<Map<String, dynamic>>(
       future: _planFuture,
       builder: (context, snap) {

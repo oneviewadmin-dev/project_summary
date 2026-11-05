@@ -1,45 +1,16 @@
-"""OneView (사업부 진행현황) — 백엔드.
-
-사업부에서 올린 엑셀·PPT 를 읽어 JSON 파일에 적어 두고, 앱과 관리자 웹이
-물어보면 꺼내 준다. DB 는 없다 — models.json · notes.json 같은 파일이 전부다.
-
-  사업부 엑셀 → 관리자 웹에서 올림 → POST /admin/.../import
-             → models.json → GET /projects/... → 앱 화면
-
-구역 (머리말 ════ 로 감싸 둠. 아래 제목을 Ctrl+F 하면 간다)
-  환경 변수 · 분류(enrichment) · 카드 묶기 · FastAPI 앱
-  관리자 세션            로그인
-  알림 (FCM)             폰 푸시
-  PPT 업로드 · 엑셀 업로드 · 노트 첨부      ← 받기. 제일 자주 고친다
-  대시보드 / 프로젝트별 보기 / 사업부별 한 눈  ← 보여주기
-  프로젝트 모델 · 모델 데이터 백업 · phases   ← 모델
-  주차별 계획 · 개발 승인 프로세스 · 블룸 일 보드
-  매출 자동 계산 · 매입·지급 현황
-  KPI · 사장님 지시사항 · 잔업·특근
-  어드민 페이지 (옛 HTML. 지금 쓰는 건 admin_v2.html)
-  일일 백업 · 앱 배포 · 양식 내려받기 · 기동 시 1회 정리
-
-읽는 요령
-  _ 로 시작하면 이 파일 안에서만 쓰는 도우미.
-  @app.get / @app.post 붙은 것만 바깥에서 부를 수 있다 (175개).
-  /admin 으로 시작하면 로그인이 있어야 한다 (get_admin_session 이 문지기).
-
-고칠 때
-  1. ./backup.sh 먼저
-  2. 고친 뒤 tests/ 전부 (106개, 실패 0건)
-  3. flyctl deploy 는 커밋이 아니라 '지금 폴더' 를 올린다
-"""
+# =================================================================
+# Project Name: OneView (사업부 진행현황) — 백엔드
+# =================================================================
 import os
 import base64
 import time
-import secrets
 import hmac
 import json
 import re
 import shutil
 import hashlib
 import subprocess
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -49,8 +20,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Res
 from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, StreamingResponse
-from dotenv import load_dotenv
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from openai import OpenAI
 from rag import vector_store as _vs
 
@@ -60,20 +30,20 @@ from project_templates import (
     build_project_detail,
 )
 
-# ════════════════════════════════════════════════════════════
-#  분류(enrichment) — 올라온 자료에 사업부·프로젝트를 붙인다
-# ════════════════════════════════════════════════════════════
 import config_loader as _cl
 import week_calendar as _wcal
+import division_visibility as _dvis
+import division_revenue as _drev          # 매출 파일로 들어온 사업부 매출
+import division_terms as _dterm
+import issue_status as _iss
 import revenue as _rev
+import division_columns as _dcol
 
 
+# ============================================================
+#  분류(enrichment) — 올라온 자료에 사업부·프로젝트를 붙인다
+# ============================================================
 def _safe_text_for_card(card: dict) -> str:
-    """카드 한 장에서 "분류에 쓸 글자" 만 모아 한 줄로 잇는다.
-
-    이 한 줄을 config_loader 가 보고 사업부·프로젝트를 맞춘다.
-    쓰는 곳: 카드를 만든 직후의 enrich 단계.
-    """
     parts = [
         card.get("product") or "",      # 모델/제품 이름 — 분류에 제일 결정적이다
         card.get("headline") or "",     # 이슈 한 줄 요약 — 제품명이 없을 때의 보조
@@ -82,55 +52,47 @@ def _safe_text_for_card(card: dict) -> str:
     # 빈 값은 빼고 잇는다. 안 그러면 "  " 같은 공백만 남아 분류가 헛돈다.
     return " ".join([p for p in parts if p]).strip()
 
-
-# ════════════════════════════════════════════════════════════
+# ============================================================
 #  카드 묶기 — 이슈 여러 건을 모델 한 장으로 합친다
-# ════════════════════════════════════════════════════════════
+# ============================================================
 def _normalize_model_name(name: str) -> str:
-    """모델명에서 앞 번호 prefix 제거 + 공백 정리"""
     if not isinstance(name, str):
-        return ""
+        return ""                                       # 이름이 글자가 아니면 빈 이름
     import re as _re
     t = name.strip()
-    t = _re.sub(r"^\s*\d+(?:[-.]\d+)*[.)\]]?\s+", "", t)
-    t = _re.sub(r"\s+", " ", t)
+    t = _re.sub(r"^\s*\d+(?:[-.]\d+)*[.)\]]?\s+", "", t)  # 앞 번호 '3. ' · '1-2) ' 떼기
+    t = _re.sub(r"\s+", " ", t)                          # 띄어쓰기 여러 칸 → 한 칸
     return t.strip()
 
+
+# 카드의 모델 이름 → 같은 모델끼리 묶을 열쇠.
 def _model_match_key(name: str, project_id, existing) -> str:
-    """
-    하이브리드 매칭:
-    - 같은 project_id 안에서만 그룹핑
-    - 정규화된 이름이 기존 어떤 키의 prefix 거나 그 반대면 같은 모델로 합침
-    - existing 형식: {(project_id, key): ...}
-    """
-    base = _normalize_model_name(name).lower()
+    base = _normalize_model_name(name).lower()   # 앞 번호를 떼고 소문자로
     if not base:
-        return base
-    for (pid, k) in existing:
+        return base                              # 이름이 없으면 묶을 수 없다
+    for (pid, k) in existing:                    # 지금까지 만든 묶음 (프로젝트, 열쇠)
         if pid != project_id:
-            continue
+            continue                             # 다른 프로젝트의 모델과는 안 합친다
         if not k:
             continue
+        # 긴 이름을 a, 짧은 이름을 b 로 — 어느 쪽이 먼저 왔든 결과가 같다
         a, b = (base, k) if len(base) >= len(k) else (k, base)
         if a == b:
-            return k
+            return k                             # 이름이 똑같다
         if a.startswith(b):
             rest = a[len(b):]
+            # 'EFEM' 과 'EFEM (2대)' 는 같은 모델, 'EFEM' 과 'EFEMX' 는 다른 모델.
+            # 짧은 이름 바로 뒤가 띄어쓰기 · 괄호 · 기호일 때만 합친다.
             if rest[:1] in (" ", "(", "[", "{", "-", "_", ".", ",", ":", "/"):
                 return k
-    return base
+    return base                                  # 맞는 묶음이 없으면 새 열쇠
 
 # 신호등 등급. 숫자가 클수록 나쁘다.
 #   RED   = 문제 있음      BLUE = 지켜봐야 함      BLACK = 정상
 _STATUS_SEVERITY = {"RED": 3, "BLUE": 2, "BLACK": 1}
 
+# 이슈 여러 개의 색 중 가장 나쁜 색 하나를 고른다
 def _worst_status(statuses):
-    """이슈 여러 개의 색 중 가장 나쁜 색 하나를 고른다.
-
-    카드 한 장 안에 이슈가 여럿일 때 카드 자체의 색을 정하는 데 쓴다.
-    빨강이 하나라도 있으면 카드는 빨강이다 — 좋은 쪽으로 묻히지 않게.
-    모르는 값은 0점이라 BLACK 보다도 아래로 친다.
-    """
     best = "BLACK"
     best_sev = -1
     for s in statuses:
@@ -148,18 +110,15 @@ from pathlib import Path as _Path_hl
 
 _HEADLINE_CACHE_PATH = _Path_hl(__file__).parent / "headline_cache.json"
 
+# headline_cache.json 을 읽는다
 def _load_headline_cache() -> dict:
-    """headline_cache.json 을 읽는다. 없거나 깨졌으면 빈 캐시로 시작한다.
-
-    캐시가 없다고 멈추면 안 된다 — 그냥 GPT 를 다시 부르면 되는 일이다.
-    """
     try:
         return _json_hl.loads(_HEADLINE_CACHE_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
+# 캐시를 파일에 적는다. 실패해도 조용히 넘어간다(캐시일 뿐이라서).
 def _save_headline_cache(cache: dict) -> None:
-    """캐시를 파일에 적는다. 실패해도 조용히 넘어간다(캐시일 뿐이라서)."""
     try:
         _HEADLINE_CACHE_PATH.write_text(
             _json_hl.dumps(cache, ensure_ascii=False, indent=2),
@@ -168,12 +127,8 @@ def _save_headline_cache(cache: dict) -> None:
     except Exception:
         pass
 
+# dated_items: [(due_date, text, raw_str), ...] due_date_min 과 같은 날짜의 항목을 우선 선택.
 def _pick_headline_source(dated_items: list, due_date_min) -> str:
-    """
-    dated_items: [(due_date, text, raw_str), ...]
-    due_date_min 과 같은 날짜의 항목을 우선 선택.
-    없으면 첫 항목.
-    """
     if not dated_items:
         return ""
     if due_date_min:
@@ -182,11 +137,8 @@ def _pick_headline_source(dated_items: list, due_date_min) -> str:
                 return t
     return dated_items[0][1]
 
+# 원문 한 줄을 15자 이내 행동 중심 요약으로 변환.
 def _ai_headline(source_text: str) -> str:
-    """
-    원문 한 줄을 15자 이내 행동 중심 요약으로 변환.
-    캐시 우선. OpenAI 실패 시 원문 앞 15자.
-    """
     src = (source_text or "").strip()
     if not src:
         return ""
@@ -236,16 +188,8 @@ def _ai_headline(source_text: str) -> str:
     _save_headline_cache(cache)
     return result
 
+# 이슈 헤드라인 dedup 용 정규화 (중간 강도).
 def _normalize_issue_headline(text: str) -> str:
-    """
-    이슈 헤드라인 dedup 용 정규화 (중간 강도).
-    - 앞쪽 번호 prefix 제거
-    - 양 끝 공백/구두점 정리
-    - 다중 공백 1개로
-    - 끝쪽의 보조어 (중/진행/예정/완료/중임/중입니다 등) 제거
-    - 한글/영문 모델명 사이 공백 통일
-    - 비교용이므로 lowercase
-    """
     if not isinstance(text, str):
         return ""
     import re as _re
@@ -270,10 +214,8 @@ def _normalize_issue_headline(text: str) -> str:
     t = t.strip(" ,.·-;:")
     return t.lower()
 
+# cards 를 모델 단위로 그룹핑.
 def _group_dashboard_cards(cards: list) -> list:
-    """
-    cards 를 모델 단위로 그룹핑.
-    """
     groups = {}            # key=(project_id, model_key) → group dict
     order = []             # 그룹 등장 순서 보존
     issue_seen = {}        # 그룹 내 (status, headline) 중복 제거용
@@ -362,16 +304,13 @@ def _group_dashboard_cards(cards: list) -> list:
         result.append(g)
 
     # 가장 심각한 그룹부터 정렬
+    # 위험한 상태(RED → ORANGE → …)부터 앞에
     result.sort(key=lambda g: -_STATUS_SEVERITY.get(g["status"], 0))
     return result
 
 
+# /dashboard 카드에 division/project 분류 정보를 '추가'한다
 def enrich_card(card: dict) -> dict:
-    """
-    /dashboard 카드에 division/project 분류 정보를 '추가'한다.
-    기존 필드는 절대 건드리지 않는다.
-    실패 시 새 필드는 None으로만 들어가고, 카드 자체는 정상 반환한다.
-    """
     try:
         text = _safe_text_for_card(card)
 
@@ -426,48 +365,8 @@ def enrich_card(card: dict) -> dict:
     return card
 
 
-def enrich_project_entry(entry: dict) -> dict:
-    """
-    /projects 응답 각 항목에 division/project 분류 정보를 '추가'한다.
-    """
-    try:
-        # /projects 항목은 보통 project_key 또는 name/label 을 가짐
-        hint_pid = entry.get("project_key") or entry.get("key")
-        text = " ".join([
-            str(entry.get("label") or ""),
-            str(entry.get("name") or ""),
-            str(hint_pid or ""),
-        ]).strip()
-
-        project_id = None
-        if hint_pid and _cl.get_project(hint_pid):
-            project_id = hint_pid
-        if not project_id:
-            project_id = _cl.classify_project(text)
-
-        division_id = _cl.derive_division_from_project(project_id)
-        project = _cl.get_project(project_id) if project_id else None
-        division = _cl.get_division(division_id) if division_id else None
-
-        entry["division_id"] = division_id
-        entry["division_label"] = division.get("label") if division else None
-        entry["project_id"] = project_id
-        entry["project_label"] = project.get("label") if project else None
-        entry["project_badge"] = _cl.badge_label_for_project(project_id)
-    except Exception as e:
-        entry.setdefault("division_id", None)
-        entry.setdefault("division_label", None)
-        entry.setdefault("project_id", None)
-        entry.setdefault("project_label", None)
-        entry.setdefault("project_badge", None)
-        entry["_enrich_error"] = str(e)
-    return entry
-
-
+# /projects/{key} 상세 응답 최상위에 분류 정보를 '추가'한다
 def enrich_project_detail(detail: dict) -> dict:
-    """
-    /projects/{key} 상세 응답 최상위에 분류 정보를 '추가'한다.
-    """
     if not isinstance(detail, dict):
         return detail
     try:
@@ -507,7 +406,6 @@ from chart_extractor import extract_charts_from_pptx
 # 파싱 — 글자에서 뜻을 꺼내는 함수들은 parsing.py 로 뺐다.
 # 서버 상태를 안 쓰는 순수 함수만 거기 있다 (파일도 설정도 안 본다).
 from parsing import (
-    _EXCEL_MARKER_RE,
     _parse_due_text,
     _parse_report_filename,
     _extract_excel_markers,
@@ -516,21 +414,15 @@ from parsing import (
 )
 
 
-# ════════════════════════════════════════════════════════════
-#  환경 변수 — .env(내 컴) · flyctl secrets(서버) 에서 읽는다
-# ════════════════════════════════════════════════════════════
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")   # 챗봇·요약·교정에 쓴다. 없으면 그 기능만 꺼진다
 # 챗봇 답변 모델. 환경변수로 교체 가능 (품질: gpt-4o > gpt-4o-mini, 비용은 반대)
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o")
 
 
-# ════════════════════════════════════════════════════════════
-#  챗봇 — 숫자는 코드가 계산, 말은 RAG + GPT
-# ════════════════════════════════════════════════════════════
-
-
+# ============================================================
+#  챗봇 도우미 — 숫자는 코드가 계산, 말은 RAG + GPT
+# ============================================================
 def _strip_useless_caveats(answer: str) -> str:
-    """'실적이 없는 주차도 있으니 주의가 필요합니다' 같은 군더더기 경고 문장 제거."""
     import re as _re
     if not answer:
         return answer
@@ -574,15 +466,12 @@ _CHAT_KW_EXTRA = {
 _RAG_STATE = {"checked": 0.0, "building": False}
 
 
+# 벡터 인덱스에 넣을 텍스트 조각.
 def _rag_build_chunks() -> list:
-    """벡터 인덱스에 넣을 텍스트 조각. 숫자가 아니라 '말'을 담는다.
-
-    숫자(매출·수량·주차 계획)는 규칙 엔진이 권위 데이터로 답한다.
-    벡터 검색은 규칙으로 못 잡는 비고·이슈·자재 메모를 찾는 용도다.
-    """
     chunks = []
-
-    # 1) 주간 보고 카드
+    # -----------------------------------------------------------
+    # 주간 보고 카드
+    # -----------------------------------------------------------
     try:
         for division_id, div in (_load_notes().get("notes") or {}).items():
             report_date = div.get("report_date", "")
@@ -604,8 +493,9 @@ def _rag_build_chunks() -> list:
                                "report_date": report_date, "text": raw})
     except Exception as e:
         print(f"[rag] notes 청킹 실패: {e}")
-
-    # 2) 모델 비고 / 이슈 (프로젝트 단위로 묶는다)
+    # -----------------------------------------------------------
+    # 모델 비고 / 이슈 (프로젝트 단위로 묶는다)
+    # -----------------------------------------------------------
     try:
         for pk, proj in (_load_models().get("projects") or {}).items():
             label = _display_project_label(pk)
@@ -629,8 +519,9 @@ def _rag_build_chunks() -> list:
                 })
     except Exception as e:
         print(f"[rag] 모델 비고 청킹 실패: {e}")
-
-    # 3) 블룸 일 보고 자재 메모
+    # -----------------------------------------------------------
+    # 블룸 일 보고 자재 메모
+    # -----------------------------------------------------------
     try:
         board = ((_load_models().get("projects") or {})
                  .get(_BLOOM_STORE) or {}).get("daily_board") or {}
@@ -648,8 +539,8 @@ def _rag_build_chunks() -> list:
     return chunks
 
 
+# 인덱스를 지금 데이터로 다시 만든다
 def _rag_rebuild() -> dict:
-    """인덱스를 지금 데이터로 다시 만든다. 서버에서만 돈다(임베딩 키 필요)."""
     import numpy as _np
     import faiss as _faiss
     chunks = _rag_build_chunks()
@@ -677,8 +568,8 @@ def _rag_rebuild() -> dict:
     return {"ok": True, "count": len(chunks)}
 
 
+# 인덱스가 없거나 하루 넘게 묵었으면 백그라운드에서 다시 만든다
 def _rag_maybe_refresh():
-    """인덱스가 없거나 하루 넘게 묵었으면 백그라운드에서 다시 만든다."""
     import time as _t
     import threading as _th
     now = _t.time()
@@ -704,9 +595,8 @@ def _rag_maybe_refresh():
     _th.Thread(target=_run, daemon=True).start()
 
 
+# 질문과 가까운 메모를 찾아 LLM 에 넘길 배경 텍스트로 만든다
 def _rag_context(query: str, top_k: int = 3, min_score: float = 0.30) -> str:
-    """질문과 가까운 메모를 찾아 LLM 에 넘길 배경 텍스트로 만든다.
-    인덱스가 없거나 닮은 게 없으면 빈 문자열 — 그러면 예전과 똑같이 동작한다."""
     if not query:
         return ""
     try:
@@ -729,12 +619,8 @@ def _rag_context(query: str, top_k: int = 3, min_score: float = 0.30) -> str:
     return "\n\n".join(parts[:top_k])
 
 
+# 이슈·지연 질문 즉답. 적어둔 이슈 문장을 자르지 않고 그대로 낸다
 def _issue_answer(project_key: str) -> str:
-    """이슈·지연 질문 즉답. 적어둔 이슈 문장을 자르지 않고 그대로 낸다.
-
-    LLM 을 거치면 문장이 중간에서 멈춘다(컨텍스트가 80자에서 잘려 있었다).
-    이슈는 짧게 요약할 성질이 아니라 적힌 그대로가 답이다.
-    """
     if not project_key or project_key == 'all':
         return ""
     proj = (_load_models().get("projects") or {}).get(_model_key_alias(project_key)) or {}
@@ -792,28 +678,18 @@ def _issue_answer(project_key: str) -> str:
 _ALERT_WORD = {"지연": "일정 지연", "이슈": "특이사항", "임박": "집중관리"}
 
 
+# '2026-09-14' → '9/14'.
 def _alert_short_date(v) -> str:
-    """'2026-09-14' → '9/14'. 연도는 화면에서 이미 아는 값이다."""
     t = str(v or "").strip()
     m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})", t)
     return f"{int(m.group(2))}/{int(m.group(3))}" if m else t
 
 
+# 한 줄 사유.
 def _alert_brief(a: dict, width: int = 34) -> str:
-    """한 줄 사유.
-
-    적어 둔 이슈가 있으면 앞머리만 쓴다. '2대 고객 사급자재 지연
-    (ETA: 9/20) → W39 (9/23) 출하예정' 을 통째로 들고 오면 화면에서
-    잘려서 오히려 무슨 말인지 모르게 된다.
-    """
     txt = " ".join(str(a.get("issue") or "").split())
     if txt:
-        # 괄호 부연과 뒤에 이어 붙인 줄만 떼어낸다.
-        #
-        # 화살표에서 자르면 안 된다. '계획 77 → 실적 66' 처럼 화살표
-        # 자체가 뜻을 가진 문장이 있어서 '계획 77' 로 끊긴다. 괄호만
-        # 잘라도 '2대 고객 사급자재 지연 (ETA: 9/20) → W39 …' 은
-        # '2대 고객 사급자재 지연' 으로 정리된다.
+        # 괄호 부연과 뒤에 이어 붙인 줄만 떼어낸다
         for sep in ("(", " · "):
             i = txt.find(sep)
             if i > 4:
@@ -829,13 +705,8 @@ def _alert_brief(a: dict, width: int = 34) -> str:
     return str(a.get("stage") or "").strip()
 
 
+# 프로젝트를 안 짚고 '일정 지연' 만 물었을 때.
 def _alert_answer_all(kinds, per_project: int = 5) -> str:
-    """프로젝트를 안 짚고 '일정 지연' 만 물었을 때.
-
-    홈 카드와 같은 계산(get_home_alerts)을 그대로 쓴다. 예전에는 챗이
-    따로 세서, 홈은 '일정 지연 8건 · 3곳' 인데 챗은 2건 2곳이라고 했다.
-    이슈 칸에 견적 협의 메모를 적어 둔 모델까지 지연으로 끌어왔었다.
-    """
     try:
         res = get_home_alerts(limit=500)
     except Exception as e:
@@ -869,13 +740,8 @@ def _alert_answer_all(kinds, per_project: int = 5) -> str:
     return "\n".join(lines)
 
 
+# 질문에서 프로젝트를 찾을 때 쓰는 '키워드 → project_key' 사전.
 def _chat_project_keywords() -> dict:
-    """질문에서 프로젝트를 찾을 때 쓰는 '키워드 → project_key' 사전.
-
-    config/projects.json 의 label / badge_label / aliases / keywords 를 전부 끌어온다.
-    (예전에는 project_templates.PRODUCT_TO_PROJECT 8개 + 하바 하드코딩만 봐서
-     블룸·큐리처럼 나중에 추가된 프로젝트를 아예 인식하지 못했다.)
-    """
     import config_loader as _clx
     try:
         _projs = _clx.get_projects(visible_only=False)
@@ -915,8 +781,8 @@ def _chat_project_keywords() -> dict:
     return kw
 
 
+# 질문 문장에서 프로젝트 키를 찾는다
 def _chat_resolve_project(text: str):
-    """질문 문장에서 프로젝트 키를 찾는다. 가장 긴 키워드가 이긴다."""
     import re as _re
     if not text:
         return None
@@ -944,10 +810,8 @@ def _chat_resolve_project(text: str):
             return None
     return None
 
-
+# 답변에 들어간 금액/수량이 권위 데이터에 없는 값이면 그 값을 돌려준다
 def _answer_number_mismatch(answer: str, allowed_amounts: set, allowed_qty: set):
-    """답변에 들어간 금액/수량이 권위 데이터에 없는 값이면 그 값을 돌려준다.
-    (없으면 None) — LLM 이 수치를 바꿔 말하는 것을 잡아내는 안전망."""
     import re as _re
     if not answer:
         return None
@@ -991,20 +855,16 @@ NOTE_PHOTOS_DIR = NOTE_ASSETS_DIR / "photos"
 for d in [UPLOAD_DIR, SLIDES_DIR, SLIDE_IMAGES_DIR, CROPPED_DIR, NOTE_ASSETS_DIR, NOTE_TABLES_DIR, NOTE_PHOTOS_DIR]:
     d.mkdir(exist_ok=True)
 
-# ── 올라온 엑셀 원본 보관 ──────────────────────────────────────────
-#
-# 엑셀은 열어서 읽고 버려 왔다. 그래서 숫자가 이상할 때 "엑셀이 원래
-# 그랬나, 우리가 잘못 읽었나" 를 가릴 수가 없었다. 이제 올라온 파일을
-# 손대지 않은 그대로 한 벌 남긴다 — 자세한 규칙은 upload_store.py.
-#
-# 읽기와 보관을 한 줄로 묶어 두는 이유는, 업로드 경로가 스무 곳이 넘어서
-# 각자 보관을 따로 부르면 한 곳만 빼먹어도 그 파일이 영원히 안 남기
-# 때문이다. 파일을 읽는 통로를 하나로 둔다.
+# ============================================================
+#  올라온 엑셀 원본 보관
+# ============================================================
+# 엑셀은 열어서 읽고 버려 왔다. 그래서 숫자가 이상할 때 "엑셀이 원래 그랬나, 우리가 잘못 읽었나" 를 가릴 수가 없었다
 import upload_store
 
-
+# ============================================================
+#  올린 파일을 보관함에 한 벌 남기기
+# ============================================================
 async def _keep_upload(file, where: str = "", project: str = "") -> bytes:
-    """업로드 파일을 읽으면서 원본을 보관함에 한 벌 남긴다."""
     raw = await file.read()
     try:
         upload_store.keep(raw, getattr(file, "filename", "") or "",
@@ -1016,7 +876,6 @@ async def _keep_upload(file, where: str = "", project: str = "") -> bytes:
 
 # DATA_DIR이 git 경로와 다르면(Railway), git에 포함된 시드 자산을 영구 볼륨에 복사
 try:
-    import shutil
     seed_assets = BASE_DIR / "note_assets"
     if DATA_DIR != BASE_DIR and seed_assets.exists():
         for src in seed_assets.rglob("*"):
@@ -1043,19 +902,14 @@ except Exception as _e:
 RETENTION_DAYS = 180   # 오래된 업로드 자료를 며칠까지 들고 있을지
 
 
-# ════════════════════════════════════════════════════════════
-#  FastAPI 앱 — 여기서부터 엔드포인트(바깥 창구)
-# ════════════════════════════════════════════════════════════
-
-# ════════════════════════════════════════════════════════════
-#  알림 (FCM) — 폰으로 푸시
-# ════════════════════════════════════════════════════════════
 DEVICE_TOKENS_FILE = DATA_DIR / "device_tokens.json"   # 기기 토큰이 쌓이는 파일
 _fcm_initialized = False
 _fcm_lock = None
 
+# ============================================================
+#  알림 (FCM) — 폰으로 푸시
+# ============================================================
 def _init_fcm():
-    """Firebase Admin SDK 초기화. 서비스 계정 JSON은 FIREBASE_SERVICE_ACCOUNT_JSON 환경변수."""
     global _fcm_initialized
     if _fcm_initialized:
         return True
@@ -1080,11 +934,8 @@ def _init_fcm():
         return False
 
 
+# 등록된 기기 토큰 목록을 읽는다. 없으면 빈 목록.
 def _load_device_tokens() -> list:
-    """등록된 기기 토큰 목록을 읽는다. 없으면 빈 목록.
-
-    쓰는 곳: 알림을 보낼 때(받는 사람 명단) · 토큰을 새로 등록할 때.
-    """
     try:
         with open(DEVICE_TOKENS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1093,6 +944,7 @@ def _load_device_tokens() -> list:
         return []
 
 
+# 앱 푸시 알림을 받을 폰 목록(device_tokens.json)을 저장한다
 def _save_device_tokens(tokens: list) -> None:
     from datetime import datetime
     DEVICE_TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1100,15 +952,8 @@ def _save_device_tokens(tokens: list) -> None:
         json.dump({"updated_at": datetime.now().isoformat(), "tokens": tokens}, f, ensure_ascii=False, indent=2)
 
 
+# 앱이 보내온 기기 토큰을 명단에 넣는다
 def _add_device_token(token: str, platform: str = "android", debug: bool = True) -> None:
-    """앱이 보내온 기기 토큰을 명단에 넣는다. 이미 있으면 시각만 갱신.
-
-    앱은 켜질 때마다 토큰을 보낸다. 그래서 같은 토큰이 몇 번이고 온다 —
-    중복으로 쌓지 않고 last_seen 만 고쳐 준다. 그 시각을 보면
-    "이 폰이 마지막으로 앱을 켠 때" 를 알 수 있다.
-
-    쓰는 곳: POST /fcm/register (앱이 부른다)
-    """
     from datetime import datetime
     tokens = _load_device_tokens()
     for t in tokens:
@@ -1129,8 +974,8 @@ def _add_device_token(token: str, platform: str = "android", debug: bool = True)
     print(f"[FCM] 새 토큰 등록: {token[:20]}... (총 {len(tokens)}개)")
 
 
+# 등록된 모든 토큰에 알람 전송. 오늘 스코프: 디버그 토큰만 대상.
 def _send_fcm_to_all(title: str, body: str, data: dict = None) -> dict:
-    """등록된 모든 토큰에 알람 전송. 오늘 스코프: 디버그 토큰만 대상."""
     if not _init_fcm():
         return {"ok": False, "reason": "fcm_not_initialized"}
     tokens = _load_device_tokens()
@@ -1178,19 +1023,12 @@ def _send_fcm_to_all(title: str, body: str, data: dict = None) -> dict:
     return {"ok": True, "sent": sent, "failed": failed}
 
 
+# 현재 notes.json의 카드별 상태 + 원인 아이템 스냅샷.
 def _snapshot_notes_status() -> dict:
-    """현재 notes.json의 카드별 상태 + 원인 아이템 스냅샷.
-
-    Value 형태:
-      {
-        "status": "RED",
-        "trigger": {"text": "...", "due_date": "2026-08-02", "days_diff": -1}
-      }
-    """
     from datetime import date as _date
 
+    # 카드 안 아이템 중 상태가 가장 위험한 것 하나 반환.
     def _pick_worst_item(card_dict):
-        """카드 안 아이템 중 상태가 가장 위험한 것 하나 반환."""
         priority = {"RED": 5, "ORANGE": 4, "BLUE": 3, "GREEN": 2, "BLACK": 1}
         worst = None
         worst_sev = -1
@@ -1208,8 +1046,8 @@ def _snapshot_notes_status() -> dict:
                     worst = {"item": it, "status": s}
         return worst
 
+    # 카드 안 RED/ORANGE 아이템 전체 수집 (신규 지연 항목 감지용).
     def _collect_hot_items(card_dict):
-        """카드 안 RED/ORANGE 아이템 전체 수집 (신규 지연 항목 감지용)."""
         out = []
         for sec in card_dict.get("sections", []) or []:
             for it in (sec.get("items", []) or []):
@@ -1273,11 +1111,8 @@ def _snapshot_notes_status() -> dict:
         return {}
 
 
+# 이전 → 이후 상태 diff. RED/ORANGE로 새로 전이된 카드만 반환.
 def _detect_status_transitions(before: dict, after: dict) -> list:
-    """이전 → 이후 상태 diff. RED/ORANGE로 새로 전이된 카드만 반환.
-
-    before/after 는 신구 구조 모두 대응 (str or dict).
-    """
     def _as_status(v):
         if isinstance(v, dict):
             return v.get("status") or ""
@@ -1312,8 +1147,9 @@ def _detect_status_transitions(before: dict, after: dict) -> list:
                 "trigger": _trigger(after_val),
                 "project_key": _pkey(after_val),
             })
-
-    # ─── 신규 RED/ORANGE 항목 감지 (카드 색 전이 없어도 발송) ───
+    # -----------------------------------------------------------
+    # ─ 신규 RED/ORANGE 항목 감지 (카드 색 전이 없어도 발송)
+    # -----------------------------------------------------------
     from datetime import date as _date2
     _today2 = _date2.today()
     for key, after_val in after.items():
@@ -1359,6 +1195,7 @@ FCM_COOLDOWN_FILE = DATA_DIR / "fcm_cooldown.json"
 FCM_COOLDOWN_SECONDS = 30 * 60  # 30분
 
 
+# 같은 알림을 너무 자주 안 보내려고 적어 둔 '마지막 보낸 시각'을 읽는다
 def _load_fcm_cooldown() -> dict:
     try:
         return _read_json(FCM_COOLDOWN_FILE, {}) or {}
@@ -1366,6 +1203,7 @@ def _load_fcm_cooldown() -> dict:
         return {}
 
 
+# 푸시 알림 '마지막 보낸 시각'을 저장한다
 def _save_fcm_cooldown(d: dict) -> None:
     try:
         _write_json(FCM_COOLDOWN_FILE, d)
@@ -1378,6 +1216,7 @@ FCM_HISTORY_FILE = DATA_DIR / "notification_history.json"
 FCM_HISTORY_MAX = 200
 
 
+# 보낸 푸시 알림 기록을 읽는다 (알림 화면 · 중복 막기).
 def _load_fcm_history() -> list:
     try:
         v = _read_json(FCM_HISTORY_FILE, [])
@@ -1386,6 +1225,7 @@ def _load_fcm_history() -> list:
         return []
 
 
+# 보낸 푸시 알림 기록을 저장한다. 오래된 것은 잘라 낸다
 def _save_fcm_history(hist: list) -> None:
     try:
         # 최신 200건만 유지
@@ -1399,8 +1239,8 @@ def _save_fcm_history(hist: list) -> None:
 # ─── FCM 편집 세션 관리 (알람 억제용) ───
 EDIT_SESSION_FILE = Path("/tmp/fcm_edit_session.json")
 
+# 편집 세션 파일 로드. 구조: {doc_id: {"snapshot": {...}, "started_at": timestamp}}
 def _load_edit_session() -> dict:
-    """편집 세션 파일 로드. 구조: {doc_id: {"snapshot": {...}, "started_at": timestamp}}"""
     if not EDIT_SESSION_FILE.exists():
         return {}
     try:
@@ -1408,8 +1248,8 @@ def _load_edit_session() -> dict:
     except Exception:
         return {}
 
+# 편집 세션 저장 (before snapshot)
 def _save_edit_session(doc_id: str, snapshot: dict) -> None:
-    """편집 세션 저장 (before snapshot)"""
     import time as _time
     sessions = _load_edit_session()
     sessions[doc_id] = {
@@ -1421,8 +1261,8 @@ def _save_edit_session(doc_id: str, snapshot: dict) -> None:
     except Exception as e:
         print(f"[FCM] edit session save error: {e}")
 
+# 편집 세션 클리어 및 저장된 snapshot 반환
 def _clear_edit_session(doc_id: str) -> dict:
-    """편집 세션 클리어 및 저장된 snapshot 반환"""
     sessions = _load_edit_session()
     session_data = sessions.pop(doc_id, None)
     try:
@@ -1431,8 +1271,8 @@ def _clear_edit_session(doc_id: str) -> dict:
         print(f"[FCM] edit session clear error: {e}")
     return session_data.get("snapshot") if session_data else None
 
+# 30분 이상 된 세션 자동 정리
 def _cleanup_expired_sessions() -> None:
-    """30분 이상 된 세션 자동 정리"""
     import time as _time
     now = int(_time.time())
     sessions = _load_edit_session()
@@ -1446,8 +1286,8 @@ def _cleanup_expired_sessions() -> None:
         except Exception:
             pass
 
+# 상태 전이 이벤트를 FCM으로 전송.
 def _fire_status_alarms(events: list) -> None:
-    """상태 전이 이벤트를 FCM으로 전송. 30분 쿨다운 적용 + 히스토리 저장."""
     if not events:
         return
 
@@ -1571,9 +1411,6 @@ _STATIC_DIR = BASE_DIR / "static"
 _STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
-# ════════════════════════════════════════════════════════════
-#  관리자 세션 — 로그인 유지 (쿠키 하나, 8시간)
-# ════════════════════════════════════════════════════════════
 ADMIN_SESSION_COOKIE = "admin_auth"
 ADMIN_SESSION_MAX_LIFETIME_SEC = int(os.getenv("ADMIN_SESSION_MAX_LIFETIME_SEC", str(24 * 3600)))  # 발급 후 최대 24시간
 ADMIN_SESSION_TTL_SEC = 8 * 60 * 60
@@ -1582,32 +1419,25 @@ ADMIN_COOKIE_SECURE = os.getenv("ADMIN_COOKIE_SECURE", "false").lower() == "true
 if not ADMIN_SESSION_SECRET:
     ADMIN_SESSION_SECRET = hashlib.sha256(("session::" + UPLOAD_PASSWORD).encode()).hexdigest()
 
+# ============================================================
+#  관리자 세션 — 로그인 유지 (쿠키 하나, 8시간)
+# ============================================================
 def _b64u(b: bytes) -> str:
-    """바이트 → 쿠키에 담아도 안전한 글자."""
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
+# _b64u 의 반대. 잘라냈던 '=' 를 채워서 되돌린다
 def _b64u_decode(s: str) -> bytes:
-    """_b64u 의 반대. 잘라냈던 '=' 를 채워서 되돌린다."""
     pad = "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s + pad)
 
+# 쿠키 값을 만든다 — "발급시각.만료시각.서명".
 def _sign_session(exp_ts: int, issued_at: int) -> str:
-    """쿠키 값을 만든다 — "발급시각.만료시각.서명".
-
-    DB 가 없어 세션을 서버에 저장하지 않는다. 대신 시각을 쿠키에 적고
-    서버 비밀값으로 서명한다. 값을 고치면 서명이 안 맞아 들통난다.
-    쓰는 곳: _issue_session_cookie
-    """
     msg = f"{issued_at}.{exp_ts}".encode()
     sig = hmac.new(ADMIN_SESSION_SECRET.encode(), msg, hashlib.sha256).digest()
     return f"{issued_at}.{exp_ts}.{_b64u(sig)}"
 
+# 쿠키를 검사한다. 통과하면 만료시각, 아니면 None.
 def _verify_session(token: Optional[str]) -> Optional[int]:
-    """쿠키를 검사한다. 통과하면 만료시각, 아니면 None.
-
-    ① 서명이 맞나 ② 8시간 안 지났나 ③ 발급 후 24시간 안 넘었나.
-    쓰는 곳: get_admin_session — 모든 /admin 요청이 여기를 거친다.
-    """
     if not token:
         return None
     try:
@@ -1632,12 +1462,8 @@ def _verify_session(token: Optional[str]) -> Optional[int]:
     except Exception:
         return None
 
+# 로그인에 성공했을 때 쿠키를 구워서 응답에 붙인다
 def _issue_session_cookie(response: Response, issued_at: Optional[int] = None):
-    """로그인에 성공했을 때 쿠키를 구워서 응답에 붙인다.
-
-    issued_at 을 넘기면 "연장" 이다 — 최초 발급 시각을 그대로 들고 가서
-    24시간 상한을 넘기지 못하게 한다.
-    """
     now = int(time.time())
     if issued_at is None:
         issued_at = now  # 새 발급
@@ -1658,11 +1484,8 @@ def _issue_session_cookie(response: Response, issued_at: Optional[int] = None):
     )
     return exp_ts
 
+# 문지기. /admin 엔드포인트에 Depends(get_admin_session) 으로 붙인다
 def get_admin_session(admin_auth: Optional[str] = Cookie(default=None)) -> int:
-    """문지기. /admin 엔드포인트에 Depends(get_admin_session) 으로 붙인다.
-
-    쿠키가 없거나 썩었으면 401 을 던져 거기서 요청이 끝난다.
-    """
     exp = _verify_session(admin_auth)
     if not exp:
         raise HTTPException(status_code=401, detail="인증이 필요합니다.")
@@ -1702,7 +1525,7 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
     fd.append('password', pw);
     const r = await fetch('/admin/login', { method: 'POST', body: fd, credentials: 'same-origin' });
     if (r.ok) {
-      const next = new URLSearchParams(location.search).get('next') || '/admin/upload';
+      const next = new URLSearchParams(location.search).get('next') || '/admin/v2';
       location.href = next;
     } else {
       const j = await r.json().catch(()=>({}));
@@ -1717,13 +1540,14 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
 
 </body></html>"""
 
+# admin 로그인 화면(HTML) ← release.sh
 @app.get("/admin/login", response_class=HTMLResponse)
 def admin_login_page(
     admin_auth: Optional[str] = Cookie(default=None),
     next: Optional[str] = None,
 ):
     # next 안전성 체크: 반드시 /admin/ 하위만 허용
-    safe_next = "/admin/upload"
+    safe_next = "/admin/v2"
     if next and next.startswith("/admin/") and "://" not in next:
         safe_next = next
     if _verify_session(admin_auth):
@@ -1736,6 +1560,7 @@ def admin_login_page(
     )
     return HTMLResponse(content=html)
 
+# admin 비밀번호 확인 → 세션 쿠키 ← release.sh
 @app.post("/admin/login")
 def admin_login_submit(
     response: Response,
@@ -1745,16 +1570,18 @@ def admin_login_submit(
     if password != UPLOAD_PASSWORD:
         raise HTTPException(status_code=401, detail="비밀번호가 올바르지 않습니다.")
     exp = _issue_session_cookie(response)
-    safe_next = "/admin/upload"
+    safe_next = "/admin/v2"
     if next and next.startswith("/admin/") and "://" not in next:
         safe_next = next
     return {"ok": True, "expires_at": exp, "next": safe_next}
 
+# admin 로그아웃.
 @app.post("/admin/logout")
 def admin_logout(response: Response):
     response.delete_cookie(ADMIN_SESSION_COOKIE, path="/")
     return {"ok": True}
 
+# admin 세션 시간 연장.
 @app.post("/admin/extend")
 def admin_extend(
     response: Response,
@@ -1776,20 +1603,15 @@ def admin_extend(
     exp = _issue_session_cookie(response, issued_at=issued_at)
     return {"ok": True, "expires_at": exp, "max_lifetime_remaining": (issued_at + ADMIN_SESSION_MAX_LIFETIME_SEC - now) if issued_at else ADMIN_SESSION_MAX_LIFETIME_SEC}
 
+# admin 세션이 살아 있나 · 남은 시간.
 @app.get("/admin/session")
 def admin_session_info(_exp: int = Depends(get_admin_session)):
     return {"ok": True, "expires_at": _exp, "ttl_sec": ADMIN_SESSION_TTL_SEC}
 
-
-# ════════════════════════════════════════════════════════════
+# ============================================================
 #  유틸 — JSON 파일 읽고 쓰기 · 문서 id · PPT 변환
-# ════════════════════════════════════════════════════════════
+# ============================================================
 def _read_json(path: Path, default):
-    """JSON 파일을 읽는다. 없거나 깨졌으면 default 를 돌려준다.
-
-    이 시스템의 자료는 전부 JSON 파일이라 이 함수가 사실상 "DB 읽기" 다.
-    절대 예외를 던지지 않는다 — 파일 하나 깨졌다고 서버가 서면 안 된다.
-    """
     if not path.exists():
         return default
     try:
@@ -1798,32 +1620,24 @@ def _read_json(path: Path, default):
         return default
 
 
+# JSON 파일에 적는다. 이 시스템의 "DB 쓰기".
 def _write_json(path: Path, data):
-    """JSON 파일에 적는다. 이 시스템의 "DB 쓰기".
-
-    통째로 덮어쓴다. 그래서 쓰기 전에 백업이 필요하다 (./backup.sh).
-    indent=2 · ensure_ascii=False — 사람이 열어 봐야 할 때가 많아서다.
-    """
     path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
 
+# 올라온 파일에 붙일 짧은 id 를 만든다 (12자리).
 def _make_doc_id(filename: str) -> str:
-    """올라온 파일에 붙일 짧은 id 를 만든다 (12자리).
-
-    파일명 + 올린 시각을 섞어 해시한다. 같은 이름을 또 올려도 다른 id 가
-    나와야 앞 자료를 덮어쓰지 않는다.
-    """
     short = hashlib.md5(
         f"{filename}_{datetime.now().isoformat()}".encode("utf-8")
     ).hexdigest()[:12]
     return short
 
 
+# LibreOffice + Poppler 로 PPTX → PDF → PNG 변환
 def _convert_pptx_to_png(pptx_path: Path, out_dir: Path):
-    """LibreOffice + Poppler 로 PPTX → PDF → PNG 변환"""
     out_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["soffice", "--headless", "--convert-to", "pdf",
@@ -1848,8 +1662,8 @@ def _convert_pptx_to_png(pptx_path: Path, out_dir: Path):
         pass
 
 
+# 슬라이드별 텍스트 추출
 def _extract_text_per_slide(pptx_path: Path):
-    """슬라이드별 텍스트 추출"""
     from pptx import Presentation
     prs = Presentation(str(pptx_path))
     texts = []
@@ -1866,11 +1680,8 @@ def _extract_text_per_slide(pptx_path: Path):
     return texts
 
 
+# 슬라이드별 텍스트(표 제외)와 표를 분리 추출.
 def _extract_pptx_text_and_tables(pptx_path: Path):
-    """슬라이드별 텍스트(표 제외)와 표를 분리 추출.
-    반환: (slide_texts: list[str], slide_tables: list[list[dict]])
-    각 표: {"headers": [...], "rows": [[...], ...]}
-    """
     from pptx import Presentation
     prs = Presentation(str(pptx_path))
     slide_texts = []
@@ -1897,6 +1708,7 @@ def _extract_pptx_text_and_tables(pptx_path: Path):
     return slide_texts, slide_tables
 
 
+# 주간보고 PPT 글자를 GPT 에 보내 제품별 상태(신호등)를 뽑는다
 def _classify_status_with_gpt(slide_texts: list[str]) -> dict:
     if not client:
         return {"products": []}
@@ -1954,8 +1766,8 @@ JSON 스키마:
         print(f"🔴 GPT 분류 실패: {e}")
         return {"products": []}
 
+# 6개월 지난 파일 자동 삭제
 def _cleanup_old_files():
-    """6개월 지난 파일 자동 삭제"""
     cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
     for base in [UPLOAD_DIR, SLIDES_DIR, SLIDE_IMAGES_DIR, CROPPED_DIR]:
         if not base.exists():
@@ -1972,14 +1784,8 @@ def _cleanup_old_files():
                 continue
 
 
+# 최신 보고서 저장.
 def _update_latest(summary):
-    """
-    최신 보고서 저장.
-    - 같은 doc_id가 있으면 갱신 (중복 방지)
-    - 그 외에는 누적
-    - report_family는 부가 정보로만 사용 (덮어쓰기 키로 사용 X)
-    - 최대 50개까지만 유지 (오래된 것부터 제거)
-    """
     latest = _read_json(LATEST_FILE, [])
     new_doc_id = summary.get("doc_id")
 
@@ -1989,6 +1795,7 @@ def _update_latest(summary):
 
     # 업로드 시각 기준 최신순 정렬, 최대 50개
     latest.sort(
+        # 올린 시각으로, 없으면 보고서 날짜로 — 최신이 앞
         key=lambda r: r.get("uploaded_at") or r.get("report_meta", {}).get("date", ""),
         reverse=True
     )
@@ -1996,28 +1803,42 @@ def _update_latest(summary):
 
     _write_json(LATEST_FILE, latest)
 
-# ════════════════════════════════════════════════════════════
-#  헬스체크 — fly.io 가 서버가 살아 있는지 물어보는 곳
-# ════════════════════════════════════════════════════════════
+# ============================================================
+#  헬스체크 · 자료 버전 — 배포가 갔나, 자료가 바뀌었나
+# ============================================================
+# 지금 코드의 지문(10자리). /health 로 '배포가 갔나'를 확인할 때 쓴다
+def _build_stamp() -> str:
+    import hashlib as _hl
+    import os as _os
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    h = _hl.sha256()
+    for _n in ("main.py", "admin_v2.html", "division_columns.py",
+               "division_form_import.py", "config_loader.py",
+               # 파서만 고친 배포에서는 지문이 안 바뀌어서
+               # "올라갔나" 를 가릴 수가 없었다. 자주 고치는 읽기 자리를
+               # 다 넣는다.
+               "dev_schedule_import.py", "revenue_file_import.py",
+               "division_revenue.py"):
+        try:
+            with open(_os.path.join(here, _n), "rb") as _f:
+                h.update(_f.read())
+        except Exception:
+            h.update(b"?")      # 파일이 없어도 서버는 떠야 한다
+    return h.hexdigest()[:10]
+
+
+BUILD = _build_stamp()
+BUILD_AT = datetime.now().isoformat(timespec="seconds")
+
+
+# 서버가 살아 있는지만 답한다 ← backup.sh
 @app.get("/health")
 def health():
-    """서버가 살아 있는지만 답한다.
-
-    fly.io 가 주기적으로 부른다. 여기가 안 되면 서버를 죽이고 다시 띄운다.
-    그래서 무거운 일을 하면 안 된다 — 파일도 읽지 않는다.
-    """
-    return {"status": "ok", "time": datetime.now().isoformat()}
+    return {"status": "ok", "time": datetime.now().isoformat(),
+            "build": BUILD, "up": BUILD_AT}
 
 
-# ─── 자료 버전 — 앱이 "새 자료 들어왔나" 묻는 창구 ───────────────
-#
-# 관리자가 엑셀을 올리면 앱이 알아서 당겨받게 하려고 둔다. 앱은 이 한 줄만
-# 자주 물어보고, 값이 바뀐 때에만 전체를 다시 받는다. 매번 전부 받으면
-# 통신량이 수십 배가 되고 서버도 버티지 못한다.
-#
-# 쓰는 쪽에는 손을 대지 않는다 — 자료 파일의 수정 시각과 크기만 본다.
-# 그래서 엑셀 업로드든 화면에서 고친 것이든 터미널로 넣은 것이든 똑같이
-# 잡힌다. 저장 경로마다 '버전 올리기'를 심어 두면 언젠가 한 곳을 빠뜨린다.
+# ─ 자료 버전 — 앱이 "새 자료 들어왔나" 묻는 창구 ───────────────
 _DATA_VERSION_FILES = (
     "models.json",            # 프로젝트·모델·주차별 계획
     "revenue.json",           # 매출 실적·예상·타겟
@@ -2027,12 +1848,13 @@ _DATA_VERSION_FILES = (
     "overtime.json",          # 잔업·특근
     "notes.json",             # 프로젝트 메모
     "reports_latest.json",    # 주간보고 (PPT)
+    "division_app_hidden.json",  # 앱에서 숨긴 사업부
 )
 
 
+# 자료가 바뀌었는지 한 줄로 알려준다 ← 앱 data_version_service.dart fetch()
 @app.get("/data-version")
 def data_version():
-    """자료가 바뀌었는지 한 줄로 알려준다. 앱의 자동 반영이 이걸 본다."""
     import hashlib as _hl
     parts, newest = [], 0.0
     for name in _DATA_VERSION_FILES:
@@ -2054,15 +1876,11 @@ def data_version():
         headers={"Cache-Control": "no-store, max-age=0"},
     )
 
-
-# ════════════════════════════════════════════════════════════
+# ============================================================
 #  PPT 업로드 — 주간보고 PPT 를 받아 슬라이드별로 읽는다
-# ════════════════════════════════════════════════════════════
-
-# 같은 파일을 두 번 올리는 걸 막으려고 파일 내용의 해시를 적어 둔다.
-# 파일명이 달라도 내용이 같으면 같은 해시가 나온다.
+# ============================================================
+# 올라왔던 파일들의 해시 장부를 읽는다
 def _load_upload_hash_index():
-    """올라왔던 파일들의 해시 장부를 읽는다."""
     try:
         if not UPLOAD_HASHES_PATH.exists():
             return {}
@@ -2070,8 +1888,8 @@ def _load_upload_hash_index():
     except Exception:
         return {}
 
+# 해시 장부를 적는다. 실패해도 넘어간다(중복 검사가 느슨해질 뿐).
 def _save_upload_hash_index(data):
-    """해시 장부를 적는다. 실패해도 넘어간다(중복 검사가 느슨해질 뿐)."""
     try:
         UPLOAD_HASHES_PATH.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
@@ -2080,17 +1898,13 @@ def _save_upload_hash_index(data):
     except Exception:
         pass
 
+# 전에 올라온 적 있는 파일인가?. 있으면 그때의 파일명·doc_id 를 준다
 def _find_duplicate_upload_by_hash(file_hash: str):
-    """전에 올라온 적 있는 파일인가? 있으면 그때의 파일명·doc_id 를 준다.
-
-    /upload 가 이걸 보고 "이미 올린 파일입니다" 를 띄운다.
-    정말 다시 올리려면 allow_duplicate=True 로 넘긴다.
-    """
     idx = _load_upload_hash_index()
     return idx.get(file_hash)
 
+# 방금 받은 파일을 해시 장부에 적는다
 def _record_upload_hash(file_hash: str, saved_name: str, doc_id: str):
-    """방금 받은 파일을 해시 장부에 적는다."""
     idx = _load_upload_hash_index()
     idx[file_hash] = {
         "filename": saved_name,
@@ -2098,6 +1912,7 @@ def _record_upload_hash(file_hash: str, saved_name: str, doc_id: str):
     }
     _save_upload_hash_index(idx)
 
+# 주간보고 PPT 를 받는다. 이 구역에서 제일 중요한 창구.
 @app.post("/upload")
 async def upload_ppt(
     file: UploadFile = File(...),
@@ -2108,19 +1923,6 @@ async def upload_ppt(
     project_id: Optional[str] = Form(None),   # 5-2b: 프로젝트 사전 매핑 (선택)
     allow_duplicate: bool = Form(False),  # 중복 업로드 허용
 ):
-    """주간보고 PPT 를 받는다. 이 구역에서 제일 중요한 창구.
-
-    하는 일 순서
-      ① 비밀번호(또는 로그인 쿠키) 확인
-      ② 같은 파일 또 올린 건지 해시로 확인
-      ③ PPT → PDF → 슬라이드 PNG 로 변환 (soffice + poppler)
-      ④ 슬라이드 그림을 GPT 에게 보여 주고 이슈·신호등 색을 받아 온다
-      ⑤ 사업부·프로젝트를 붙여(enrichment) 카드로 묶는다
-      ⑥ notes.json / reports_latest.json 에 적는다
-
-    division_id · project_id 를 같이 넘기면 ⑤ 의 추측을 건너뛰고
-    그 값을 그대로 쓴다 (사장님이 미리 지정한 경우).
-    """
     _has_session = bool(_verify_session(admin_auth))
     if not _has_session and password != UPLOAD_PASSWORD:
         raise HTTPException(status_code=401, detail="비밀번호가 틀립니다.")
@@ -2182,13 +1984,11 @@ async def upload_ppt(
         str(i + 1): f"/slides/{doc_id}/slide_{i+1:02d}.png"
         for i in range(len(slide_texts))
     }
-
-
-    # ============================================================
+    # -----------------------------------------------------------
     # 5-2b: 사장님이 사전 지정한 division_id/project_id 폴백 적용
+    # -----------------------------------------------------------
     # - 자동 분류 성공 카드: 그대로 유지
     # - 자동 분류 실패 카드만 사장님 의도로 폴백
-    # ============================================================
     if division_id or project_id:
         import config_loader as _cl
         try:
@@ -2223,12 +2023,11 @@ async def upload_ppt(
         "slide_images": slide_images,
     }
     _update_latest(summary)
-
-    # ============================================================
+    # -----------------------------------------------------------
     # KPI 자동 추출 훅 (신규)
+    # -----------------------------------------------------------
     # - 프로파일 등록된 프로젝트만 자동 반영
     # - 실패해도 업로드는 성공
-    # ============================================================
     _kpi_extract_result = _auto_extract_kpi_from_pptx(
         saved_pptx_path,
         file.filename,
@@ -2245,12 +2044,10 @@ async def upload_ppt(
         "kpi_auto_extract": _kpi_extract_result,
     }
 
-
-# =========================================================
-# 3. 대시보드 / 리포트
-# =========================================================
+# ============================================================
+#  대시보드 — 신호등 카드
+# ============================================================
 def _due_status_one(due_raw: str) -> str:
-    """단일 due_date 문자열 → 상태색."""
     from datetime import date
     due_raw = (due_raw or "").strip()
     if not due_raw:
@@ -2268,11 +2065,8 @@ def _due_status_one(due_raw: str) -> str:
     return "BLUE"
 
 
+# 카드 안 items 들의 due_date 들을 보고 가장 위험한 색으로 집계.
 def _calc_card_status(card: dict) -> str:
-    """카드 안 items 들의 due_date 들을 보고 가장 위험한 색으로 집계.
-    빨강 > 주황 > 파랑 > 초록(매출만) > 검정 순.
-    items가 비어있고 매출 데이터도 없으면 → BLACK.
-    매출 데이터가 있고 due 항목이 없으면 → GREEN (정상 운영중)."""
     priority = {"RED": 5, "ORANGE": 4, "BLUE": 3, "GREEN": 2, "BLACK": 1}
     best = "BLACK"
     sections = card.get("sections") or []
@@ -2295,9 +2089,9 @@ def _calc_card_status(card: dict) -> str:
     return best
 
 
+# 신호등 카드 ← 앱 dashboard_service.dart
 @app.get("/dashboard")
 def dashboard():
-    """신호등 카드 - 각 카드에 project_key 포함 → Flutter에서 상세 이동에 사용"""
     from project_templates import _match_project_key  # 키워드 매핑 함수 재사용
 
     latest = _read_json(LATEST_FILE, [])
@@ -2333,7 +2127,7 @@ def dashboard():
 
     # 🟢 카드별로 division/project 분류 정보 enrichment (기존 필드 변경 없음)
     cards = [enrich_card(c) for c in cards]
-    
+
     # 🟢 오래된 이슈 카드 필터링 (사급자재/오웬 최종승인)
     cards = [c for c in cards if not any(kw in json.dumps(c, ensure_ascii=False) for kw in ['사급자재', '오웬 최종승인'])]
 
@@ -2479,7 +2273,9 @@ def dashboard():
     # 🟢 모델 단위 그룹핑 (신규 필드, 옛 cards 는 호환을 위해 그대로 유지)
     # --- ESS 합성 카드 주입 (models.json → dashboard 카드) ---
     _models_data = _load_models()
-    # --- 반도체 frame 카드 주입 ---
+    # -----------------------------------------------------------
+    # 반도체 frame 카드 주입
+    # -----------------------------------------------------------
     _semi_frame_projects = {"frame": "프레임", "powerbox": "파워박스", "major_module": "메이저모듈"}
     for _pk, _label in _semi_frame_projects.items():
         for _m in _models_data.get("projects", {}).get(_pk, {}).get("models", []):
@@ -2508,8 +2304,10 @@ def dashboard():
                 "division_label": "반도체사업부",
                 "from_note": False,
             })
-    # --- frame 주입 끝 ---
-    _ess_projects = {"sdi": "SDI", "fluence": "FLUENCE", "epc_power": "EPC POWER"}
+    # ESS 프로젝트 키는 사업부 양식이 만든 ess_* 하나뿐이다
+    # (_ess_legacy_cleanup 주석 참고).
+    _ess_projects = {"ess_sdi": "SDI", "ess_fluence": "플루언스",
+                     "ess_epc_power": "EPC POWER"}
     for _pk, _label in _ess_projects.items():
         for _m in _models_data.get("projects", {}).get(_pk, {}).get("models", []):
             _issues_txt = (_m.get("issues") or "").strip()
@@ -2536,15 +2334,15 @@ def dashboard():
                 "division_label": "ESS사업부",
                 "from_note": False,
             })
-    # --- 주입 끝 ---
 
     grouped_cards = _group_dashboard_cards(cards)
 
     return {"cards": cards, "grouped_cards": grouped_cards}
 
-
+# ============================================================
+#  리포트 목록 · 제품 상세
+# ============================================================
 def _normalize_project_name(name) -> str:
-    """프로젝트명 정규화: trim + 연속공백을 단일공백으로 + 자주 틀리는 표기 통일."""
     if not name:
         return ""
     s = str(name).strip()
@@ -2561,9 +2359,8 @@ def _normalize_project_name(name) -> str:
     return s
 
 
+# dedupe용 정렬 키. 최신이 클수록 큰 값.
 def _report_sort_key(r: dict):
-    """dedupe용 정렬 키. 최신이 클수록 큰 값.
-    uploaded_at -> created_at -> parsed.date 순으로 fallback."""
     if not isinstance(r, dict):
         return ""
     for k in ("uploaded_at", "created_at"):
@@ -2575,9 +2372,8 @@ def _report_sort_key(r: dict):
     return str(d)
 
 
+# 같은 프로젝트명이 여러 카드에 있으면 최신 것만 남긴다
 def _dedupe_cards_by_project(cards: list) -> list:
-    """같은 프로젝트명이 여러 카드에 있으면 최신 것만 남긴다.
-    비교 전 이름을 정규화. 순서는 최신순으로 정렬."""
     if not cards:
         return []
     best = {}
@@ -2600,10 +2396,8 @@ def _dedupe_cards_by_project(cards: list) -> list:
     return out
 
 
+# 한 리포트에 여러 프로젝트가 들어있으면 프로젝트 단위 카드로 분리.
 def _split_report_by_project(r_enriched: dict) -> list:
-    """한 리포트에 여러 프로젝트가 들어있으면 프로젝트 단위 카드로 분리.
-    project_overrides가 있으면 프로젝트명을 그걸로 대체.
-    """
     parsed = (r_enriched or {}).get("parsed") or {}
     projects = parsed.get("projects") or []
     week_num = (r_enriched or {}).get("week_override") or parsed.get("week")
@@ -2642,13 +2436,8 @@ def _split_report_by_project(r_enriched: dict) -> list:
     return cards
 
 
+# 업로드 후 경과 시간과 report_date 기준 상태 분류.
 def _classify_report_status(upload_timestamp: str, report_date: str) -> dict:
-    """업로드 후 경과 시간과 report_date 기준 상태 분류.
-
-    - 업로드 후 5분 이내: ai_processing (Chamber D-2 예시처럼)
-    - report_date가 미래 or 오늘: review_pending (검토 대기)
-    - 그 외: published (발행 완료)
-    """
     from datetime import datetime as _dt, timedelta as _td
     now = _dt.now()
 
@@ -2679,6 +2468,7 @@ def _classify_report_status(upload_timestamp: str, report_date: str) -> dict:
     return {"status": status, "d_day": d_day}
 
 
+# 올라온 주간보고 목록 ← admin v2 getISOWeek()
 @app.get("/reports")
 def list_reports():
     raw = _read_json(LATEST_FILE, [])
@@ -2722,9 +2512,9 @@ def list_reports():
     return {"reports": split_cards}
 
 
+# 제품 단위 상세 (기존 카드 탭용) ← admin v2 executeDelete() · __moreBtn.onclick() · _loadSalesForSection() 외
 @app.get("/reports/{doc_id}/{product_name}")
 def get_product_detail(doc_id: str, product_name: str):
-    """제품 단위 상세 (기존 카드 탭용)"""
     latest = _read_json(LATEST_FILE, [])
     for report in latest:
         if report.get("doc_id") != doc_id:
@@ -2744,10 +2534,6 @@ def get_product_detail(doc_id: str, product_name: str):
                 }
     raise HTTPException(status_code=404, detail="제품을 찾을 수 없습니다.")
 
-
-# =========================================================
-# 4. 프로젝트별 보기
-# =========================================================
 
 _APP_RELEASE_HTML = """<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
@@ -2875,13 +2661,10 @@ document.getElementById('f').onsubmit=function(ev){
 </script></body></html>"""
 
 
-# ── 모델 데이터 백업 ──────────────────────────────────────────────────
-#
-# _save_models 는 덮어쓰기 전에 models.json.auto_<시각> 을 남긴다 (최근 10개).
-# 무언가 사라졌을 때 어디로 돌아가야 하는지 보려면 그 안을 들여다볼 수
-# 있어야 한다. 되돌리는 것도 저장이라, 되돌리기 전의 상태도 백업으로 남는다.
-
-
+# ============================================================
+#  모델 데이터 백업
+# ============================================================
+# models.json 자동 백업 파일 목록 (최신부터).
 def _models_backups():
     import glob
     out = []
@@ -2895,8 +2678,8 @@ def _models_backups():
     return out
 
 
+# 프로젝트별로 무엇이 몇 개 들어 있는지.
 def _models_shape(data: dict) -> dict:
-    """프로젝트별로 무엇이 몇 개 들어 있는지. 백업끼리 비교하려고 쓴다."""
     out = {}
     for key, proj in (data.get("projects") or {}).items():
         ms = (proj or {}).get("models") or []
@@ -2915,9 +2698,9 @@ def _models_shape(data: dict) -> dict:
     return out
 
 
+# 백업 목록. name 을 주면 그 백업 안이 어떤 모양인지 같이 보여준다
 @app.get("/admin/models/backups")
 def admin_models_backups(name: str = "", _admin: int = Depends(get_admin_session)):
-    """백업 목록. name 을 주면 그 백업 안이 어떤 모양인지 같이 보여준다."""
     out = {"ok": True, "current": _models_shape(_load_models()),
            "backups": _models_backups()}
     if name:
@@ -2930,14 +2713,9 @@ def admin_models_backups(name: str = "", _admin: int = Depends(get_admin_session
     return out
 
 
+# 백업으로 되돌린다. payload = {name, projects?: [키...]}
 @app.post("/admin/models/restore")
 def admin_models_restore(payload: dict, _admin: int = Depends(get_admin_session)):
-    """백업으로 되돌린다. payload = {name, projects?: [키...]}
-
-    projects 를 주면 그 프로젝트만 백업 것으로 바꾼다. 통째로 되돌리면
-    그 사이에 제대로 들어간 것까지 같이 잃는다.
-    되돌리기 직전 상태도 백업으로 남으므로 다시 되돌릴 수 있다.
-    """
     name = os.path.basename(str(payload.get("name") or ""))
     if not name or ".auto_" not in name:
         raise HTTPException(status_code=400, detail="백업 이름이 필요합니다")
@@ -2962,23 +2740,21 @@ def admin_models_restore(payload: dict, _admin: int = Depends(get_admin_session)
     return {"ok": True, "from": name, "projects": changed,
             "shape": _models_shape(data)}
 
-
+# ============================================================
+#  앱 배포 — APK · 버전 · 변경 내역
+# ============================================================
+# APK 올리는 화면. 배포 없이 새 버전을 내보낼 수 있다
 @app.get("/admin/app", response_class=HTMLResponse)
 def admin_app_page(admin_auth: Optional[str] = Cookie(default=None)):
-    """APK 올리는 화면. 배포 없이 새 버전을 내보낼 수 있다."""
     if not _verify_session(admin_auth):
         return RedirectResponse(url="/admin/login?next=/admin/app", status_code=302)
     return HTMLResponse(_APP_RELEASE_HTML)
 
 
-# ── 앱 배포 ───────────────────────────────────────────────────────────
-#
-# APK 와 버전 파일은 볼륨(/data)에 둔다. 이미지에 넣으면 80MB 짜리를
-# 배포마다 같이 굽게 되고, 버전만 바꾸려 해도 배포를 해야 한다.
-# 볼륨에 있으면 올리는 즉시 반영된다.
-#
-# 저장소가 비공개면 GitHub 릴리스 주소는 로그인 없이 못 받는다.
-# 그래서 앱이 이미 쓰는 이 서버가 APK 를 직접 내려준다.
+# ============================================================
+#  앱 배포
+# ============================================================
+# APK 와 버전 파일은 볼륨(/data)에 둔다
 APP_VERSION_FILE = DATA_DIR / "app_version.json"
 APP_VERSION_SEED = BASE_DIR / "app_version.json"   # 볼륨에 없으면 이걸 쓴다
 APP_APK_FILE = DATA_DIR / "app_release.apk"
@@ -2992,14 +2768,8 @@ APP_VERSION_FALLBACK = {
 }
 
 
+# 볼륨과 이미지 중 버전 코드가 더 높은 쪽.
 def _read_app_version() -> dict:
-    """볼륨과 이미지 중 버전 코드가 더 높은 쪽.
-
-    예전에는 볼륨을 무조건 앞세웠다. 그런데 볼륨에는 한참 전에 admin 으로
-    올린 2.1.9 가 남아 있었고, release.sh 로 2.3.8 을 배포해도 서버는 계속
-    2.1.9 를 알려줬다. 그 주소는 비공개 저장소의 릴리스라 앱이 받지도
-    못해서 '업데이트 실패 404' 만 떴다.
-    """
     best, best_code = None, -1
     for path in (APP_VERSION_FILE, APP_VERSION_SEED):
         try:
@@ -3017,31 +2787,18 @@ def _read_app_version() -> dict:
     return dict(best) if best else dict(APP_VERSION_FALLBACK)
 
 
-# ─────────────────────────────────────────────────────────────
 # 변경 내역 (CHANGELOG.md)
-#
-# 전에는 app_version.json 에 release_notes 한 줄만 있었다. 버전을 올려도
-# 그 줄을 안 고치면 옛 노트가 그대로 나갔고, 실제로 2.3.10 이 몇 버전 전의
-# 블룸 일 보고 얘기를 띄우고 있었다. 게다가 '2.3.9 와 2.3.10 이 뭐가
-# 다른가' 는 어디에도 안 남아서 답할 수가 없었다.
-#
-# 이제 버전별로 CHANGELOG.md 에 쌓고, release.sh 가 배포하는 버전의
-# 항목이 없으면 배포를 멈춘다.
 _CHANGELOG_FILE = BASE_DIR / "CHANGELOG.md"
 _CHANGELOG_FILE_ALT = BASE_DIR.parent / "CHANGELOG.md"
 
 
+# '## 2.3.10 — 2026-09-16' 단위로 쪼갠다
 def _parse_changelog(text: str) -> list:
-    """'## 2.3.10 — 2026-09-16' 단위로 쪼갠다."""
     import re as _re
     out = []
     cur = None
     for line in (text or "").split("\n"):
-        # '## 2.3.10 — 2026-09-16' 도 '## 2.3.9 이전' 도 받는다.
-        # 날짜 자리를 엄격하게 잡으면 뒤엣것이 머리로 안 잡혀서
-        # 앞 버전의 본문에 통째로 딸려 들어간다.
-        # 줄 맨 앞의 ## 만 머리다. 들여쓴 건 머리말의 형식 예시라서
-        # 머리로 잡으면 있지도 않은 버전이 생긴다.
+        # '## 2.3.10 — 2026-09-16' 도 '## 2.3.9 이전' 도 받는다
         m = _re.match(r"^##\s+(\S+)\s*(.*?)\s*$", line.rstrip())
         if m:
             if cur:
@@ -3059,6 +2816,7 @@ def _parse_changelog(text: str) -> list:
     return [e for e in out if e["body"]]
 
 
+# CHANGELOG.md 를 읽는다 (앱 '변경 내역' · 업데이트 팝업).
 def _load_changelog() -> list:
     for path in (_CHANGELOG_FILE, _CHANGELOG_FILE_ALT):
         try:
@@ -3069,8 +2827,8 @@ def _load_changelog() -> list:
     return []
 
 
+# 그 버전의 본문. 없으면 빈 문자열.
 def _changelog_for(version: str) -> str:
-    """그 버전의 본문. 없으면 빈 문자열."""
     v = str(version or "").strip().lstrip("vV")
     for e in _load_changelog():
         if e["version"].lstrip("vV") == v:
@@ -3078,9 +2836,9 @@ def _changelog_for(version: str) -> str:
     return ""
 
 
+# 설정 화면의 '변경 내역'. 최신 버전부터 ← 앱 changelog_screen.dart initState()
 @app.get("/app/changelog")
 def get_app_changelog(limit: int = 20):
-    """설정 화면의 '변경 내역'. 최신 버전부터."""
     try:
         n = max(1, min(100, int(limit)))
     except (TypeError, ValueError):
@@ -3090,9 +2848,9 @@ def get_app_changelog(limit: int = 20):
             "count": len(items), "items": items}
 
 
+# 앱 시작 시 호출. 최신 버전 정보 반환 ← 앱 app_updater.dart _fromServer()
 @app.get("/app/version")
 def get_app_version():
-    """앱 시작 시 호출. 최신 버전 정보 반환."""
     data = dict(_read_app_version())
     # 노트는 CHANGELOG.md 가 정본이다. app_version.json 의 release_notes 는
     # 한 줄뿐이라 버전을 올려도 안 고치면 옛 노트가 그대로 나갔다.
@@ -3109,9 +2867,9 @@ def get_app_version():
     return data
 
 
+# 최신 APK 다운로드 ← release.sh
 @app.get("/app/download")
 def download_app_apk():
-    """최신 APK 다운로드."""
     from fastapi.responses import FileResponse
     for apk_path in (APP_APK_FILE, BASE_DIR / "app_release.apk"):
         if apk_path.exists():
@@ -3123,9 +2881,9 @@ def download_app_apk():
     raise HTTPException(status_code=404, detail="APK not uploaded yet")
 
 
+# 지금 서버가 내주고 있는 버전과 APK 상태 ← release.sh
 @app.get("/admin/app/release")
 def admin_app_release(_admin: int = Depends(get_admin_session)):
-    """지금 서버가 내주고 있는 버전과 APK 상태."""
     size = APP_APK_FILE.stat().st_size if APP_APK_FILE.exists() else 0
     mtime = ""
     if APP_APK_FILE.exists():
@@ -3139,6 +2897,7 @@ def admin_app_release(_admin: int = Depends(get_admin_session)):
     }
 
 
+# 새 APK 와 버전 정보를 올린다 ← release.sh
 @app.post("/admin/app/release")
 async def admin_app_release_upload(
     file: UploadFile = File(None),
@@ -3148,11 +2907,6 @@ async def admin_app_release_upload(
     force_update: bool = Form(False),
     _admin: int = Depends(get_admin_session),
 ):
-    """새 APK 와 버전 정보를 올린다. 올리는 즉시 앱에 뜬다 (배포 불필요).
-
-    versionCode 는 반드시 올라가야 한다. 안드로이드는 같거나 낮은 번호의
-    APK 를 기존 앱 위에 설치하지 않는다 — 설치 실패 이유도 알려주지 않는다.
-    """
     cur = _read_app_version()
     ver = (latest_version or "").strip() or cur.get("latest_version", "1.0.0")
     code = int(latest_version_code or 0) or _as_int(cur.get("latest_version_code"), 1)
@@ -3195,7 +2949,9 @@ async def admin_app_release_upload(
 
 NOTES_FILE = DATA_DIR / "notes.json"
 
-
+# ============================================================
+#  노트 저장소
+# ============================================================
 def _load_notes() -> dict:
     try:
         with open(NOTES_FILE, "r", encoding="utf-8") as f:
@@ -3204,6 +2960,7 @@ def _load_notes() -> dict:
         return {"version": 1, "updated_at": None, "notes": {}}
 
 
+# 사업부 노트(notes.json)를 저장한다
 def _save_notes(data: dict) -> None:
     from datetime import datetime
     data["updated_at"] = datetime.now().isoformat()
@@ -3221,19 +2978,36 @@ SEED_MODELS_FILE = BASE_DIR / "models.seed.json"
 _seed_warned = False
 
 
-def _load_models() -> dict:
-    """운영 데이터를 읽는다. 씨앗으로 떨어질 때는 조용히 넘어가지 않는다.
+# 운영 파일을 읽은 것 한 벌. 파일이 바뀐 시각이 열쇠다
+_MODELS_CACHE: dict = {"key": None, "data": None}
 
-    예전에는 /app/models.json 으로 말없이 떨어졌다. 볼륨이 안 붙거나 비면
-    에러 없이 몇 달 전 자료가 그대로 서비스돼서, 화면은 멀쩡한데 숫자만
-    옛날 것인 상태가 된다 — 아무도 못 알아챈다. 그래서 떨어질 때마다
-    로그에 크게 남긴다.
-    """
+# ============================================================
+#  모델 저장소 (models.json) — 모든 프로젝트·모델 자료
+# ============================================================
+def _load_models() -> dict:
     global _seed_warned
+    # -----------------------------------------------------------
+    # 한 번 읽은 것을 다시 쓴다
+    # -----------------------------------------------------------
+    # 캐시를 보는 일은 **try 밖**에서 한다
+    _ck = None
+    if MODELS_FILE.exists():
+        try:
+            _st = MODELS_FILE.stat()
+            _ck = (_st.st_mtime_ns, _st.st_size)
+        except OSError:
+            _ck = None
+        if _ck is not None and _MODELS_CACHE.get("key") == _ck \
+                and _MODELS_CACHE.get("data") is not None:
+            return _MODELS_CACHE["data"]
     if MODELS_FILE.exists():
         try:
             with open(MODELS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if _ck is not None:
+                _MODELS_CACHE["key"] = _ck
+                _MODELS_CACHE["data"] = data
+            return data
         except Exception as _e:
             print(f"[models] !! {MODELS_FILE} 를 읽지 못했습니다: {_e}")
     if SEED_MODELS_FILE.exists():
@@ -3252,6 +3026,7 @@ def _load_models() -> dict:
     return {"version": 1, "updated_at": None, "projects": {}}
 
 
+# 모든 프로젝트·모델 자료(models.json)를 저장한다
 def _save_models(data: dict) -> None:
     from datetime import datetime
     # 덮어쓰기 전에 직전 파일을 백업해 둔다. 엑셀 업로드 한 번에 모델이 통째로
@@ -3270,23 +3045,171 @@ def _save_models(data: dict) -> None:
     except Exception as _e:
         print(f"[save_models] 백업 실패(무시): {_e}")
     data["updated_at"] = datetime.now().isoformat()
-    # 운영 파일을 직접 열어서 쓰지 않는다. 쓰는 도중에 서버가 죽거나 배포로
-    # 교체되면 JSON 이 반만 적힌 파일이 남고, 그건 다시 읽을 수 없다.
-    # 옆에 다 쓰고 → 디스크에 앉히고 → 이름만 바꾼다. os.replace 는 같은
-    # 파일 시스템 안에서 원자적이라, 어느 순간에 죽어도 파일은 '옛날 것'
-    # 아니면 '새 것'이지 중간이 없다.
+    # 운영 파일을 직접 열어서 쓰지 않는다
     tmp = f"{MODELS_FILE}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, MODELS_FILE)
+    # 방금 쓴 것이 곧 최신이다. 여기서 안 맞춰 두면 다음 읽기가 파일을
+    # 다시 파싱한다 — 아끼려던 자리를 도로 쓴다.
+    try:
+        _st = MODELS_FILE.stat()
+        _MODELS_CACHE["key"] = (_st.st_mtime_ns, _st.st_size)
+        _MODELS_CACHE["data"] = data
+    except OSError:
+        _MODELS_CACHE["key"] = None
     _pj = {k: len(v.get("models", [])) for k, v in data.get("projects", {}).items()}
     print(f"[save_models] wrote {MODELS_FILE} | projects={len(_pj)} | {_pj}")
 
 
+# ==== ESS 프로젝트가 두 벌이던 것을 한 벌로
+_ESS_LEGACY = {"sdi": "ess_sdi", "fluence": "ess_fluence", "epc_power": "ess_epc_power"}
+_ess_legacy_done = False
+
+# ============================================================
+#  옛 자료 정리 — ESS 옛 키 · 자동차 수주 합치기 (서버 켤 때)
+# ============================================================
+def _ess_legacy_cleanup() -> list:
+    global _ess_legacy_done
+    if _ess_legacy_done:
+        return []
+    _ess_legacy_done = True
+    data = _load_models()
+    projs = data.get("projects") or {}
+    dropped = []
+    for old, new in _ESS_LEGACY.items():
+        if old not in projs:
+            continue
+        if not (projs.get(new) or {}).get("models"):
+            print(f"[ess] {old} 는 그대로 둡니다 — {new} 에 품목이 없습니다")
+            continue
+        projs.pop(old, None)
+        dropped.append(old)
+    if dropped:
+        _save_models(data)
+        print(f"[ess] 옛 ESS 프로젝트를 지웠습니다: {dropped}")
+    return dropped
+
+
+# ==== 자동차 수주 자료를 양식 품목으로 옮긴다
+
+# (원본 프로젝트, 원본 품목 id, 옮길 프로젝트, 옮길 품목 id)
+_AUTO_ORDER_MOVE = [
+    ("auto_schaeffler", "SVCT", "automotive_schaeffler", "AAA9543030400"),
+    ("auto_schaeffler", "OV1", "automotive_schaeffler", "AAA9550840300"),
+    ("auto_stellantis", "오일펌프하우징", "automotive_stellantis", "68666525AA"),
+    ("auto_kefico", "V2LC HOUSING", "automotive_kefico_vn", "9191030001"),
+    ("auto_kefico", "OBC HOUSING", "automotive_kefico_india", "9091060001"),
+    ("auto_kefico", "EREV ICCU HOUSING", "automotive_kefico_india", "9091100001"),
+]
+# 짝을 가릴 수 없어 버리는 것 (민님 지시)
+_AUTO_ORDER_DROP = [
+    ("auto_kefico", "DCDC HOUSING"),
+    ("auto_kefico", "HE ICCU ASSY"),
+    ("auto_valeo", "DCDC HOUSING"),
+]
+_AUTO_ORDER_PROJECTS = ["auto_schaeffler", "auto_kefico",
+                        "auto_stellantis", "auto_valeo"]
+# 오타로 하나 더 생긴 프로젝트 → 본체
+_AUTO_DUP_PROJECT = ("automotive_schaefller", "automotive_schaeffler")
+_auto_order_done = False
+
+
+# 수주 자료를 양식 품목에 얹고 auto_* 를 지운다
+def _auto_order_merge() -> dict:
+    global _auto_order_done
+    if _auto_order_done:
+        return {}
+    _auto_order_done = True
+    data = _load_models()
+    projs = data.get("projects") or {}
+
+    def _pick(pk, mid):
+        for m in (projs.get(pk) or {}).get("models") or []:
+            if isinstance(m, dict) and str(m.get("id") or "") == mid:
+                return m
+        return None
+
+    moved, missing = [], []
+    for spk, smid, tpk, tmid in _AUTO_ORDER_MOVE:
+        src = _pick(spk, smid)
+        if src is None or not src.get("auto"):
+            continue                      # 이미 옮겼거나 없다
+        tgt = _pick(tpk, tmid)
+        if tgt is None:
+            missing.append("%s/%s" % (tpk, tmid))
+            continue
+        if tgt.get("auto"):
+            continue                      # 이미 있다 — 덮지 않는다
+        blk = dict(src["auto"])
+        # 수주 엑셀에 적힌 제품명을 남긴다. 양식 이름과 다른 경우가 있다
+        # (오일펌프하우징 ↔ Oil pump) — 어디서 온 숫자인지 알아야 한다.
+        blk.setdefault("product", src.get("name") or smid)
+        tgt["auto"] = blk
+        moved.append("%s/%s → %s/%s" % (spk, smid, tpk, tmid))
+
+    if missing:
+        print("[auto] 얹을 자리를 못 찾아 아무것도 지우지 않습니다: %s" % missing)
+        if moved:
+            _save_models(data)
+        return {"moved": moved, "missing": missing}
+
+    dropped = ["%s/%s" % (k, m) for k, m in _AUTO_ORDER_DROP if _pick(k, m)]
+    removed = [k for k in _AUTO_ORDER_PROJECTS if projs.pop(k, None) is not None]
+
+    # 오타 프로젝트 — 본체에 같은 품목이 같은 숫자로 있을 때만 지운다
+    dup, keep = _AUTO_DUP_PROJECT
+    dup_removed = ""
+    if dup in projs:
+        dms = [m for m in (projs.get(dup) or {}).get("models") or []
+               if isinstance(m, dict)]
+        kby = {str(m.get("id") or ""): m
+               for m in (projs.get(keep) or {}).get("models") or []
+               if isinstance(m, dict)}
+        same = bool(dms) and all(
+            str(m.get("id") or "") in kby
+            and kby[str(m.get("id") or "")].get("po_qty") == m.get("po_qty")
+            and kby[str(m.get("id") or "")].get("shipped_qty") == m.get("shipped_qty")
+            for m in dms)
+        if same:
+            projs.pop(dup, None)
+            dup_removed = dup
+            # 프로젝트 목록에서는 **지우지 않고 끈다** (set_project_visible
+            # 주석 참고 — 이름이 다시 올 수 있다).
+            try:
+                _cl.set_project_visible(dup, False, "dup_of_%s" % keep)
+            except Exception as _e:
+                print("[auto] %s 숨기기 실패(무시): %s" % (dup, _e))
+        else:
+            print("[auto] %s 는 그대로 둡니다 — %s 와 숫자가 다릅니다" % (dup, keep))
+
+    if moved or removed or dup_removed:
+        _save_models(data)
+        print("[auto] 수주 얹음 %d · 버림 %d · 프로젝트 삭제 %s %s"
+              % (len(moved), len(dropped), removed, dup_removed))
+    return {"moved": moved, "dropped": dropped,
+            "removed": removed, "dup": dup_removed}
+
+
+# 서버가 켜질 때 저절로 돈다
+@app.on_event("startup")
+def _ess_legacy_cleanup_on_startup() -> None:
+    # 뜨자마자 한 번. 여기서 터져도 서버는 떠야 하니 전부 감싼다.
+    try:
+        _ess_legacy_cleanup()
+    except Exception as _e:
+        print(f"[ess] 옛 프로젝트 정리 실패(무시): {_e}")
+    try:
+        _auto_order_merge()
+    except Exception as _e:
+        print(f"[auto] 수주 자료 정리 실패(무시): {_e}")
+
+# ============================================================
+#  모델 한 개 모양 맞추기
+# ============================================================
 def _normalize_model(raw: dict, existing_ids: set) -> dict | None:
-    """dict → 정규화된 모델 dict. 검증 실패 시 None 반환"""
     if not isinstance(raw, dict):
         return None
     mid = str(raw.get("id") or "").strip()
@@ -3294,7 +3217,7 @@ def _normalize_model(raw: dict, existing_ids: set) -> dict | None:
     if not name:
         return None
     if not mid:
-        mid = (name.lower().replace(" ", "-").replace("/", "-")) or f"model-{int(__import__('time').time()*1000)}"
+        mid = (name.lower().replace(" ", "-").replace("/", "-")) or f"model-{int(time.time()*1000)}"
     if mid in existing_ids:
         return None
     group = str(raw.get("group") or "양산").strip()
@@ -3334,8 +3257,8 @@ def _normalize_model(raw: dict, existing_ids: set) -> dict | None:
     }
 
 
+# 프로젝트 키로 모델 목록 조회 (별칭 매핑 적용)
 def _get_project_models(project_key: str) -> list:
-    """프로젝트 키로 모델 목록 조회 (별칭 매핑 적용)"""
     _alias = {
         "havaplate": "hrva_plate",
         "hrvaplate": "hrva_plate",
@@ -3351,33 +3274,35 @@ def _get_project_models(project_key: str) -> list:
 import uuid as _uuid_mod
 from datetime import datetime as _dt_mod
 
+# ============================================================
+#  노트에 붙이는 표 · 사진 파일
+# ============================================================
 def _new_asset_id(division_id: str) -> str:
-    """사업부별 자산 ID 생성: YYYY-MM-DD_<uuid8>"""
     date_str = _dt_mod.now().strftime("%Y-%m-%d")
     uid = _uuid_mod.uuid4().hex[:8]
     return f"{date_str}_{uid}"
 
+# 노트에 붙인 표(JSON) 파일 자리.
 def _table_path(division_id: str, asset_id: str) -> Path:
     div_dir = NOTE_TABLES_DIR / division_id
     div_dir.mkdir(parents=True, exist_ok=True)
     return div_dir / f"{asset_id}.json"
 
+# 노트에 붙인 사진 파일 자리.
 def _photo_path(division_id: str, asset_id: str, ext: str = "jpg") -> Path:
     div_dir = NOTE_PHOTOS_DIR / division_id
     div_dir.mkdir(parents=True, exist_ok=True)
     return div_dir / f"{asset_id}.{ext}"
 
+# 표 JSON 저장 → asset_id 반환 (예: 'semiconductor/2026-06-11_a1b2c3d4')
 def _save_note_table(division_id: str, table_data: dict) -> str:
-    """표 JSON 저장 → asset_id 반환 (예: 'semiconductor/2026-06-11_a1b2c3d4')"""
     asset_id = _new_asset_id(division_id)
     p = _table_path(division_id, asset_id)
     p.write_text(json.dumps(table_data, ensure_ascii=False, indent=2), encoding="utf-8")
     return f"{division_id}/{asset_id}"
 
+# 이미지 bytes → note_photos/에 저장 → photo_ref 반환.
 def _save_note_photo(division_id: str, image_bytes: bytes, ext: str = "png") -> str:
-    """이미지 bytes → note_photos/에 저장 → photo_ref 반환.
-    반환 예: 'semiconductor/2026-07-30_a1b2c3d4.png'
-    """
     if not image_bytes:
         raise ValueError("empty image bytes")
     ext = (ext or "png").lower().lstrip(".")
@@ -3387,21 +3312,16 @@ def _save_note_photo(division_id: str, image_bytes: bytes, ext: str = "png") -> 
     return f"{division_id}/{asset_id}.{ext}"
 
 
+# xlsx → PNG bytes (LibreOffice + pdf2image로 색상/스타일 완벽 반영).
 def _xlsx_file_to_png_bytes(xlsx_path: Path) -> bytes:
-    """xlsx → PNG bytes (LibreOffice + pdf2image로 색상/스타일 완벽 반영).
-    
-    옛 openpyxl+Pillow 직접 렌더링 방식은 표 서식/조건부 서식/테마 색상을
-    지원하지 못했음. LibreOffice로 pdf 변환 후 pdf2image로 png 렌더링하면
-    원본 엑셀과 시각적으로 100% 동일.
-    """
     import subprocess
     import tempfile
     from io import BytesIO
     from pdf2image import convert_from_path
-    
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
-        
+
         # 1) LibreOffice: xlsx → pdf
         result = subprocess.run(
             ['libreoffice', '--headless', '--convert-to',
@@ -3414,28 +3334,25 @@ def _xlsx_file_to_png_bytes(xlsx_path: Path) -> bytes:
                 f"LibreOffice 변환 실패 (code={result.returncode}): "
                 f"{result.stderr.decode('utf-8', errors='ignore')[:500]}"
             )
-        
+
         pdf_files = list(tmp_dir.glob("*.pdf"))
         if not pdf_files:
             raise RuntimeError("LibreOffice가 PDF를 생성하지 못함")
         pdf_path = pdf_files[0]
-        
+
         # 2) pdf → png (첫 페이지, 고해상도)
         images = convert_from_path(str(pdf_path), dpi=150, first_page=1, last_page=1)
         if not images:
             raise RuntimeError("pdf2image로 PNG 변환 실패")
-        
+
         # 3) PNG bytes
         buf = BytesIO()
         images[0].save(buf, 'PNG', optimize=True)
         return buf.getvalue()
 
 
+# report dict → division_id 유추.
 def _derive_division_id_from_report(it: dict) -> str:
-    """report dict → division_id 유추.
-    우선순위: it.division_id → products[i].name derive → 'semiconductor' 폴백.
-    _sync_report_to_notes의 로직과 동일하게 유지.
-    """
     if not isinstance(it, dict):
         return "semiconductor"
     division_id = (it.get("division_id") or "").strip()
@@ -3453,8 +3370,8 @@ def _derive_division_id_from_report(it: dict) -> str:
     return "semiconductor"
 
 
+# table_ref = 'semiconductor/2026-06-11_a1b2c3d4' → 표 JSON 반환
 def _load_note_table(table_ref: str):
-    """table_ref = 'semiconductor/2026-06-11_a1b2c3d4' → 표 JSON 반환"""
     if not table_ref or "/" not in table_ref:
         return None
     division_id, asset_id = table_ref.split("/", 1)
@@ -3466,6 +3383,7 @@ def _load_note_table(table_ref: str):
     except Exception:
         return None
 
+# 노트에 붙인 표 파일 하나를 지운다
 def _delete_note_table(table_ref: str) -> bool:
     if not table_ref or "/" not in table_ref:
         return False
@@ -3476,8 +3394,8 @@ def _delete_note_table(table_ref: str) -> bool:
         return True
     return False
 
+# photo_ref = 'semiconductor/2026-06-11_a1b2c3d4.jpg'
 def _delete_note_photo(photo_ref: str) -> bool:
-    """photo_ref = 'semiconductor/2026-06-11_a1b2c3d4.jpg'"""
     if not photo_ref or "/" not in photo_ref:
         return False
     p = NOTE_PHOTOS_DIR / photo_ref
@@ -3610,13 +3528,12 @@ group_id를 부여하는 경우 처리 방법:
 
 응답은 반드시 위 JSON 형식 한 객체만 출력. 마크다운, 코드블록, 설명 없이 JSON만 출력하세요."""
 
-
+# ============================================================
+#  PPT → 노트 카드 · 프로젝트별 최근 노트
+# ============================================================
+# 업로드된 PPT를 주간 보고 카드 구조로 자동 변환.
 @app.post("/admin/notes/from_pptx")
 def admin_notes_from_pptx(payload: dict, _admin: int = Depends(get_admin_session)):
-    """업로드된 PPT를 주간 보고 카드 구조로 자동 변환.
-    - 슬라이드 텍스트는 AI로 카드 구조화
-    - 표는 자동으로 note_assets/tables/ 에 저장 + table_ref 연결
-    """
     doc_id = (payload or {}).get("doc_id", "").strip()
     division_id = (payload or {}).get("division_id", "").strip()
     if not doc_id:
@@ -3627,14 +3544,16 @@ def admin_notes_from_pptx(payload: dict, _admin: int = Depends(get_admin_session
     pptx_path = UPLOAD_DIR / f"{doc_id}.pptx"
     if not pptx_path.exists():
         raise HTTPException(status_code=404, detail=f"PPT 파일을 찾을 수 없음: {doc_id}")
-
-    # 1) 텍스트 + 표 분리 추출
+    # -----------------------------------------------------------
+    # 텍스트 + 표 분리 추출
+    # -----------------------------------------------------------
     try:
         slide_texts, slide_tables = _extract_pptx_text_and_tables(pptx_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PPT 추출 실패: {e}")
-
-    # 2) AI로 카드 구조 변환 (표 데이터는 텍스트로 함께 전달, AI가 표 참조 자리에 마커 삽입)
+    # -----------------------------------------------------------
+    # AI로 카드 구조 변환 (표 데이터는 텍스트로 함께 전달, AI가 표 참조 자리에 마커 삽입)
+    # -----------------------------------------------------------
     joined_text = "\n\n".join([f"=== Slide {i+1} ===\n{t}" for i, t in enumerate(slide_texts) if t.strip()])
     if not joined_text.strip():
         return {"cards": []}
@@ -3661,8 +3580,9 @@ def admin_notes_from_pptx(payload: dict, _admin: int = Depends(get_admin_session
         result = json.loads(resp.choices[0].message.content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI 변환 실패: {e}")
-
-    # 3) 표가 있는 슬라이드 → 자동 저장 + 첫 번째 섹션에 table_ref 부착
+    # -----------------------------------------------------------
+    # 표가 있는 슬라이드 → 자동 저장 + 첫 번째 섹션에 table_ref 부착
+    # -----------------------------------------------------------
     cards = result.get("cards", []) or []
     saved_tables = []
     for slide_idx, tables in enumerate(slide_tables):
@@ -3692,14 +3612,9 @@ def admin_notes_from_pptx(payload: dict, _admin: int = Depends(get_admin_session
     return {"cards": cards, "saved_tables": saved_tables}
 
 
+# 프로젝트 키로 가장 최근 노트 카드를 찾아 반환.
 @app.get("/notes/by_project")
 def notes_by_project(project_key: str = ""):
-    """프로젝트 키로 가장 최근 노트 카드를 찾아 반환.
-    매칭 우선순위:
-      1) card.get("project_key") == project_key
-      2) card.get("title") 가 projects.json 의 label/aliases 와 매칭
-    표는 _load_note_table 으로 inline 포함.
-    """
     project_key = (project_key or "").strip()
     if not project_key:
         raise HTTPException(status_code=400, detail="project_key 필요")
@@ -3780,9 +3695,10 @@ def notes_by_project(project_key: str = ""):
 
 # ─── 노트 엑셀(표) 마커 전/후처리 (ai_parse 용) ───
 
-
+# ============================================================
+#  노트 글 정리 — 표 · 사진 끼워 넣기 · 납기 글자 읽기
+# ============================================================
 def _inject_tables_into_cards(cards, tables):
-    """정리된 카드 구조에 type:'table' item 을 앵커 기준으로 주입."""
     if not tables or not isinstance(cards, list):
         return cards
 
@@ -3854,12 +3770,8 @@ _PHOTO_MARKER_RE = _re_photo.compile(
     _re_photo.IGNORECASE,
 )
 
+# 텍스트에서 사진 마커 추출 (next_anchor 기반 위치 보존).
 def _extract_photo_markers(text: str):
-    """텍스트에서 사진 마커 추출 (next_anchor 기반 위치 보존).
-    반환: (clean_text, [{filename, photo_ref, anchor, next_anchor, placeholder}])
-    anchor      = 마커 직전의 비어있지 않은 줄
-    next_anchor = 마커 다음에 나오는 비어있지 않은 줄 (마커가 아닌 줄)
-    """
     lines = text.split("\n")
 
     marker_positions = []
@@ -3909,124 +3821,30 @@ def _extract_photo_markers(text: str):
     return ("\n".join(out_lines), photos)
 
 
-_DONE_KEYWORDS = ("완료", "완료됨", "출고완료", "승인완료", "끝")
-_PENDING_KEYWORDS = ("예정", "예상", "타겟", "목표", "진행중", "준비중", "까지", "예약")
-
-
-def _split_for_date_scope(txt: str):
-    """문장을 ',', '/', '|', '·' 기준으로 조각내서 (시작idx, 끝idx, 조각텍스트) 리스트 반환."""
-    chunks = []
-    start = 0
-    for m in re.finditer(r"[,/|·]", txt):
-        end = m.start()
-        chunks.append((start, end, txt[start:end]))
-        start = m.end()
-    chunks.append((start, len(txt), txt[start:]))
-    return chunks
-
-
-def _is_done_scope(txt: str, idx: int) -> bool:
-    """idx 위치의 날짜가 '완료된 날짜'인지 판정.
-    한국어 어순: 날짜 → 키워드 (예: "5/29 승인완료", "W25 출하예정")
-    규칙:
-      1) idx 뒤에서 가장 가까이 나타나는 키워드(완료/예정)를 찾는다.
-         - 완료 키워드면: 완료 (True, 날짜 버림)
-         - 예정 키워드면: 살림 (False)
-      2) idx 뒤에 키워드 없으면 idx 앞 12자 윈도우에 완료 키워드 있으면 완료.
-      3) 그 외엔 살림.
-    """
-    if not txt:
-        return False
-
-    # 1) idx 뒤에서 가장 가까운 완료/예정 키워드 위치
-    nearest_pos = -1
-    nearest_kind = None  # 'done' or 'pending'
-    for k in _DONE_KEYWORDS:
-        i = txt.find(k, idx)
-        if i != -1 and (nearest_pos == -1 or i < nearest_pos):
-            nearest_pos = i
-            nearest_kind = "done"
-    for k in _PENDING_KEYWORDS:
-        i = txt.find(k, idx)
-        if i != -1 and (nearest_pos == -1 or i < nearest_pos):
-            nearest_pos = i
-            nearest_kind = "pending"
-
-    # 1-b) done 키워드 뒤에 곧바로 "예정" 이 나오면 pending 으로 재분류
-    # 예: "완료 예정", "완료예정", "출하예정 완료" 등
-    if nearest_kind == "done" and nearest_pos != -1:
-        # done 키워드 뒤 6자 이내에 예정/예상 이 있는지
-        window_end = min(len(txt), nearest_pos + 12)
-        after = txt[nearest_pos:window_end]
-        for pk in _PENDING_KEYWORDS:
-            if pk in after:
-                nearest_kind = "pending"
-                break
-
-    # 1-b) done 키워드 뒤에 곧바로 "예정" 이 나오면 pending 으로 재분류
-    # 예: "완료 예정", "완료예정", "출하예정 완료" 등
-    if nearest_kind == "done" and nearest_pos != -1:
-        # done 키워드 뒤 6자 이내에 예정/예상 이 있는지
-        window_end = min(len(txt), nearest_pos + 12)
-        after = txt[nearest_pos:window_end]
-        for pk in _PENDING_KEYWORDS:
-            if pk in after:
-                nearest_kind = "pending"
-                break
-
-    # 같은 줄에서 너무 멀면 무시 (다른 절일 가능성)
-    if nearest_pos != -1 and (nearest_pos - idx) <= 25:
-        return nearest_kind == "done"
-
-    # 2) idx 앞 12자 윈도우에 완료 키워드만 있으면 완료
-    lo = max(0, idx - 12)
-    front = txt[lo:idx]
-    if any(k in front for k in _DONE_KEYWORDS) and not any(k in front for k in _PENDING_KEYWORDS):
-        return True
-
-    return False
-
-
+# 본문 텍스트에서 due_date(YYYY-MM-DD) 추출.
 def _extract_due_date_from_text(txt: str) -> str:
-    """본문 텍스트에서 due_date(YYYY-MM-DD) 추출. 못 찾으면 빈 문자열.
-    
-    화살표 인식형 파서 (마커 없이 자동 판단):
-      1) 텍스트를 화살표(-->, ->, →, ➜, ⇒, ~>)로 split → 단계별로 나눔.
-      2) 마지막 세그먼트만 대상으로 날짜 후보 수집 (앞 단계는 완료로 간주).
-      3) 마지막 세그먼트에 날짜 없으면 전체 텍스트에서 fallback.
-      4) 후보 중 최적 선택:
-         - 오늘 이후(포함) 날짜 있으면 → 그중 가장 가까운 미래
-         - 없으면 → 지난 날짜 중 가장 최근 (지연 D+n 표시용)
-    
-    지원 패턴:
-      - [YYYY-MM-DD] / YYYY-MM-DD
-      - YY.M.D / YY-M-D
-      - M월말 (해당 월 마지막 평일)
-      - M월 D일
-      - (M/D), M/D
-      - (M/D-M/D), (M/D~M/D)  → 종료일 채택
-      - W23~W53 (해당 ISO 주차 금요일)
-    """
     from datetime import date, timedelta
     import calendar
     if not txt:
         return ""
     YEAR = 2026
     today = date.today()
-
-    # ─── Step 1: 화살표로 split ───
+    # -----------------------------------------------------------
+    # ─ Step 1: 화살표로 split
+    # -----------------------------------------------------------
     arrow_pattern = r"-->|->|→|➜|⇒|~>|»"
     segments = re.split(arrow_pattern, txt)
     last_seg = segments[-1] if segments else txt
 
+    # 문자열 s 에서 모든 날짜 후보를 date 리스트로 반환.
     def _collect_dates(s: str):
-        """문자열 s 에서 모든 날짜 후보를 date 리스트로 반환. done_scope 검사 없음(마커 없이 자동판단)."""
         out = []
 
         # 범위 (M/D-M/D) / (M/D~M/D) → 종료일
         for m in re.finditer(r"\(?\s*(\d{1,2})/(\d{1,2})\s*[-~]\s*(\d{1,2})/(\d{1,2})\s*\)?", s):
             try:
-                mo = int(m.group(3)); dd = int(m.group(4))
+                mo = int(m.group(3))
+                dd = int(m.group(4))
                 if 1 <= mo <= 12 and 1 <= dd <= 31:
                     out.append(date(YEAR, mo, dd))
             except Exception:
@@ -4068,7 +3886,8 @@ def _extract_due_date_from_text(txt: str) -> str:
         # (M/D) 또는 M/D  (분수 제외 — 경계 있을 때만)
         for m in re.finditer(r"(?:^|[\s\(\[~])(\d{1,2})/(\d{1,2})(?=[\s\)\]\,\.~]|$)", s):
             try:
-                mo = int(m.group(1)); dd = int(m.group(2))
+                mo = int(m.group(1))
+                dd = int(m.group(2))
                 if 1 <= mo <= 12 and 1 <= dd <= 31:
                     out.append(date(YEAR, mo, dd))
             except Exception:
@@ -4084,11 +3903,13 @@ def _extract_due_date_from_text(txt: str) -> str:
                 pass
 
         return out
-
-    # ─── Step 2: 마지막 세그먼트에서 먼저 시도 ───
+    # -----------------------------------------------------------
+    # ─ Step 2: 마지막 세그먼트에서 먼저 시도
+    # -----------------------------------------------------------
     candidates = _collect_dates(last_seg)
-
-    # ─── Step 3: 없으면 전체에서 fallback ───
+    # -----------------------------------------------------------
+    # ─ Step 3: 없으면 전체에서 fallback
+    # -----------------------------------------------------------
     if not candidates and len(segments) == 1:
         # split 안 됐으면 이미 전체 = last_seg, 중복 fallback 불필요
         pass
@@ -4097,8 +3918,9 @@ def _extract_due_date_from_text(txt: str) -> str:
 
     if not candidates:
         return ""
-
-    # ─── Step 4: 최적 선택 ───
+    # -----------------------------------------------------------
+    # ─ Step 4: 최적 선택
+    # -----------------------------------------------------------
     future = [d for d in candidates if d >= today]
     if future:
         return min(future).isoformat()  # 가장 임박한 미래
@@ -4106,15 +3928,8 @@ def _extract_due_date_from_text(txt: str) -> str:
     return max(candidates).isoformat()
 
 
+# AI 결과 아이템 후처리: 색상 태그, ※ 항목, 화살표 중복 제거.
 def _normalize_note_item(it: dict, section_title: str = "") -> dict:
-    """AI 결과 아이템 후처리: 색상 태그, ※ 항목, 화살표 중복 제거.
-    
-    ★ 2026-07-27~ 스키마 확장:
-      - item_id: md5(section_title + normalized_text)[:8] 자동 생성
-      - due_date_auto: 파서가 뽑은 자동값 (매번 재계산)
-      - due_date_override: 사용자 지정값 (있으면 유지)
-      - due_date: override or auto (앱 호환용 최종값)
-    """
     if not isinstance(it, dict):
         return it
 
@@ -4148,27 +3963,30 @@ def _normalize_note_item(it: dict, section_title: str = "") -> dict:
 
     # bullet/highlight 도 "→ → ..." 처럼 화살표 중복 시 1개로 축약
     txt = re.sub(r"^(→\s*){2,}", "→ ", txt)
-
-    # ─── item_id 생성/갱신 (section_title + normalized_text 기반) ───
+    # -----------------------------------------------------------
+    # ─ item_id 생성/갱신 (section_title + normalized_text 기반)
+    # -----------------------------------------------------------
     normalized = re.sub(r"\s+", " ", txt).strip()
     if normalized:
         new_id = hashlib.md5(
             f"{section_title}||{normalized}".encode("utf-8")
         ).hexdigest()[:8]
         it["item_id"] = new_id
-
-    # ─── due_date_auto 재계산 (매번, 텍스트는 원문 유지) ───
+    # -----------------------------------------------------------
+    # ─ due_date_auto 재계산 (매번, 텍스트는 원문 유지)
+    # -----------------------------------------------------------
     _, auto_iso = _extract_due_date(txt)
     # 사용자가 자동 날짜를 숨긴 경우(auto_due_hidden=True)는 재계산돼도 유지
-    _prev_auto = (it.get("due_date_auto") or "").strip()
     _new_auto = auto_iso or ""
     it["due_date_auto"] = _new_auto
-
-    # ─── due_date_override 처리 ───
+    # -----------------------------------------------------------
+    # ─ due_date_override 처리
+    # -----------------------------------------------------------
     override_raw = (it.get("due_date_override") or "").strip()
     override = override_raw if override_raw else ""
-
-    # ─── 최종 due_date = override or auto (앱 호환) ───
+    # -----------------------------------------------------------
+    # ─ 최종 due_date = override or auto (앱 호환)
+    # -----------------------------------------------------------
     effective = override or (auto_iso or "")
     if effective:
         it["due_date"] = effective
@@ -4190,8 +4008,8 @@ def _normalize_note_item(it: dict, section_title: str = "") -> dict:
     return it
 
 
+# parsed["cards"] 전체에 _normalize_note_item 적용 + 기타 특이사항 섹션 병합.
 def _normalize_note_cards(parsed: dict) -> dict:
-    """parsed["cards"] 전체에 _normalize_note_item 적용 + 기타 특이사항 섹션 병합."""
     if not isinstance(parsed, dict):
         return parsed
     cards = parsed.get("cards") or []
@@ -4199,8 +4017,9 @@ def _normalize_note_cards(parsed: dict) -> dict:
     for card in cards:
         if not isinstance(card, dict):
             continue
-
-        # 1) 각 섹션 아이템 정규화
+        # -----------------------------------------------------------
+        # 각 섹션 아이템 정규화
+        # -----------------------------------------------------------
         for sec in (card.get("sections") or []):
             if not isinstance(sec, dict):
                 continue
@@ -4211,8 +4030,9 @@ def _normalize_note_cards(parsed: dict) -> dict:
                 else:
                     new_items.append(it)
             sec["items"] = new_items
-
-        # 2) "기타 특이사항" 류 섹션은 직전 섹션에 흡수 후 삭제
+        # -----------------------------------------------------------
+        # "기타 특이사항" 류 섹션은 직전 섹션에 흡수 후 삭제
+        # -----------------------------------------------------------
         sections = card.get("sections") or []
         merged_sections = []
         for sec in sections:
@@ -4234,11 +4054,8 @@ def _normalize_note_cards(parsed: dict) -> dict:
     return parsed
 
 
+# 정리된 카드 구조에 type:'photo' item 을 주입.
 def _inject_photos_into_cards(cards, photos):
-    """정리된 카드 구조에 type:'photo' item 을 주입.
-    1순위: placeholder 텍스트 ('__PHOTO_PLACEHOLDER_N__') 가진 item 을 photo item 으로 직접 치환 → 원문 위치 보존
-    2순위(fallback): anchor 텍스트 매칭 (구버전 호환)
-    """
     if not photos or not isinstance(cards, list):
         return cards
 
@@ -4247,8 +4064,9 @@ def _inject_photos_into_cards(cards, photos):
         return re.sub(r"\s+", " ", v.lower())
 
     used = set()
-
-    # ── 1순위: placeholder 직접 치환 ──
+    # -----------------------------------------------------------
+    # 1순위: placeholder 직접 치환
+    # -----------------------------------------------------------
     for ph in photos:
         placeholder = ph.get("placeholder") or ""
         ref = ph.get("photo_ref")
@@ -4282,8 +4100,9 @@ def _inject_photos_into_cards(cards, photos):
 
         if replaced:
             continue
-
-        # ── 1.5순위: next_anchor 매칭 (마커 다음 줄 앞에 삽입) ──
+        # -----------------------------------------------------------
+        # 1.5순위: next_anchor 매칭 (마커 다음 줄 앞에 삽입)
+        # -----------------------------------------------------------
         next_anchor_n = _norm(ph.get("next_anchor"))
         if next_anchor_n:
             inserted_by_next = False
@@ -4331,8 +4150,9 @@ def _inject_photos_into_cards(cards, photos):
                             break
             if inserted_by_next:
                 continue
-
-        # ── 2순위(fallback): anchor 텍스트 매칭 ──
+        # -----------------------------------------------------------
+        # 2순위(fallback): anchor 텍스트 매칭
+        # -----------------------------------------------------------
         anchor_n = _norm(ph.get("anchor"))
         if anchor_n and anchor_n.startswith("__photo_placeholder_"):
             anchor_n = ""  # placeholder 자체는 anchor 로 쓰지 않음
@@ -4436,8 +4256,9 @@ def _inject_photos_into_cards(cards, photos):
                 "photo_ref": ref,
             })
             used.add(ref)
-
-    # ── 후처리: 사용되지 않은 placeholder item 제거 (AI 가 위치 보존 안 한 경우 대비) ──
+    # -----------------------------------------------------------
+    # 후처리: 사용되지 않은 placeholder item 제거 (AI 가 위치 보존 안 한 경우 대비)
+    # -----------------------------------------------------------
     placeholder_re = re.compile(r"\[PHOTO_KEEP_\d+\]")
     for card in cards:
         for sec in (card.get("sections") or []):
@@ -4449,10 +4270,12 @@ def _inject_photos_into_cards(cards, photos):
 
     return cards
 
-
+# ============================================================
+#  노트 저장 · AI 정리 · 알림 목록
+# ============================================================
+# 자유 형식 텍스트를 AI로 구조화 JSON으로 변환 (증분 병합 지원).
 @app.post("/admin/notes/ai_parse")
 def admin_notes_ai_parse(payload: dict, _admin: int = Depends(get_admin_session)):
-    """자유 형식 텍스트를 AI로 구조화 JSON으로 변환 (증분 병합 지원)."""
     text = (payload or {}).get("text", "").strip()
     division_id = (payload or {}).get("division_id", "").strip()
     if not text:
@@ -4488,9 +4311,9 @@ def admin_notes_ai_parse(payload: dict, _admin: int = Depends(get_admin_session)
         raise HTTPException(status_code=500, detail=f"AI 파싱 실패: {str(e)}")
 
 
+# 사업부별 노트 저장.
 @app.post("/admin/notes")
 def admin_save_note(payload: dict, _admin: int = Depends(get_admin_session)):
-    """사업부별 노트 저장."""
     division_id = (payload or {}).get("division_id", "").strip()
     report_date = (payload or {}).get("report_date", "").strip()
     raw_text = (payload or {}).get("raw_text", "").strip()
@@ -4502,9 +4325,6 @@ def admin_save_note(payload: dict, _admin: int = Depends(get_admin_session)):
         raise HTTPException(status_code=400, detail="cards는 배열이어야 합니다")
 
     # 저장 전 카드/아이템 정규화
-    # - text 안의 due_date 패턴 추출
-    # - item 구조 표준화
-    # - 향후 AI 정리/수기 저장/직접 API 호출 모두 동일 규칙 적용
     try:
         normalized = _normalize_note_cards({"cards": cards}) or {}
         cards = normalized.get("cards") or cards
@@ -4556,10 +4376,9 @@ def admin_save_note(payload: dict, _admin: int = Depends(get_admin_session)):
     return {"ok": True, "division_id": division_id, "card_count": len(merged_cards)}
 
 
-# ─── 알림 히스토리 (앱 종 아이콘용) ───
+# 최근 알람 목록. 최신순 ← 앱 notifications_service.dart list()
 @app.get("/notifications")
 def get_notifications(limit: int = 100, unread_only: bool = False):
-    """최근 알람 목록. 최신순."""
     hist = _load_fcm_history()
     if unread_only:
         hist = [h for h in hist if not h.get("read")]
@@ -4569,9 +4388,9 @@ def get_notifications(limit: int = 100, unread_only: bool = False):
     return {"items": hist, "unread_count": unread_count}
 
 
+# id 지정 시 해당 항목만, 없으면 전체 읽음 처리.
 @app.post("/notifications/mark_read")
 def mark_notifications_read(payload: dict = None):
-    """id 지정 시 해당 항목만, 없으면 전체 읽음 처리."""
     payload = payload or {}
     ids = payload.get("ids")
     hist = _load_fcm_history()
@@ -4585,9 +4404,10 @@ def mark_notifications_read(payload: dict = None):
     return {"ok": True, "changed": changed}
 
 
+# 앱이 호출하는 공개 API. division_id 지정 시 해당 사업부만 반환.
+# ← admin v2 _loadNotesForSchedule() · _reloadNotesCache() · static · note_loader.js
 @app.get("/notes")
 def get_notes(division_id: str = ""):
-    """앱이 호출하는 공개 API. division_id 지정 시 해당 사업부만 반환."""
     data = _load_notes()
     notes = data.get("notes", {})
     if division_id:
@@ -4597,19 +4417,11 @@ def get_notes(division_id: str = ""):
         return {"division_id": division_id, **item}
     return {"notes": notes}
 
-
-# ─────────────────────────────────────────────
-# item 단위 due_date override (사용자 수동 지정)
-#
-# 규칙:
-#   - due_date_auto: 파서 자동값 (매번 재계산)
-#   - due_date_override: 사용자가 지정한 값 (있으면 유지)
-#   - due_date: override or auto (최종 표시값)
-#
-# POST → override 지정, DELETE → override 제거 (자동값 복귀)
-# ─────────────────────────────────────────────
+# ============================================================
+#  노트 항목 납기 직접 지정
+# ============================================================
+# (item_ref, card_ref, section_ref) 반환.
 def _find_item_by_id(notes_data: dict, division_id: str, card_title: str, item_id: str):
-    """(item_ref, card_ref, section_ref) 반환. 못 찾으면 (None, None, None)."""
     div = (notes_data.get("notes") or {}).get(division_id)
     if not isinstance(div, dict):
         return None, None, None
@@ -4627,8 +4439,8 @@ def _find_item_by_id(notes_data: dict, division_id: str, card_title: str, item_i
     return None, None, None
 
 
+# it 안의 override/auto 를 보고 최종 due_date 필드를 갱신.
 def _apply_effective_due_date(it: dict) -> None:
-    """it 안의 override/auto 를 보고 최종 due_date 필드를 갱신."""
     override = (it.get("due_date_override") or "").strip()
     auto_raw = (it.get("due_date_auto") or "").strip()
     # auto_due_hidden 이 True 면 자동값을 무시
@@ -4643,16 +4455,12 @@ def _apply_effective_due_date(it: dict) -> None:
         it.pop("due_date_override", None)
 
 
+# 특정 item 의 due_date_override 지정 ← admin v2 outsideClick()
 @app.post("/admin/notes/item/due_override")
 def admin_notes_item_due_override(
     payload: dict,
     _admin: int = Depends(get_admin_session),
 ):
-    """특정 item 의 due_date_override 지정.
-    
-    Request:
-      { division_id, card_title, item_id, due_date: "YYYY-MM-DD" }
-    """
     from datetime import date as _date
 
     division_id = (payload or {}).get("division_id", "").strip()
@@ -4664,7 +4472,7 @@ def admin_notes_item_due_override(
         raise HTTPException(status_code=400, detail="division_id, card_title, item_id 필수")
     if not due_date_raw:
         raise HTTPException(status_code=400, detail="due_date 필수 (지우려면 DELETE 사용)")
-    
+
     # 형식 검증 (YYYY-MM-DD)
     try:
         parsed = _date.fromisoformat(due_date_raw)
@@ -4704,16 +4512,12 @@ def admin_notes_item_due_override(
     }
 
 
+# item 의 due_date_override 제거 → 자동값(due_date_auto) 복귀 ← admin v2 outsideClick()
 @app.delete("/admin/notes/item/due_override")
 def admin_notes_item_due_override_reset(
     payload: dict,
     _admin: int = Depends(get_admin_session),
 ):
-    """item 의 due_date_override 제거 → 자동값(due_date_auto) 복귀.
-    
-    Request:
-      { division_id, card_title, item_id }
-    """
     division_id = (payload or {}).get("division_id", "").strip()
     card_title = (payload or {}).get("card_title", "").strip()
     item_id = (payload or {}).get("item_id", "").strip()
@@ -4753,16 +4557,12 @@ def admin_notes_item_due_override_reset(
     }
 
 
+# 특정 item 의 자동 파싱 날짜를 숨김 처리 ← admin v2 outsideClick()
 @app.post("/admin/notes/item/hide_auto_due")
 def admin_notes_item_hide_auto_due(
     payload: dict,
     _admin: int = Depends(get_admin_session),
 ):
-    """특정 item 의 자동 파싱 날짜를 숨김 처리. 수동값이 있으면 그것도 함께 제거.
-    
-    Request:
-      { division_id, card_title, item_id }
-    """
     division_id = (payload or {}).get("division_id", "").strip()
     card_title = (payload or {}).get("card_title", "").strip()
     item_id = (payload or {}).get("item_id", "").strip()
@@ -4804,16 +4604,12 @@ def admin_notes_item_hide_auto_due(
     }
 
 
+# item 의 auto_due_hidden 해제 → 자동값(due_date_auto) 복원 ← admin v2 outsideClick()
 @app.delete("/admin/notes/item/hide_auto_due")
 def admin_notes_item_hide_auto_due_reset(
     payload: dict,
     _admin: int = Depends(get_admin_session),
 ):
-    """item 의 auto_due_hidden 해제 → 자동값(due_date_auto) 복원.
-    
-    Request:
-      { division_id, card_title, item_id }
-    """
     division_id = (payload or {}).get("division_id", "").strip()
     card_title = (payload or {}).get("card_title", "").strip()
     item_id = (payload or {}).get("item_id", "").strip()
@@ -4852,10 +4648,12 @@ def admin_notes_item_hide_auto_due_reset(
         "auto_due_hidden": False,
     }
 
-
+# ============================================================
+#  노트 표 · 사진 올리기 · 지우기
+# ============================================================
+# 노트 삭제.
 @app.delete("/admin/notes/{division_id}")
 def admin_delete_note(division_id: str, _admin: int = Depends(get_admin_session)):
-    """노트 삭제."""
     data = _load_notes()
     if division_id in data.get("notes", {}):
         del data["notes"][division_id]
@@ -4866,10 +4664,9 @@ def admin_delete_note(division_id: str, _admin: int = Depends(get_admin_session)
 
 # ─── 노트 표/사진 첨부 API ───
 
-# ─── 노트 표/사진 첨부 API ───
+# 표 생성/수정. payload = {division_id, table_ref?, table: {title, headers, rows}}
 @app.post("/admin/notes/table")
 def admin_save_note_table(payload: dict, _admin: int = Depends(get_admin_session)):
-    """표 생성/수정. payload = {division_id, table_ref?, table: {title, headers, rows}}"""
     division_id = (payload or {}).get("division_id", "").strip()
     table = (payload or {}).get("table")
     existing_ref = (payload or {}).get("table_ref", "").strip()
@@ -4891,9 +4688,9 @@ def admin_save_note_table(payload: dict, _admin: int = Depends(get_admin_session
     return {"table_ref": table_ref, "updated": False}
 
 
+# 표 JSON 조회 (모바일/관리자 공용)
 @app.get("/notes/table/{division_id}/{asset_id}")
 def get_note_table(division_id: str, asset_id: str):
-    """표 JSON 조회 (모바일/관리자 공용)"""
     table_ref = f"{division_id}/{asset_id}"
     data = _load_note_table(table_ref)
     if data is None:
@@ -4901,6 +4698,7 @@ def get_note_table(division_id: str, asset_id: str):
     return {"table_ref": table_ref, "table": data}
 
 
+# 노트에 붙인 표 하나 지우기 (잠김).
 @app.delete("/admin/notes/table/{division_id}/{asset_id}")
 def admin_delete_note_table(division_id: str, asset_id: str, _admin: int = Depends(get_admin_session)):
     table_ref = f"{division_id}/{asset_id}"
@@ -4910,13 +4708,13 @@ def admin_delete_note_table(division_id: str, asset_id: str, _admin: int = Depen
     return {"deleted": True, "table_ref": table_ref}
 
 
+# 사진 업로드 → photo_ref(예: 'semiconductor/2026-06-11_abcd1234.jpg') 반환 ← static · photo_drop.js
 @app.post("/admin/notes/photo")
 async def admin_upload_note_photo(
     division_id: str = Form(...),
     file: UploadFile = File(...),
     _admin: int = Depends(get_admin_session),
 ):
-    """사진 업로드 → photo_ref(예: 'semiconductor/2026-06-11_abcd1234.jpg') 반환"""
     division_id = division_id.strip()
     if not division_id:
         raise HTTPException(status_code=400, detail="division_id 필수")
@@ -4939,20 +4737,16 @@ async def admin_upload_note_photo(
 
 # ─── 엑셀 업로드 (드래그&드롭) ───
 
-
+# ============================================================
+#  엑셀 → 노트 표 · 주차 계획표 읽기
+# ============================================================
 def _norm_label(t):
     import re as _re
     return _re.sub(r"[^0-9A-Za-z가-힣]", "", str(t or "")).upper()
 
 
+# 판가·재료비 같은 '금액'. 소수점을 살린다
 def _as_money(v, default=0):
-    """판가·재료비 같은 '금액'. 소수점을 살린다.
-
-    예전에는 int() 로 잘라서 판가 3150.4 가 3150 으로 저장됐다.
-    1,000대면 400달러가 사라진다. 소수 둘째 자리까지 반올림하고,
-    딱 떨어지면 int 로 돌려 기존 데이터(3150)의 표기가 3150.0 으로
-    바뀌지 않게 한다.
-    """
     if v is None or v == "":
         return default
     try:
@@ -4965,8 +4759,8 @@ def _as_money(v, default=0):
     return int(n) if n == int(n) else n
 
 
+# 수량 값을 정수로. 문자열/소수/None/콤마 어느 쪽이 와도 터지지 않는다
 def _as_int(v, default=0):
-    """수량 값을 정수로. 문자열/소수/None/콤마 어느 쪽이 와도 터지지 않는다."""
     if v is None or v == "":
         return default
     try:
@@ -4977,11 +4771,12 @@ def _as_int(v, default=0):
 
 # 엑셀의 '키스톤 (556B)' 처럼 이름 뒤 괄호에 품번이 붙은 표기.
 # 큐리는 모델명과 품번을 따로 관리하므로 갈라서 넣는다.
+# __import__ 로 부르는 까닭: 테스트가 이 부분만 떼어 따로 돌린다 (re 가 없는 곳에서)
 _PN_IN_LABEL = __import__("re").compile(r"^(.*?)\s*[(（]\s*([^()（）]{2,20})\s*[)）]\s*$")
 
 
+# '키스톤 (556B)' -> ('키스톤', '556B').
 def _split_pn(label):
-    """'키스톤 (556B)' -> ('키스톤', '556B'). 괄호가 없으면 (원문, '')."""
     t = str(label or "").strip()
     m = _PN_IN_LABEL.match(t)
     if not m:
@@ -4993,11 +4788,8 @@ def _split_pn(label):
     return name, pn
 
 
+# 보드에서 여러 모델을 한 줄로 묶어둔 행.
 def _board_group_rows(project_key: str) -> dict:
-    """보드에서 여러 모델을 한 줄로 묶어둔 행. {정규화한 행 이름: [모델 id]}
-
-    엑셀의 묶음 행('버스바/시트메탈류(11종)')을 어디에 넣을지 찾을 때 쓴다.
-    """
     out = {}
     try:
         spec = _load_board_spec(project_key) or {}
@@ -5014,12 +4806,14 @@ def _board_group_rows(project_key: str) -> dict:
                     out.setdefault(n, ids)
     return out
 
+# '구분 x 주차' 엑셀을 모델별 주차 계획 + 프로젝트 주차 합계에 반영.
 def _apply_plan_matrix(data, project_key, parsed):
-    """'구분 x 주차' 엑셀을 모델별 주차 계획 + 프로젝트 주차 합계에 반영.
-    같은 월/주차가 이미 있으면 이번 업로드 값으로 덮어쓴다(최신 우선)."""
     proj = data.setdefault("projects", {}).setdefault(project_key, {"models": []})
     models = proj.setdefault("models", [])
-
+    # -----------------------------------------------------------
+    # 1. 등록된 모델을 이름으로 찾을 수 있게 색인을 만든다
+    # -----------------------------------------------------------
+    # 한 모델을 세 가지로 부를 수 있다 — 모델명 · id · 파트넘버.
     idx = {}
     for m in models:
         for k in (m.get("name"), m.get("id"), m.get("part_number")):
@@ -5027,45 +4821,65 @@ def _apply_plan_matrix(data, project_key, parsed):
             if n:
                 idx.setdefault(n, m)
 
-    # 묶음 행('버스바/시트메탈류(11종)')은 모델로 만들지 않는다. 모델 목록에는
-    # 품번별로 다 남기고, 보드에서만 한 줄로 묶어 보는 게 담당자가 쓰는 방식이다.
-    # 그 행의 주차 계획은 묶인 모델 중 첫 번째에 얹는다 — 보드가 행 안을
-    # 더하므로 줄 합계는 맞는다. PO·출하는 이미 모델별로 있으니 건드리지 않는다.
+    # 묶음 행('버스바/시트메탈류(11종)')은 모델로 만들지 않는다
     agg_rows = _board_group_rows(project_key)
     matched, unmatched, created = [], [], []
     for row in (parsed.get("rows") or []):
         label = row.get("label")
         name, pn = _split_pn(label)
         key = _norm_label(label)
-        # '키스톤 (556B)' 는 이름으로도 품번으로도 찾아본다.
-        # 담당자가 품번만 모델명으로 넣어둔 경우가 있다 (큐리 556B).
-        target = idx.get(key) or (idx.get(_norm_label(pn)) if pn else None) \
-                 or (idx.get(_norm_label(name)) if name else None)
+        # '키스톤 (556B)' 는 이름으로도 품번으로도 찾아본다
+        target = idx.get(key)
+        if target is None and pn:
+            target = idx.get(_norm_label(pn))
+        if target is None and name:
+            target = idx.get(_norm_label(name))
         # 앞뒤가 겹치면 같은 모델로 본다. 단 묶음 행에는 쓰지 않는다 —
         # '버스바/시트메탈류(11종)' 이 기존 '버스바' 한 개에 붙어버려서
         # 1,740 이 그 모델로 들어가고 나머지 10개가 따로 남았다.
+        # ── 3. 그래도 못 찾았으면 '앞부분이 겹치는가' 로 한 번 더
+        #    글자가 4자 이상일 때만 한다. 짧으면 엉뚱한 모델에 붙는다.
+        #    묶음 줄에는 쓰지 않는다 — '버스바/시트메탈류(11종)' 이
+        #    기존 '버스바' 한 개에 붙어서 1,740 이 그 모델로 다 들어가고
+        #    나머지 10개가 따로 남은 적이 있다.
         if target is None and len(key) >= 4 and not row.get("is_aggregate"):
             for n, m in idx.items():
                 if n.startswith(key) or key.startswith(n):
                     target = m
                     break
+        # -----------------------------------------------------------
+        # 4. 묶음 줄은 보드 설정을 보고 첫 모델에 얹는다
+        # -----------------------------------------------------------
+        # 묶음 줄('버스바/시트메탈류(11종)')은 모델로 만들지 않는다
         if target is None and row.get("is_aggregate"):
-            # 보드에 같은 이름의 묶음 행이 있으면 거기 묶인 첫 모델에 얹는다
             ids = agg_rows.get(_norm_label(label)) or []
             for _id in ids:
                 cand = idx.get(_norm_label(_id))
                 if cand is not None:
                     target = cand
                     break
+
             if target is not None:
                 _wp = target.setdefault("weekly_plan", {})
                 for _mon, _weeks in (row.get("weeks") or {}).items():
                     _wp.setdefault(_mon, {}).update(_weeks)
                 matched.append(row.get("label"))
                 continue
+        # -----------------------------------------------------------
+        # 5. 끝까지 못 찾았으면 새 모델로 만들지 결정한다
+        # -----------------------------------------------------------
         if target is None:
-            has_week = any((row.get("weeks") or {}).values())
-            # 묶음 행은 그 밑에 개별 모델이 따로 있어서 모델로 만들면 이중 계산이다
+            # 이 줄에 주차 숫자가 하나라도 있는가
+            has_week = False
+            for _weeks in (row.get("weeks") or {}).values():
+                if _weeks:
+                    has_week = True
+                    break
+
+            # 만들지 않고 '못 찾았다'로 넘기는 두 경우
+            #   · 묶음 줄 — 그 밑에 개별 모델이 따로 있어서 또 만들면
+            #     같은 수량이 두 번 세어진다
+            #   · 숫자가 하나도 없는 줄 — 만들어 봐야 빈 모델이다
             if row.get("is_aggregate") or not has_week:
                 unmatched.append(row)
                 continue
@@ -5114,20 +4928,16 @@ def _apply_plan_matrix(data, project_key, parsed):
             target["remaining_total"] = _as_int(row.get("remaining"))
 
         # 이번 달 주차 계획/실적 합계. 누적값과는 다른 값이다.
-        _p = _a = 0
+        _p = 0        # 이번 달 주차 계획 합계
+        _a = 0        # 이번 달 주차 실적 합계
         if last_month:
             _b = wp.get(last_month) or {}
-            _p = sum(_as_int((v or {}).get("plan")) for v in _b.values())
-            _a = sum(_as_int((v or {}).get("actual")) for v in _b.values())
+            for v in _b.values():
+                cell = v or {}
+                _p += _as_int(cell.get("plan"))
+                _a += _as_int(cell.get("actual"))
 
-        # po_qty / shipped_qty 는 '지금까지 받은 주문 전체 / 지금까지 나간 전체'다.
-        #
-        # 예전에는 바로 위 _p / _a (이번 달 주차 합계)를 여기에 대입했다.
-        # 9월 매트릭스를 올리면 PO 3,427 / 출하 2,098 이 PO 240 / 출하 41 이 되고,
-        # 엑셀에는 그 달 주차만 있으니 누적값을 되살릴 방법이 없었다.
-        # (같은 버그가 put_weekly_plan 에는 이미 고쳐져 있었다)
-        #
-        # 우선순위: 시트의 누적 칸 > 기존 값 유지 > (신규 모델일 때만) 주차 합계
+        # po_qty / shipped_qty 는 '지금까지 받은 주문 전체 / 지금까지 나간 전체'다
         _po_x = _as_int(row.get("po_qty"))
         _sh_x = _as_int(row.get("shipped_qty"))
         if _po_x:
@@ -5141,10 +4951,9 @@ def _apply_plan_matrix(data, project_key, parsed):
 
         if last_month:
             # due_text 는 담당자가 직접 적는 납기 칸이다 (예: '8월 24일').
-            # 여기서 '2026-09 주차계획 · 잔여 N개' 로 덮어쓰면 입력해 둔 납기가
-            # 사라지고, _parse_due_text 가 날짜를 못 읽어 마감 추적에서도 빠진다.
-            # 비어 있을 때만 채운다.
-            if (_p or _a) and not str(target.get("due_text") or "").strip():
+            has_numbers = bool(_p or _a)
+            due_empty = not str(target.get("due_text") or "").strip()
+            if has_numbers and due_empty:
                 target["due_text"] = f"{last_month} 주차계획 · 잔여 {_p - _a}개"
             try:
                 target["weekly_progress"] = _ensure_mass_progress(wp, last_month)
@@ -5152,28 +4961,47 @@ def _apply_plan_matrix(data, project_key, parsed):
                 pass
         matched.append({"label": row.get("label"),
                         "model": target.get("name") or target.get("id")})
-
-    # ── 프로젝트 주차 합계 (양산/개발) ──
-    #
-    # 시트에는 개별 모델 행과 그것을 요약한 집계 행('양산 19종', '개발 22종')이
-    # 같이 들어 있다. 예전에는 둘을 한꺼번에 더해서 그룹 PO·출하·주차 계획이
-    # 정확히 두 배가 됐다. 집계 행은 개별 행을 이미 합한 값이므로 제외한다.
-    #
-    # 단, 하바플레이트 개발처럼 개별 모델 없이 총 수량만 적는 방식도 있다.
-    # 그 경우 집계 행이 유일한 데이터이므로 그대로 쓴다.
+    # -----------------------------------------------------------
+    # 프로젝트 주차 합계 (양산/개발)
+    # -----------------------------------------------------------
+    # 시트에는 개별 모델 행과 그것을 요약한 집계 행('양산 19종', '개발 22종')이 같이 들어 있다
     ws_out = proj.setdefault("weekly_summary", {})
     for grp in ("양산", "개발"):
-        rows_g = [r for r in (parsed.get("rows") or [])
-                  if ("개발" in str(r.get("label") or "")) == (grp == "개발")]
+        # -----------------------------------------------------------
+        # 1. 이 구분(양산/개발)에 속한 줄만 고른다
+        # -----------------------------------------------------------
+        #    줄 이름에 '개발'이 들어 있으면 개발, 아니면 양산으로 본다.
+        want_dev = (grp == "개발")
+        rows_g = []
+        for r in (parsed.get("rows") or []):
+            is_dev = "개발" in str(r.get("label") or "")
+            if is_dev == want_dev:
+                rows_g.append(r)
         if not rows_g:
             continue
-        detail = [r for r in rows_g if not r.get("is_aggregate")]
-        src = detail or rows_g
+        # -----------------------------------------------------------
+        # 2. 개별 모델 줄만 추린다
+        # -----------------------------------------------------------
+        #    시트에는 개별 줄과 그걸 요약한 묶음 줄('양산 19종')이 같이
+        #    들어 있다. 둘을 다 더하면 정확히 두 배가 된다.
+        detail = []
+        for r in rows_g:
+            if not r.get("is_aggregate"):
+                detail.append(r)
 
+        # 개별 줄이 하나도 없으면 묶음 줄이 유일한 자료다 (하바 개발이 그렇다)
+        src = detail or rows_g
+        # -----------------------------------------------------------
+        # 3. 구분 단위 합계
+        # -----------------------------------------------------------
         g = ws_out.setdefault(grp, {})
-        g["po_qty"] = sum(_as_int(r.get("po_qty")) for r in src)
-        g["actual_total"] = sum(_as_int(r.get("shipped_qty")) for r in src)
-        g["remaining"] = sum(_as_int(r.get("remaining")) for r in src)
+        g["po_qty"] = 0
+        g["actual_total"] = 0
+        g["remaining"] = 0
+        for r in src:
+            g["po_qty"] += _as_int(r.get("po_qty"))
+            g["actual_total"] += _as_int(r.get("shipped_qty"))
+            g["remaining"] += _as_int(r.get("remaining"))
         weeks = g.setdefault("weeks", {})
         agg = {}
         for r in src:
@@ -5184,6 +5012,8 @@ def _apply_plan_matrix(data, project_key, parsed):
                     tgt["actual"] += _as_int((cell or {}).get("actual"))
         weeks.update(agg)          # 이번 업로드에 있는 주차만 갱신
 
+    # 양산을 앞에, 개발을 뒤에 (같은 구분 안에서는 원래 순서 그대로)
+
     models.sort(key=lambda m: 0 if m.get("group") == "양산" else 1)
     return {"matched": matched,
             "created": created,
@@ -5191,8 +5021,8 @@ def _apply_plan_matrix(data, project_key, parsed):
             "months": parsed.get("months") or []}
 
 
+# 엑셀에서 빨간(유채색) 굵은 테두리로 표시한 주차 라벨을 찾아 ['W35'] 형태로 반환.
 def _detect_marked_weeks(ws):
-    """엑셀에서 빨간(유채색) 굵은 테두리로 표시한 주차 라벨을 찾아 ['W35'] 형태로 반환."""
     import re as _re
     marked_cols = set()
     for row in ws.iter_rows():
@@ -5249,6 +5079,7 @@ def _detect_marked_weeks(ws):
     return out
 
 
+# 엑셀 첫 시트를 그림(PNG)으로 그려 미리보기용 data URL 로 만든다
 def _excel_sheet_to_preview_data_url(ws):
     from io import BytesIO
     import base64
@@ -5388,7 +5219,7 @@ def _excel_sheet_to_preview_data_url(ws):
     for r in range(min_row, max_row + 1):
         for c in range(min_col, max_col + 1):
             cell_text[(r, c)] = format_value(ws.cell(r, c))
-    
+
     col_widths = [0] * (max_col + 2)
     for c in range(min_col, max_col + 1):
         widest = 72
@@ -5503,12 +5334,11 @@ def _excel_sheet_to_preview_data_url(ws):
                     w, _ = text_size(line, use_font)
                     tx = x1 + max(4, (cell_w - w) // 2)
                     draw.text((tx, ty + li * line_h), line, fill=fc, font=use_font)
-
-    # ── 엑셀에서 강조한 테두리(빨간 박스 등) 재현 ──
-    # 셀별 선을 그대로 그리면 병합 셀 때문에 한 변이 빠져 박스가 끊긴다.
-    # 그래서 '강조 테두리가 걸린 셀 덩어리'를 찾아 그 덩어리의 바깥선을 그린다.
+    # -----------------------------------------------------------
+    # 엑셀에서 강조한 테두리(빨간 박스 등) 재현
+    # -----------------------------------------------------------
+    # (색, 두께) — 유채색이거나 굵은 선일 때만.
     def _side_accent(side):
-        """(색, 두께) — 유채색이거나 굵은 선일 때만. 평범한 검정 얇은 선은 None."""
         if side is None or not getattr(side, "style", None):
             return None
         col = getattr(side, "color", None)
@@ -5635,13 +5465,13 @@ def _excel_sheet_to_preview_data_url(ws):
     return "data:image/png;base64," + base64.b64encode(bio.getvalue()).decode("ascii")
 
 
+# 엑셀(.xlsx/.xlsm) 업로드 → 첫 시트를 PNG 이미지로 변환 → 사진처럼 저장 → photo_ref 반환 ← static · excel_drop.js
 @app.post("/admin/notes/excel")
 async def admin_upload_note_excel(
     division_id: str = Form(...),
     file: UploadFile = File(...),
     _admin: int = Depends(get_admin_session),
 ):
-    """엑셀(.xlsx/.xlsm) 업로드 → 첫 시트를 PNG 이미지로 변환 → 사진처럼 저장 → photo_ref 반환."""
     division_id = (division_id or "").strip()
     if not division_id:
         raise HTTPException(status_code=400, detail="division_id 필수")
@@ -5659,7 +5489,7 @@ async def admin_upload_note_excel(
         import openpyxl
         from io import BytesIO
         import base64
-        wb = openpyxl.load_workbook(BytesIO(raw), data_only=True)
+        wb = openpyxl.load_workbook(BytesIO(raw), data_only=True, keep_links=False)
         ws = wb.worksheets[0]
         data_url = _excel_sheet_to_preview_data_url(ws)
     except HTTPException:
@@ -5686,6 +5516,7 @@ async def admin_upload_note_excel(
         "url": f"/note_photos/{photo_ref}",
     }
 
+# 노트에 붙인 사진 하나 지우기 (잠김).
 @app.delete("/admin/notes/photo/{division_id}/{filename}")
 def admin_delete_note_photo(division_id: str, filename: str, _admin: int = Depends(get_admin_session)):
     photo_ref = f"{division_id}/{filename}"
@@ -5694,23 +5525,44 @@ def admin_delete_note_photo(division_id: str, filename: str, _admin: int = Depen
         raise HTTPException(status_code=404, detail="사진이 없음")
     return {"deleted": True, "photo_ref": photo_ref}
 
-
+# ============================================================
+#  사업부 · 프로젝트 목록
+# ============================================================
+# 공개 사업부 목록 + 각 사업부의 visible 프로젝트 리스트 ← admin v2 fillDivisions() · 앱 divisions_service.dart
 @app.get("/divisions")
 def list_divisions():
-    """공개 사업부 목록 + 각 사업부의 visible 프로젝트 리스트.
-    매핑 관리 대시보드 / 모바일 사업부 화면에서 사용."""
-    divs = _cl.get_divisions(visible_only=True)
-    
+    _hidden = _dvis.hidden_set()
+    divs = [d for d in _cl.get_divisions(visible_only=True)
+            if str(d.get("id") or "").lower() not in _hidden]
+
     # 모델/현황/주차별 계획 데이터 로드 (프로젝트별 데이터 유무)
     models_data = _load_models()
     models_by_project = {}
+    # 고객사 묶음 — 양식 '국내/해외' 칸으로 들어온 값
+    _cgroup = {k: v.get("customer_group") for k, v in
+               (models_data.get("projects") or {}).items()
+               if isinstance(v, dict) and v.get("customer_group")}
+    # 프로젝트의 종류 — 모델 '구분 1'(dev_type) 중 가장 많은 것 (아리스타 묶음)
+    _ptype = {}
+    for _k, _v in (models_data.get("projects") or {}).items():
+        _c = {}
+        for _m in (_v.get("models") or []) if isinstance(_v, dict) else []:
+            _t = str((_m or {}).get("dev_type") or "").strip() if isinstance(_m, dict) else ""
+            if _t:
+                _c[_t] = _c.get(_t, 0) + 1
+        if _c:
+            # 가장 많이 쓴 구분 (개수가 같으면 이름순으로 앞선 것)
+            def _by_count_then_name(kv):
+                type_name, count = kv
+                return (-count, type_name)
+            _ptype[_k] = sorted(_c.items(), key=_by_count_then_name)[0][0]
     for proj_key, proj_data in models_data.get("projects", {}).items():
         has_models = len(proj_data.get("models", [])) > 0
         has_note = bool((proj_data.get("status_note") or "").strip())
         has_plan = bool(proj_data.get("weekly_plan", {}).get("photo_ref"))
         if has_models or has_note or has_plan:
             models_by_project[proj_key] = len(proj_data.get("models", []))
-    
+
     result = []
     for d in divs:
         div_id = d.get("id")
@@ -5720,18 +5572,40 @@ def list_divisions():
         except Exception:
             ps = []
         ps_sorted = sorted(ps, key=lambda x: x.get("order", 999))
+        # 같은 사업부 고객사 이름 전부 — 자동차는 이름 첫 낱말로 묶는다 (brand_map)
+        _peers = [p.get("label") or "" for p in ps_sorted]
+        # 고객사마다 묶음 — 묶지 않는 사업부면 None 이라 빠진다
+        _groups_seen = []
+        for p in ps_sorted:
+            _grp = _dcol.customer_group(div_id, p.get("id"), _cgroup.get(p.get("id")),
+                                        p.get("label"), _ptype.get(p.get("id")), _peers)
+            if _grp:
+                _groups_seen.append(_grp)
         result.append({
             "id": div_id,
             "label": d.get("label"),
             "order": d.get("order", 999),
             "badge_short_label": d.get("badge_short_label"),
+            # 앱이 들고 있던 글자를 서버로
+            #   owner_label  '고객사 22개' 의 '고객사' (division_columns FORMS)
+            #   group_title  묶은 목록 위 작은 제목 ('국내 / 해외' · '고객사별')
+            "owner_label": _dcol.columns_for(div_id)["owner_label"],
+            "group_title": _dcol.group_title(div_id),
+            # 고객사 묶음 —
+            # 앱이 국내 / 해외로 나눠 그린다. 묶지 않는 사업부는 빈 목록.
+            #    엑셀(양식 '국내/해외' 칸)로 들어온 값이 먼저다.
+            "customer_groups": _dcol.customer_group_order(div_id, _groups_seen),
             "projects": [
                 {
                     "id": p.get("id"),
-                    "label": p.get("label"),
+                    # 화면 이름만 다듬는다 ('KMW HÀ nam' → 'KMW HA NAM'). 저장은 원문 그대로.
+                    "label": _dcol.clean_label(p.get("label")),
                     "order": p.get("order", 999),
                     "has_models": p.get("id") in models_by_project,
                     "model_count": models_by_project.get(p.get("id"), 0),
+                    "group": _dcol.customer_group(div_id, p.get("id"),
+                                                  _cgroup.get(p.get("id")), p.get("label"),
+                                                  _ptype.get(p.get("id")), _peers),
                 }
                 for p in ps_sorted
             ],
@@ -5740,11 +5614,9 @@ def list_divisions():
     return {"divisions": result}
 
 
+# 각 사업부의 최신 업데이트 타임스탬프 반환.
 @app.get("/divisions/updates")
 def get_divisions_updates():
-    """각 사업부의 최신 업데이트 타임스탬프 반환.
-    카드의 project_key 가 없을 수 있으므로 텍스트 기반 분류기를 사용한다.
-    """
     try:
         with open(LATEST_FILE, "r", encoding="utf-8") as f:
             reports = json.load(f)
@@ -5794,19 +5666,19 @@ def get_divisions_updates():
 
     return {"divisions": result}
 
+# 프로젝트 버튼 목록 + 모델 데이터 유무 ← admin v2 _npLoadProjectButtons() · loadProjectOptions() · loadModels() 외
 @app.get("/projects")
 def list_projects():
-    """프로젝트 버튼 목록 + 모델 데이터 유무"""
     import config_loader
     config_projects = config_loader.get_projects(visible_only=False)
-    
+
     models_data = _load_models()
     models_by_project = {}
     for proj_key, proj_data in models_data.get("projects", {}).items():
         models_list = proj_data.get("models", [])
         if models_list:
             models_by_project[proj_key] = len(models_list)
-    
+
     projects = []
     for p in config_projects:
         proj_key = p.get("id") or p.get("key")
@@ -5819,7 +5691,7 @@ def list_projects():
             "model_count": models_by_project.get(proj_key, 0),
             "division_id": p.get("division_id", "semiconductor"),
         })
-    
+
     for proj_key, model_count in models_by_project.items():
         if not any(p["key"] == proj_key for p in projects):
             projects.append({
@@ -5829,22 +5701,16 @@ def list_projects():
                 "report_date": None,
                 "has_models": True,
                 "model_count": model_count,
-                "division_id": "ess" if proj_key in ["sdi", "fluence", "epc_power"] else "semiconductor",
+                "division_id": "ess" if proj_key.startswith("ess_") else "semiconductor",
             })
-    
+
+# ============================================================
+#  모델 목록 양식 · 가져오기 (예전 방식)
+# ============================================================
     return {"projects": projects}
+# 모델 등록용 빈 엑셀 양식 ← admin v2 tplBtn.onclick() · _nm.onclick()
 @app.get("/admin/models/template")
 def admin_models_template(project_key: str = "", _admin: int = Depends(get_admin_session)):
-    """모델 등록용 빈 엑셀 양식.
-
-    예전에는 uploads/model_add_template.xlsx 라는 정적 파일을 그대로 내보냈고,
-    없으면 모델·구분·유형·판가·재료비 다섯 칸짜리를 만들어 줬다. 둘 다 파트넘버가
-    없다. 파트넘버가 없으면 임포터가 모델명으로 맞추는 수밖에 없고, 큐리처럼
-    '버스바' 5줄 '시트메탈' 6줄인 파일은 16줄이 7종으로 뭉개진다.
-    그래서 양식은 코드에서 만든다 (model_template.py). 임포터가 읽는 열과 항상 같다.
-
-    project_key 를 주면 그 프로젝트의 유형 목록이 드롭다운으로 들어간다.
-    """
     from urllib.parse import quote
     import model_template as _mt
 
@@ -5868,21 +5734,23 @@ def admin_models_template(project_key: str = "", _admin: int = Depends(get_admin
     )
 
 
+# 모델 목록 엑셀 올리기 (예전 방식) ← admin v2 doExcelUpload()
 @app.post("/admin/projects/{project_key}/models/import")
 async def admin_models_import(project_key: str, file: UploadFile = File(...), _admin: int = Depends(get_admin_session)):
+    _form_only("models-import")
     from io import BytesIO
     from openpyxl import load_workbook
     raw = await _keep_upload(file, "/admin/projects/{project_key}/models/import", project_key)
     if not raw:
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
     try:
-        wb = load_workbook(BytesIO(raw), data_only=True)
+        wb = load_workbook(BytesIO(raw), data_only=True, keep_links=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"엑셀 파싱 실패: {e}")
     ws = wb.active
-
-    # ── 개발현황 엑셀이 먼저다.
-    #
+    # -----------------------------------------------------------
+    # 개발현황 엑셀이 먼저다.
+    # -----------------------------------------------------------
     # 열 이름이 모델 등록 양식과 겹쳐서('모델', '판가', '비고') 아래 일반
     # 파서가 그냥 읽어버리면 'PO 잔량' 이 'PO 수량' 자리를 덮고, '구분' 열이
     # 없어서 개발품이 양산으로 들어간다. 모양을 먼저 알아본다.
@@ -5915,16 +5783,10 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
             elif k == "구분":
                 col_map["group"] = c
             elif k in ("유형", "개발유형", "type", "devtype"):
-                # 예전에는 여기만 원문을 그대로 비교해서, '개발유형' 처럼
-                # 공백이 없거나 셀에 공백이 낀 머리글을 통째로 놓쳤다.
-                # 놓치면 dev_type 이 빈 채로 들어가고, 그 모델은 주차 보드
-                # 어느 줄에도 안 잡힌다.
+                # 예전에는 여기만 원문을 그대로 비교해서, '개발유형' 처럼 공백이 없거나 셀에 공백이 낀 머리글을 통째로 놓쳤다
                 col_map["dev_type"] = c
             elif "비율" in k:
-                # '재료비율' 은 양식에서 수식 칸이다. 읽으면 안 된다 —
-                # 그런데 '재료비' 로 시작해서 아래 가지에 먼저 걸리면
-                # 재료비 자리를 빼앗고, 수식 칸이라 값이 None 이라
-                # 재료비가 통째로 0 이 됐다. 그래서 먼저 걸러낸다.
+                # '재료비율' 은 양식에서 수식 칸이다
                 continue
             elif k.startswith("판가"):
                 col_map["price"] = c
@@ -5941,7 +5803,7 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
             elif k in ("전환주차", "양산전환", "양산전환주차", "전환", "전환시점",
                        "개발→양산전환주차", "개발->양산전환주차",
                        "개발→양산", "개발->양산"):
-                # 2026-10-21 추가 — 개발 → 양산으로 넘어간 주차.
+                # 추가 — 개발 → 양산으로 넘어간 주차.
                 # 이 칸이 생기기 전에는 화면에서 손으로 넣었는데, 엑셀과
                 # 어긋나면 어느 쪽이 맞는지 알 길이 없었다. 이제 엑셀이 기준이다.
                 col_map["switch_week"] = c
@@ -5978,10 +5840,7 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
     projs = data.setdefault("projects", {})
     proj = projs.setdefault(_key, {"models": []})
     models = proj.setdefault("models", [])
-    # 파트넘버가 있으면 그게 열쇠다.
-    #
-    # 예전에는 모델명으로만 맞췄다. 큐리 파일은 '버스바' 5줄, '시트메탈' 6줄이
-    # 파트넘버로만 갈리는데, 16줄이 7종으로 뭉개져 들어갔다. 마지막 줄만 남았다.
+    # 파트넘버가 있으면 그게 열쇠다
     by_name = {str(m.get("name", "")).strip().lower(): m for m in models}
     by_pn = {}
     for m in models:
@@ -5989,14 +5848,7 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
         if _p:
             by_pn[_p] = m
 
-    # 한 파일 안에서 같은 파트넘버가 두 번 이상 나오면, 그 파트넘버는
-    # 열쇠로 못 쓴다.
-    #
-    # 아리스타 PCB 가 그렇다. 품번 하나가 출하처(Foxconn·Jabil·Sanmina)
-    # 마다 한 줄씩, 많으면 세 줄이다. 파트넘버로만 맞추면 세 줄이 한
-    # 모델로 합쳐지고 마지막 줄만 남는다 — 조용히 사라져서 더 나쁘다.
-    # 그런 파트넘버만 모델명으로 맞춘다. 한 번만 나오는 파트넘버는
-    # 예전 그대로다(큐리처럼 모델명이 겹치는 파일이 여기 기댄다).
+    # 한 파일 안에서 같은 파트넘버가 두 번 이상 나오면, 그 파트넘버는 열쇠로 못 쓴다
     _pn_seen = {}
     if col_map.get("part_number"):
         for _r in range(header_row + 1, ws.max_row + 1):
@@ -6034,12 +5886,7 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
                     skipped_rows.append(
                         {"row": r, "why": "모델명과 파트넘버가 둘 다 비었습니다"})
             continue
-        # 모델명 칸이 비어 있으면 비어 있는 대로 둔다.
-        #
-        # 예전에는 품번을 넣어 채웠다. 그러면 표에 똑같은 글자가 두 칸
-        # 나란히 찍힌다 — 아리스타 PCB 처럼 품번만 있고 따로 부르는
-        # 이름이 없는 것이 그렇다. 화면에서는 빈 칸으로 두고, 이름이
-        # 꼭 필요한 자리(앱 목록)에서만 품번을 대신 보여준다.
+        # 모델명 칸이 비어 있으면 비어 있는 대로 둔다
         name = str(name_v).strip() if name_v is not None else ""
         if not name and not pn:
             continue
@@ -6056,13 +5903,8 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
             except Exception:
                 return 0
 
+        # 그 칸에 사람이 뭔가 적었나.
         def _filled(col):
-            """그 칸에 사람이 뭔가 적었나.
-
-            빈 칸은 '그대로 둬라' 다. 예전에는 빈 칸이 0 으로 들어가서,
-            양식을 받아 PO 만 고쳐 올리면 판가가 전부 0 이 됐다. 정말
-            0 으로 만들고 싶으면 0 을 적으면 된다.
-            """
             if not col:
                 return False
             v = ws.cell(row=r, column=col).value
@@ -6070,8 +5912,9 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
 
         price = _num(col_map.get("price"))
         mcost = _num(col_map.get("material_cost"))
-
-        # ── 전환주차 ────────────────────────────────────────────────
+        # -----------------------------------------------------------
+        # 전환주차
+        # -----------------------------------------------------------
         # 엑셀에 '2026-W36' 처럼 적어 두면 그 주차부터 양산으로 본다.
         # 빈 칸이면 지금 이력을 그대로 둔다. '-' 나 '없음' 이면 이력을 지운다
         # (처음부터 끝까지 한 구분이라는 뜻).
@@ -6084,12 +5927,8 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
                 skipped_rows.append(
                     {"row": r, "why": "전환주차를 못 읽었습니다: %s (예: 2026-W36)" % _sw_raw})
 
+        # 전환주차 한 칸을 '개발 → 양산' 두 구간으로 펴 준다
         def _phases_from_switch(old_entry):
-            """전환주차 한 칸을 '개발 → 양산' 두 구간으로 펴 준다.
-
-            전환 전 판가는 이미 쌓아 둔 이력의 첫 구간을 쓴다. 없으면 지금
-            판가를 쓴다 — 없는 값을 지어내면 지난달 매출이 흔들린다.
-            """
             prev = _norm_phases((old_entry or {}).get("phases"))
             dev_price = prev[0]["price"] if prev else _as_money((old_entry or {}).get("price"))
             dev_mcost = prev[0]["material_cost"] if prev else _as_money((old_entry or {}).get("material_cost"))
@@ -6175,6 +6014,8 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
         if _filled(col_map.get("shipped_qty")):
             existing["shipped_qty"] = int(_num(col_map["shipped_qty"]))
 
+    # 양산을 앞에, 개발을 뒤에 (같은 구분 안에서는 원래 순서 그대로)
+
     models.sort(key=lambda m: 0 if m.get("group") == "양산" else 1)
 
     # 엑셀 '유형' 열에 나온 값을 프로젝트 유형 목록에 자동 등록 (칩·자동완성용)
@@ -6201,17 +6042,17 @@ async def admin_models_import(project_key: str, file: UploadFile = File(...), _a
 # ─── 이슈 AI 요약 (models.json 기반, 캐시) ───
 _issues_summary_cache = {}  # project_key -> {"fingerprint": str, "summary": str}
 
-
+# ============================================================
+#  이슈 요약 · 프로젝트 상세
+# ============================================================
 def _issues_fingerprint(models: list) -> str:
-    """issues 내용 기반 지문 — 변경 시에만 LLM 재호출"""
     import hashlib
     raw = "|".join(str(m.get("issues") or "") for m in models)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
+# 모델별 이슈를 각각 1~2문장으로 요약.
 def _summarize_issues(project_key: str, models: list) -> list:
-    """모델별 이슈를 각각 1~2문장으로 요약. 반환: [{"model": str, "summary": str}, ...]
-    summary 내 문장은 \n으로 분리 (이슈 / 후속조치)."""
     with_issues = [(m.get("name") or m.get("id") or "", (m.get("issues") or "").strip())
                    for m in models if (m.get("issues") or "").strip()]
     if not with_issues:
@@ -6259,28 +6100,19 @@ def _summarize_issues(project_key: str, models: list) -> list:
     _issues_summary_cache[project_key] = {"fingerprint": fp, "summary": result}
     return result
 
+# 앱 개요 화면용 이슈 AI 요약 ← 앱 project_overview_screen.dart _loadBloom()
 @app.get("/projects/{project_key}/issues/summary")
 def get_issues_summary(project_key: str):
-    """앱 개요 화면용 이슈 AI 요약"""
     _key = _model_key_alias(project_key)
     data = _load_models()
     models = data.get("projects", {}).get(_key, {}).get("models", [])
     items = _summarize_issues(_key, models)
     return {"project_key": _key, "items": items}
 
+# 프로젝트 모델 목록 + 그룹별 요약 (앱 8번 화면용)
+# ← admin v2 mdlRefresh() · loadModels() · saveModels() · _wpLoadModels() 외 1곳 외
 @app.get("/projects/{project_key}/models")
 def get_project_models(project_key: str):
-    """프로젝트 모델 목록 + 그룹별 요약 (앱 8번 화면용)
-
-    응답:
-    {
-      "project_key": "cup",
-      "has_models": true,
-      "total": 4,
-      "groups": {"양산": {"count": 4, "models": [...]}, "개발": {...}},
-      "models": [...]
-    }
-    """
     models = _get_project_models(project_key)
     groups: dict = {}
     for m in models:
@@ -6301,9 +6133,9 @@ def get_project_models(project_key: str):
     }
 
 
+# 프로젝트 상세 ← admin v2 markClean() · reloadKpiSlot() · loadProjectTypes() 외
 @app.get("/projects/{project_key}")
 def get_project_detail(project_key: str):
-    """프로젝트 상세"""
     # 별칭 매핑: 앱/구 데이터에서 오는 키를 실제 프로젝트 키로 변환
     _alias_map = {
         "havaplate": "hrva_plate",
@@ -6334,12 +6166,13 @@ def get_project_detail(project_key: str):
                         break
                 if detail:
                     break
-        except Exception as _e:
+        except Exception:
             pass
         if not detail:
             raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
-    
-    # === notes.json 매칭 sections 우선 사용 + str items → obj items 변환 ===
+    # -----------------------------------------------------------
+    # notes.json 매칭 sections 우선 사용 + str items → obj items 변환
+    # -----------------------------------------------------------
     try:
         _notes_data = _read_json(NOTES_FILE, {})
         _project_label = (detail.get("label") or detail.get("project_label") or "").strip()
@@ -6379,7 +6212,7 @@ def get_project_detail(project_key: str):
                         _new_items.append({"type": "sub", "text": _s})
                 _sec["items"] = _new_items
                 _sec.pop("notes", None)
-    except Exception as _e:
+    except Exception:
         pass
 
     # 🟢 프로젝트 상세 enrichment (기존 필드 변경 없음)
@@ -6390,28 +6223,24 @@ def get_project_detail(project_key: str):
         if project_key == "major_module":
             detail["kpi_card"] = _build_major_module_kpi_card()
             detail["issue_lines"] = _build_major_module_issue_lines()
-    except Exception as _e:
+    except Exception:
         # KPI 계산 실패해도 기본 상세는 정상 반환되어야 함
         pass
 
     return detail
 
 
-# =========================================================
-# 5. 사용자 직접 차트/사진 업로드
-# =========================================================
+# ============================================================
+#  admin 설정 · 이름 맞추기
 # ============================================================
 # Admin Config API (5단계: admin 페이지 동적 dropdown용)
 # - 운영 도구 페이지에서 사업부/프로젝트/섹션을 동적으로 로드하기 위한 API
 # - 모두 GET, 인증 불필요 (admin 페이지 내부에서만 호출됨)
-# ============================================================
 
+
+# admin 페이지의 사업부 dropdown 용.
 @app.get("/admin/config/divisions")
 def admin_config_divisions(_exp: int = Depends(get_admin_session)):
-    """
-    admin 페이지의 사업부 dropdown 용.
-    config_loader.get_divisions() 결과를 그대로 노출.
-    """
     try:
         items = _cl.get_divisions(visible_only=True)
         return {
@@ -6433,6 +6262,9 @@ def admin_config_divisions(_exp: int = Depends(get_admin_session)):
 # === Learned Aliases (사용자 승인 오타 -> 프로젝트 매핑) ===
 LEARNED_ALIASES_FILE = Path("learned_aliases.json")
 
+# ============================================================
+#  배운 별칭 — '이 이름은 이 프로젝트'
+# ============================================================
 def _load_learned_aliases() -> dict:
     try:
         with open(LEARNED_ALIASES_FILE, "r", encoding="utf-8") as f:
@@ -6440,12 +6272,14 @@ def _load_learned_aliases() -> dict:
     except Exception:
         return {"version": 1, "updated_at": None, "aliases": {}}
 
+# 배운 별칭 목록을 저장한다
 def _save_learned_aliases(data: dict) -> None:
     from datetime import datetime
     data["updated_at"] = datetime.now().isoformat()
     with open(LEARNED_ALIASES_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+# 배운 별칭으로 프로젝트를 찾는다
 def _find_project_by_learned_alias(query: str) -> Optional[dict]:
     q = (query or "").strip().lower()
     if not q:
@@ -6470,12 +6304,9 @@ def _find_project_by_learned_alias(query: str) -> Optional[dict]:
     return None
 
 
+# fuzzy로 못 잡은 오타를 AI로 판정 ← admin v2 _onNewProjectNameInput()
 @app.post("/admin/projects/resolve")
 def admin_projects_resolve(payload: dict, _admin: int = Depends(get_admin_session)):
-    """
-    fuzzy로 못 잡은 오타를 AI로 판정.
-    payload: {"query": "참바", "division_id": "semiconductor" (optional)}
-    """
     if client is None:
         return {"resolved": None, "reason": "OPENAI_API_KEY not configured"}
 
@@ -6566,12 +6397,9 @@ def admin_projects_resolve(payload: dict, _admin: int = Depends(get_admin_sessio
     return {"resolved": None, "reason": "matched_id not found in candidates"}
 
 
+# 사용자 승인 alias를 learned_aliases.json에 저장 ← admin v2 _npBuildAiSuggestBox()
 @app.post("/admin/projects/alias")
 def admin_projects_add_alias(payload: dict, _admin: int = Depends(get_admin_session)):
-    """
-    사용자 승인 alias를 learned_aliases.json에 저장.
-    payload: {"project_id": "chamber", "alias": "참바"}
-    """
     project_id = str((payload or {}).get("project_id") or "").strip()
     alias = str((payload or {}).get("alias") or "").strip()
 
@@ -6628,6 +6456,9 @@ _JONG_COMBINE = {
     ("ㄹ","ㅎ"):"ㅀ",("ㅂ","ㅅ"):"ㅄ",
 }
 
+# ============================================================
+#  한/영 자판 바꿔 찾기 · 프로젝트 추천
+# ============================================================
 def _en_to_ko(text: str) -> str:
     if not text:
         return text
@@ -6687,6 +6518,7 @@ def _en_to_ko(text: str) -> str:
         result.append(chr(code))
     return "".join(result)
 
+# 한글 자판으로 친 영문을 영문으로 바꾼다 (검색용).
 def _ko_to_en(text: str) -> str:
     if not text:
         return text
@@ -6727,14 +6559,9 @@ def _ko_to_en(text: str) -> str:
     return "".join(result)
 
 
+# 프로젝트명 fuzzy match ← admin v2 _onNewProjectNameInput()
 @app.get("/admin/projects/suggest")
 def admin_projects_suggest(query: str = "", limit: int = 5):
-    """
-    프로젝트명 fuzzy match.
-    - learned_aliases.json 우선 체크
-    - 한글 자모 단위 유사도 (챕버 <-> 챔버)
-    - 한/영 자판 변환 (xhffhs -> 톨론, coaqj -> 챔버)
-    """
     from difflib import SequenceMatcher
     import unicodedata
 
@@ -6816,9 +6643,11 @@ def admin_projects_suggest(query: str = "", limit: int = 5):
         if label:
             candidates.append(label)
         for a in (p.get("aliases") or []):
-            if a: candidates.append(str(a))
+            if a:
+                candidates.append(str(a))
         for k in (p.get("keywords") or []):
-            if k: candidates.append(str(k))
+            if k:
+                candidates.append(str(k))
 
         best_sim = 0.0
         best_matched = ""
@@ -6867,18 +6696,14 @@ def admin_projects_suggest(query: str = "", limit: int = 5):
         "exact_match": exact,
     }
 
-
+# ============================================================
+#  admin 설정 목록 · 통계
+# ============================================================
+# admin 페이지의 프로젝트 dropdown 용 ← admin v2 _npLoadProjectButtons() · loadProjectOptions() · back.onclick()
 @app.get("/admin/config/projects")
 def admin_config_projects(division_id: str | None = None):
-    """
-    admin 페이지의 프로젝트 dropdown 용.
-    division_id 가 주어지면 해당 사업부의 프로젝트만 반환.
-    """
     try:
-        # 앱·홈에 안 띄우기로 한 프로젝트라도, admin 에서 자료를 올려야 하는
-        # 자리는 여기엔 나와야 한다. 블룸이 그랬다 — 품목 파일이 전부
-        # bloom_main 으로 저장되는데 visible:false 라 화면에 올릴 곳이
-        # 아예 없었고, 사람들은 품목 일곱 개 중 하나를 골라 올리고 있었다.
+        # 앱·홈에 안 띄우기로 한 프로젝트라도, admin 에서 자료를 올려야 하는 자리는 여기엔 나와야 한다
         items = _cl.get_projects(division_id=division_id, visible_only=False)
         items = [p for p in items
                  if p.get("visible", True) or p.get("admin_only")]
@@ -6900,13 +6725,9 @@ def admin_config_projects(division_id: str | None = None):
         raise HTTPException(status_code=500, detail=f"projects load error: {e}")
 
 
+# admin 이미지 업로드 탭의 섹션 dropdown 용.
 @app.get("/admin/config/sections")
 def admin_config_sections(project_key: str, _exp: int = Depends(get_admin_session)):
-    """
-    admin 이미지 업로드 탭의 섹션 dropdown 용.
-    현재 분석된 PPT 결과에서 해당 프로젝트의 실제 GPT 섹션 제목들을 가져옴.
-    이것이 핵심 — 더 이상 자유 입력 안 함, GPT 가 만든 실제 섹션만 옵션으로 노출.
-    """
     try:
         latest = _read_json(LATEST_FILE, [])
         grouped = aggregate_projects(latest)
@@ -6930,14 +6751,9 @@ def admin_config_sections(project_key: str, _exp: int = Depends(get_admin_sessio
         raise HTTPException(status_code=500, detail=f"sections load error: {e}")
 
 
+# 매핑 관리 탭용 통계.
 @app.get("/admin/config/stats")
 def admin_config_stats(_exp: int = Depends(get_admin_session)):
-    """
-    매핑 관리 탭용 통계.
-    - 현재 사업부/프로젝트 수
-    - 자동 분류된 카드/실패 카드 수
-    - 실패 카드의 product/category 샘플
-    """
     try:
         divs = _cl.get_divisions(visible_only=True)
         all_projects = _cl.get_projects(visible_only=True)
@@ -6976,22 +6792,17 @@ def admin_config_stats(_exp: int = Depends(get_admin_session)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"stats load error: {e}")
 
-# =========================================================
-# 6. 어드민 페이지 (브라우저용)
-# =========================================================
-
-
+# ============================================================
+#  admin v2 화면
+# ============================================================
+# admin v2 화면(HTML) 자체를 내준다
 @app.get("/admin/v2", response_class=HTMLResponse)
 def admin_v2_page(admin_auth: Optional[str] = Cookie(default=None)):
     if not _verify_session(admin_auth):
         return RedirectResponse(url="/admin/login?next=/admin/v2", status_code=302)
-    """OneView Admin v2 — 시안 기반 새 관리자 페이지."""
     return HTMLResponse(open(_ADMIN_V2_HTML_PATH, encoding='utf-8').read())
 
 
-# ══════════════════════════════════════════════════════════════════
-#  원본 보관함 — 올라온 엑셀을 브라우저로 꺼내는 길 (2026-10-23)
-# ══════════════════════════════════════════════════════════════════
 #
 # 보기 전용이다. 여기서는 운영 데이터를 바꾸지 않는다. admin_v2.html 은
 # '수정 금지' 상태라 일부러 건드리지 않고 별도 페이지로 둔다.
@@ -7003,7 +6814,10 @@ def admin_v2_page(admin_auth: Optional[str] = Cookie(default=None)):
 #   /admin/uploads/file/{id}     한 건 내려받기
 #   /admin/uploads/zip?month=    한 달치 통째로
 
-
+# ============================================================
+#  원본 보관함 — 올라온 엑셀을 브라우저로 꺼내는 길
+# ============================================================
+# 업로드 보관함 화면(HTML).
 @app.get("/admin/uploads", response_class=HTMLResponse)
 def admin_uploads_page(admin_auth: Optional[str] = Cookie(default=None)):
     if not _verify_session(admin_auth):
@@ -7013,6 +6827,7 @@ def admin_uploads_page(admin_auth: Optional[str] = Cookie(default=None)):
     return HTMLResponse(upload_vault_page.HTML)
 
 
+# 업로드 보관함 — 달별 건수 요약.
 @app.get("/admin/uploads/summary")
 def admin_uploads_summary(_admin: int = Depends(get_admin_session)):
     st = upload_store.stats()
@@ -7020,6 +6835,7 @@ def admin_uploads_summary(_admin: int = Depends(get_admin_session)):
     return st
 
 
+# 업로드 보관함 — 목록.
 @app.get("/admin/uploads/list")
 def admin_uploads_list(month: str = "", project: str = "",
                        _admin: int = Depends(get_admin_session)):
@@ -7028,14 +6844,10 @@ def admin_uploads_list(month: str = "", project: str = "",
                                             limit=2000)}
 
 
+# 한 건 내려받기.
 @app.get("/admin/uploads/file/{entry_id}")
 def admin_uploads_file(entry_id: str,
                        _admin: int = Depends(get_admin_session)):
-    """한 건 내려받기.
-
-    경로를 바깥에서 받지 않는다 — 기록에 있는 id 로만 찾는다.
-    '../' 같은 값으로 보관함 밖 파일을 읽히지 않게 하기 위해서다.
-    """
     from fastapi.responses import FileResponse
     p = upload_store.path_of(entry_id)
     if not p:
@@ -7046,10 +6858,10 @@ def admin_uploads_file(entry_id: str,
                         media_type="application/octet-stream")
 
 
+# 한 달치를 zip 으로. 인수인계 때 통째로 넘기는 길.
 @app.get("/admin/uploads/zip")
 def admin_uploads_zip(month: str,
                       _admin: int = Depends(get_admin_session)):
-    """한 달치를 zip 으로. 인수인계 때 통째로 넘기는 길."""
     import re as _re
     if not _re.fullmatch(r"\d{4}-\d{2}", month or ""):
         raise HTTPException(status_code=400, detail="연-월 형식이 아닙니다")
@@ -7062,6286 +6874,20 @@ def admin_uploads_zip(month: str,
     )
 
 
-import os
 _ADMIN_V2_HTML_PATH = os.path.join(os.path.dirname(__file__), 'admin_v2.html')
-if os.path.exists(_ADMIN_V2_HTML_PATH):
-    with open(_ADMIN_V2_HTML_PATH, 'r', encoding='utf-8') as f:
-        _ADMIN_V2_HTML = f.read()
-else:
-    _ADMIN_V2_HTML = """<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="utf-8">
-<title>OneView Admin</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Pretendard", "Apple SD Gothic Neo", sans-serif; color: #1F2937; background: #F5F7FA; }
-  a { color: inherit; text-decoration: none; }
 
-  .app { display: flex; min-height: 100vh; }
-
-  /* 좌측 사이드바 */
-  .sidebar { width: 240px; flex-shrink: 0; background: #0B2B5C; color: #E5E7EB; padding: 22px 16px; display: flex; flex-direction: column; gap: 18px; }
-  .sidebar .brand { display: flex; align-items: baseline; gap: 8px; padding: 0 6px; }
-  .sidebar .brand .name { font-size: 22px; font-weight: 800; color: #fff; letter-spacing: -0.3px; }
-  .sidebar .brand .sub { font-size: 12px; color: #93C5FD; font-weight: 600; }
-
-  .biz-select { background: #12356F; border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
-  .biz-select .label { font-size: 12px; color: #93C5FD; font-weight: 600; letter-spacing: 0.5px; }
-  .biz-select select { background: transparent; color: #fff; border: none; font-size: 15px; font-weight: 600; padding: 2px 0; outline: none; cursor: pointer; }
-  .biz-select select option { color: #111; }
-
-  .nav-title { font-size: 12px; color: #93C5FD; letter-spacing: 1px; padding: 0 6px; font-weight: 700; }
-  .nav { display: flex; flex-direction: column; gap: 4px; }
-  .nav-item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 10px; font-size: 15px; font-weight: 500; color: #CBD5E1; cursor: pointer; transition: background .15s, color .15s; }
-  .nav-item:hover { background: rgba(255,255,255,0.06); color: #fff; }
-  .nav-item.active { background: #fff; color: #0B2B5C; font-weight: 700; }
-  .nav-item .icon { width: 22px; text-align: center; font-size: 16px; }
-
-  .sidebar .spacer { flex: 1; }
-  .sidebar .footer { font-size: 12px; color: #93C5FD; padding: 0 6px; opacity: 0.7; }
-
-  /* 메인 */
-  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-
-  /* 상단 헤더 */
-  .topbar { background: #fff; border-bottom: 1px solid #E5E7EB; padding: 16px 28px; display: flex; align-items: center; gap: 16px; }
-  .breadcrumb { font-size: 13px; color: #6B7280; }
-  .breadcrumb .sep { margin: 0 6px; color: #9CA3AF; }
-  .breadcrumb .cur { color: #111827; font-weight: 600; }
-  .topbar .grow { flex: 1; }
-  .search { position: relative; }
-  .search input { padding: 8px 12px 8px 34px; border: 1px solid #E5E7EB; border-radius: 999px; background: #F9FAFB; font-size: 13px; width: 220px; outline: none; }
-  .search input:focus { border-color: #3B82F6; background: #fff; }
-  .search::before { content: "🔍"; position: absolute; left: 12px; top: 50%; transform: translateY(-50%); font-size: 12px; opacity: 0.6; }
-  .btn-primary { background: #0F2C59; color: #fff; border: none; border-radius: 8px; padding: 9px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
-  .btn-primary:hover { background: #12356F; }
-
-  /* 본문 영역 */
-  .content { padding: 28px; flex: 1; }
-  .page-title { font-size: 24px; font-weight: 800; color: #111827; margin: 0 0 4px 0; }
-  .page-sub { font-size: 14px; color: #6B7280; margin: 0 0 20px 0; }
-
-  .placeholder { background: #fff; border-radius: 14px; border: 1px solid #E5E7EB; padding: 60px 28px; text-align: center; color: #6B7280; }
-  .placeholder .big { font-size: 40px; margin-bottom: 12px; opacity: 0.5; }
-  .placeholder .title { font-size: 16px; font-weight: 700; color: #374151; margin-bottom: 6px; }
-  .placeholder .sub { font-size: 13px; color: #9CA3AF; }
-</style>
-</head>
-<body>
-<div class="app">
-  <!-- 사이드바 -->
-  <aside class="sidebar">
-    <div class="brand">
-      <span class="name">OneView</span>
-      <span class="sub">Admin</span>
-    </div>
-
-    <div class="biz-select">
-      <span class="label">사업부</span>
-      <select id="v2-division-select">
-        <option value="">로딩 중...</option>
-      </select>
-    </div>
-
-    <div class="nav-title">MENU</div>
-    <nav class="nav">
-      <div class="nav-item" data-page="home"><span class="icon">🏠</span><span>홈 대시보드</span></div>
-      <div class="nav-item active" data-page="models"><span class="icon">🧩</span><span>모델 관리</span></div>
-    </nav>
-
-    <div class="spacer"></div>
-    <div class="footer">v2 skeleton</div>
-  </aside>
-
-  <!-- 메인 -->
-  <main class="main">
-    <!-- 상단바 -->
-    <div class="topbar">
-      <div class="breadcrumb">
-        <span id="v2-crumb-biz">반도체사업부</span>
-        <span class="sep">›</span>
-        <span class="cur" id="v2-crumb-page">모델 관리</span>
-      </div>
-      <div class="grow"></div>
-      <div class="search"><input type="text" placeholder="검색"></div>
-      
-    </div>
-
-    <!-- 페이지 컨텐츠 -->
-    <div class="content" id="v2-content">
-      <div id="ov-report-root"></div>
-    </div>
-  </main>
-</div>
-
-<script>
-window._normalizeAiNumberedHtml = function(html){
-  if (!html) return html;
-  var s = String(html);
-  // <br> 기준으로 라인 분리 (대소문자 무시)
-  var lines = s.split(/<br\\s*\\/?>/i);
-  // 각 라인의 &nbsp; 정규화
-  lines = lines.map(function(l){ return l.replace(/&nbsp;/g, ' '); });
-  // stripTag 함수: 태그 벗겨서 텍스트만 봤을 때 번호로 시작하는지 확인
-  function stripTag(x){ return x.replace(/<[^>]+>/g, ''); }
-  // 각 라인이 새 항목 시작인지 판별
-  var items = [];
-  var current = null;
-  for (var i = 0; i < lines.length; i++){
-    var raw = lines[i];
-    var text = stripTag(raw).replace(/\\u00A0/g, ' ').trim();
-    if (!text) {
-      // 빈 라인은 현재 항목에 <br> 로 유지
-      if (current !== null) current += '<br>';
-      continue;
-    }
-    // "1)" "2." 등 새 항목 시작
-    var m = text.match(/^(\\d+)[)\\.]\\s+(.*)$/);
-    if (m) {
-      // 새 항목 시작 - raw에서 "숫자)" 또는 "숫자." 부분 제거
-      var stripped = raw.replace(/^(\\s|&nbsp;|\\u00A0)*\\d+[)\\.]\\s*/, '');
-      if (current !== null) items.push(current);
-      current = stripped;
-    } else {
-      // 이어붙임
-      if (current === null) {
-        current = raw;
-      } else {
-        current += '<br>' + raw;
-      }
-    }
-  }
-  if (current !== null) items.push(current);
-  // 항목이 2개 이상일 때만 <ol> 로 감싸기
-  if (items.length < 2) return html;
-  var out = '<ol class="ov-num ov-num-paren" data-start="1">';
-  for (var j = 0; j < items.length; j++){
-    out += '<li>' + items[j] + '</li>';
-  }
-  out += '</ol>';
-  return out;
-};
-
-window._attachAutoListBehavior = function(el){
-  // === AI 리스트 헬퍼 (depth/style/tab 관리) ===
-  if (!window._aiListHelpersReady) {
-    window._aiListHelpersReady = true;
-
-    window._circledNumber = function(n){
-      var map = {1:'①',2:'②',3:'③',4:'④',5:'⑤',6:'⑥',7:'⑦',8:'⑧',9:'⑨',10:'⑩',11:'⑪',12:'⑫',13:'⑬',14:'⑭',15:'⑮',16:'⑯',17:'⑰',18:'⑱',19:'⑲',20:'⑳'};
-      return map[n] || (n + '.');
-    };
-
-    window._aiStyleForDepth = function(depth){
-      // Word식 반복 순환: dot → paren → circled → dot → paren → circled ...
-      if (depth <= 0) return 'dot';
-      var styles = ['dot', 'paren', 'circled'];
-      return styles[depth % 3];
-    };
-
-    window._aiGetClosestLi = function(node, root){
-      var cur = node;
-      while (cur && cur !== root) {
-        if (cur.nodeType === 1 && cur.tagName === 'LI') return cur;
-        cur = cur.parentNode;
-      }
-      return null;
-    };
-
-    window._aiGetCurrentLi = function(editor){
-      var sel = window.getSelection();
-      if (!sel || !sel.rangeCount) return null;
-      return window._aiGetClosestLi(sel.getRangeAt(0).startContainer, editor);
-    };
-
-    window._aiGetCurrentOl = function(editor){
-      var li = window._aiGetCurrentLi(editor);
-      if (!li) return null;
-      return (li.parentNode && li.parentNode.tagName === 'OL') ? li.parentNode : null;
-    };
-
-    window._aiGetListDepth = function(ol, editor){
-      var depth = 0;
-      var cur = ol.parentNode;
-      while (cur && cur !== editor) {
-        if (cur.nodeType === 1 && cur.tagName === 'OL') {
-          var ovr = cur.dataset.depthOverride;
-          if (ovr != null && ovr !== '') {
-            var od = parseInt(ovr, 10);
-            if (!isNaN(od) && od >= 0) {
-              // 조상 ol에 depthOverride가 있으면 그걸 base로 사용
-              // 자식 depth = 조상의 effective depth + (그 사이 ol 개수) + 1
-              return od + depth + 1;
-            }
-          }
-          depth++;
-        }
-        cur = cur.parentNode;
-      }
-      return depth;
-    };
-
-    window._aiRefreshList = function(ol){
-      if (!ol) return;
-      var start = parseInt(ol.dataset.start || '1', 10);
-      if (!start || start < 1) start = 1;
-      if (ol.classList.contains('ov-num-circled')) {
-        var lis = Array.prototype.filter.call(ol.children, function(x){ return x.tagName === 'LI'; });
-        lis.forEach(function(li, idx){
-          li.setAttribute('data-marker', window._circledNumber(start + idx));
-        });
-      } else {
-        ol.style.counterReset = 'aiitem ' + (start - 1);
-      }
-    };
-
-    window._aiApplyStart = function(ol, start){
-      start = parseInt(start, 10);
-      if (!start || start < 1) start = 1;
-      ol.dataset.start = String(start);
-      window._aiRefreshList(ol);
-    };
-
-    window._aiSetOlStyleByDepth = function(ol, depth){
-      ol.classList.remove('ov-num-dot', 'ov-num-paren', 'ov-num-circled');
-      var effectiveDepth = depth;
-      var override = ol.dataset.depthOverride;
-      if (override != null && override !== '') {
-        var od = parseInt(override, 10);
-        if (!isNaN(od) && od >= 0) effectiveDepth = od;
-      }
-      var style = window._aiStyleForDepth(effectiveDepth);
-      ol.classList.add('ov-num', 'ov-num-' + style);
-      // depth-override 있으면 margin-left CSS도 반영
-      if (override != null && override !== '') {
-        ol.style.marginLeft = (effectiveDepth * 24) + 'px';
-      } else {
-        ol.style.marginLeft = '';
-      }
-      if (!ol.dataset.start) ol.dataset.start = '1';
-      window._aiRefreshList(ol);
-    };
-
-    // 지정 li가 ol의 첫 번째면 원본 ol 반환, 아니면 그 li부터 분할한 새 ol 반환
-    window._aiSplitOlAtLi = function(ol, li){
-      var lis = Array.prototype.filter.call(ol.children, function(x){ return x.tagName === 'LI'; });
-      var idx = lis.indexOf(li);
-      if (idx <= 0) return ol; // 첫번째 li거나 li 못찾음 → 분할 불필요
-      var newOl = document.createElement('ol');
-      newOl.className = ol.className;
-      newOl.dataset.start = '1';
-      newOl.dataset.manualSplit = '1';
-      ol.dataset.manualSplit = '1';
-      for (var i = idx; i < lis.length; i++) {
-        newOl.appendChild(lis[i]);
-      }
-      if (ol.nextSibling) ol.parentNode.insertBefore(newOl, ol.nextSibling);
-      else ol.parentNode.appendChild(newOl);
-      return newOl;
-    };
-
-    // 편집기 안에서 지정 li보다 앞에 있는 마지막 ol 찾기 (li의 자기 ol 제외)
-    window._aiFindPrevOl = function(editor, targetOl){
-      var ols = Array.prototype.slice.call(editor.querySelectorAll('ol.ov-num'));
-      var myIdx = ols.indexOf(targetOl);
-      if (myIdx <= 0) return null;
-      return ols[myIdx - 1];
-    };
-
-    // li를 리스트에서 빼서 일반 텍스트 div로 변환, 뒤 li들은 새 ol로 분리
-    window._aiUnlistCurrentLi = function(editor, targetLi){
-      if (!targetLi || targetLi.tagName !== 'LI') return;
-      var srcOl = targetLi.parentNode;
-      if (!srcOl || srcOl.tagName !== 'OL') return;
-
-      var lis = Array.prototype.filter.call(srcOl.children, function(x){ return x.tagName === 'LI'; });
-      var idx = lis.indexOf(targetLi);
-      if (idx < 0) return;
-
-      // 새 div 만들어 li 내용 옮김
-      var block = document.createElement('div');
-      block.innerHTML = targetLi.innerHTML || '<br>';
-
-      // 뒤에 남은 li들을 새 ol로 분리
-      var afterOl = null;
-      if (idx < lis.length - 1) {
-        afterOl = document.createElement('ol');
-        afterOl.className = srcOl.className;
-        afterOl.dataset.start = '1';
-        afterOl.dataset.manualSplit = '1';
-        srcOl.dataset.manualSplit = '1';
-        for (var i = idx + 1; i < lis.length; i++) {
-          afterOl.appendChild(lis[i]);
-        }
-      }
-
-      // 원본 li 제거
-      targetLi.remove();
-
-      // 원본 ol 뒤에 block, afterOl 순서로 삽입
-      var insertAfter = srcOl.nextSibling;
-      var parent = srcOl.parentNode;
-      parent.insertBefore(block, insertAfter);
-      if (afterOl) parent.insertBefore(afterOl, insertAfter);
-
-      // 원본 ol이 비었으면 제거
-      if (!srcOl.querySelector('li')) srcOl.remove();
-
-      // 스타일/번호 재계산
-      if (window._aiRefreshAllLists) window._aiRefreshAllLists(editor);
-
-      // 커서를 block 안으로
-      var r = document.createRange();
-      r.selectNodeContents(block);
-      r.collapse(true);
-      var s = window.getSelection();
-      s.removeAllRanges();
-      s.addRange(r);
-    };
-
-    // 일반 텍스트 block의 indent를 조정
-    window._aiFindTextBlock = function(node, editor){
-      var cur = node;
-      while (cur && cur !== editor) {
-        if (cur.nodeType === 1) {
-          var tag = cur.tagName;
-          // li 안이면 텍스트 블록 아님 (리스트 처리)
-          if (tag === 'LI') return null;
-          if (tag === 'OL' || tag === 'UL') return null;
-          // 편집박스 직계 텍스트 블록
-          if (cur.parentNode === editor && (tag === 'DIV' || tag === 'P')) return cur;
-        }
-        cur = cur.parentNode;
-      }
-      return null;
-    };
-
-    window._aiGetTextBlockAtCursor = function(editor){
-      var sel = window.getSelection();
-      if (!sel || !sel.rangeCount) return null;
-      var node = sel.getRangeAt(0).startContainer;
-      // 텍스트 노드면 부모부터 탐색
-      if (node.nodeType === 3) node = node.parentNode;
-      // 편집박스 직계 자식 찾기
-      var cur = node;
-      while (cur && cur.parentNode !== editor) {
-        if (cur === editor) return null;
-        cur = cur.parentNode;
-      }
-      if (!cur) return null;
-      if (cur.tagName === 'OL' || cur.tagName === 'UL') return null;
-      return cur;
-    };
-
-    window._aiIndentTextBlock = function(editor){
-      // data-indent 대신 텍스트 앞 공백 2칸 삽입 (저장 안정성 확보)
-      document.execCommand('insertText', false, '  ');
-      return true;
-    };
-
-    window._aiOutdentTextBlock = function(editor){
-      // 커서 위치에서 앞 공백 2칸 제거
-      var sel = window.getSelection();
-      if (!sel.rangeCount) return false;
-      var node = sel.anchorNode;
-      if (node.nodeType === 3) {  // 텍스트 노드
-        var text = node.textContent;
-        var offset = sel.anchorOffset;
-        // 커서 앞의 공백 2칸 제거
-        var before = text.substring(0, offset);
-        var after = text.substring(offset);
-        if (before.endsWith('  ')) {
-          node.textContent = before.slice(0, -2) + after;
-          sel.setPosition(node, offset - 2);
-        } else if (before.endsWith(' ')) {
-          node.textContent = before.slice(0, -1) + after;
-          sel.setPosition(node, offset - 1);
-        }
-      }
-      return true;
-    };
-
-    // 커서 컨테이너에서 편집박스 직계 텍스트 블록 또는 li 찾기
-    window._aiFindNodeForRange = function(node, editor){
-      var cur = node;
-      if (cur && cur.nodeType === 3) cur = cur.parentNode;
-      while (cur && cur !== editor) {
-        if (cur.nodeType === 1) {
-          if (cur.tagName === 'LI') return { type: 'li', node: cur };
-          if (cur.parentNode === editor && (cur.tagName === 'DIV' || cur.tagName === 'P')) {
-            return { type: 'block', node: cur };
-          }
-        }
-        cur = cur.parentNode;
-      }
-      return null;
-    };
-
-    // 현재 selection이 걸친 모든 li와 텍스트 블록 수집
-    window._aiCollectSelectedNodes = function(editor){
-      var sel = window.getSelection();
-      if (!sel || !sel.rangeCount) return { lis: [], blocks: [], single: true };
-      var range = sel.getRangeAt(0);
-      if (range.collapsed) {
-        // 단일 커서: 한 노드만 반환
-        var one = window._aiFindNodeForRange(range.startContainer, editor);
-        return {
-          lis: one && one.type === 'li' ? [one.node] : [],
-          blocks: one && one.type === 'block' ? [one.node] : [],
-          single: true
-        };
-      }
-
-      var lis = [];
-      var blocks = [];
-      var seen = new Set();
-
-      // range 시작과 끝의 노드부터 감지
-      var startInfo = window._aiFindNodeForRange(range.startContainer, editor);
-      var endInfo = window._aiFindNodeForRange(range.endContainer, editor);
-
-      function addNode(info){
-        if (!info) return;
-        if (seen.has(info.node)) return;
-        seen.add(info.node);
-        if (info.type === 'li') lis.push(info.node);
-        else blocks.push(info.node);
-      }
-
-      // 편집박스 안의 모든 li, 편집박스 직계 텍스트 블록 순회하며 range와 교차하는지 확인
-      var allLis = Array.prototype.slice.call(editor.querySelectorAll('li'));
-      var allBlocks = Array.prototype.filter.call(editor.children, function(x){
-        return x.nodeType === 1 && (x.tagName === 'DIV' || x.tagName === 'P');
-      });
-
-      function intersects(el){
-        try {
-          var r = document.createRange();
-          r.selectNodeContents(el);
-          // range 시작이 el 끝 이후이거나 range 끝이 el 시작 이전이면 교차 없음
-          if (range.compareBoundaryPoints(Range.START_TO_END, r) < 0) return false;
-          if (range.compareBoundaryPoints(Range.END_TO_START, r) > 0) return false;
-          return true;
-        } catch(e) { return false; }
-      }
-
-      allLis.forEach(function(li){ if (intersects(li)) addNode({ type: 'li', node: li }); });
-      allBlocks.forEach(function(b){ if (intersects(b)) addNode({ type: 'block', node: b }); });
-
-      // 시작/끝 노드도 안전하게 추가
-      addNode(startInfo);
-      addNode(endInfo);
-
-      return { lis: lis, blocks: blocks, single: false };
-    };
-
-    window._aiSplitTextByNewlines = function(editor){
-      if (!editor) return;
-      if (editor.__aiLineSplit) return;
-      editor.__aiLineSplit = true;
-      var LF = String.fromCharCode(10);
-      var children = Array.prototype.slice.call(editor.children);
-      children.forEach(function(child){
-        var skipTags = ['OL', 'UL', 'TABLE', 'BLOCKQUOTE', 'PRE'];
-        if (skipTags.indexOf(child.tagName) >= 0) return;
-        if (child.tagName !== 'DIV' && child.tagName !== 'P') return;
-        var text = child.textContent || '';
-        if (text.indexOf(LF) < 0) return;
-        var html = child.innerHTML;
-        var parts = html.split(LF);
-        if (parts.length <= 1) return;
-        var origIndent = child.dataset.indent || '';
-        var origStyle = child.getAttribute('style') || '';
-        var frag = document.createDocumentFragment();
-        parts.forEach(function(part){
-          var newDiv = document.createElement('div');
-          newDiv.innerHTML = part;
-          if (!newDiv.textContent.trim() && !newDiv.querySelector('br')) {
-            newDiv.innerHTML = '<br>';
-          }
-          if (origIndent) newDiv.dataset.indent = origIndent;
-          if (origStyle) newDiv.setAttribute('style', origStyle);
-          frag.appendChild(newDiv);
-        });
-        child.parentNode.insertBefore(frag, child);
-        child.remove();
-      });
-    };
-
-    window._aiRefreshAllLists = function(root){
-      // legacy 클래스(ov-list-paren) 흡수
-      root.querySelectorAll('ol.ov-list-paren').forEach(function(ol){
-        ol.classList.remove('ov-list-paren');
-        if (!ol.classList.contains('ov-num')) ol.classList.add('ov-num');
-        if (!ol.dataset.start) ol.dataset.start = '1';
-      });
-      root.querySelectorAll('ol.ov-num').forEach(function(ol){
-        var depth = window._aiGetListDepth(ol, root);
-        window._aiSetOlStyleByDepth(ol, depth);
-      });
-    };
-
-    window._aiEnsureChildOl = function(parentLi, style){
-      var child = null;
-      for (var i = 0; i < parentLi.children.length; i++) {
-        if (parentLi.children[i].tagName === 'OL') { child = parentLi.children[i]; break; }
-      }
-      if (!child) {
-        child = document.createElement('ol');
-        child.className = 'ov-num ov-num-' + style;
-        child.dataset.start = '1';
-        parentLi.appendChild(child);
-      }
-      return child;
-    };
-
-    window._aiIndentCurrentLi = function(editor){
-      var li = window._aiGetCurrentLi(editor);
-      if (!li) return false;
-      var parentOl = li.parentNode;
-      var prevLi = li.previousElementSibling;
-      if (prevLi && prevLi.tagName === 'LI') {
-        // 형제 li 있음 → 자식 ol로 이동
-        var nextDepth = window._aiGetListDepth(parentOl, editor) + 1;
-        var childOl = window._aiEnsureChildOl(prevLi, window._aiStyleForDepth(nextDepth));
-        childOl.appendChild(li);
-        if (!parentOl.querySelector('li')) parentOl.remove();
-      } else {
-        // 형제 li 없음 → 자기 ol depth override 증가
-        var siblings = Array.prototype.filter.call(parentOl.children, function(x){ return x.tagName === 'LI'; });
-        var targetOl = parentOl;
-        if (siblings.length > 1) {
-          var isolatedOl = document.createElement('ol');
-          isolatedOl.className = parentOl.className;
-          isolatedOl.dataset.start = '1';
-          isolatedOl.dataset.manualSplit = '1';
-          parentOl.dataset.manualSplit = '1';
-          isolatedOl.appendChild(li);
-          if (parentOl.nextSibling) parentOl.parentNode.insertBefore(isolatedOl, parentOl.nextSibling);
-          else parentOl.parentNode.appendChild(isolatedOl);
-          targetOl = isolatedOl;
-        }
-        var currentDepth = window._aiGetListDepth(targetOl, editor);
-        var override = targetOl.dataset.depthOverride;
-        var currentEffective = (override != null && override !== '') ? parseInt(override, 10) : currentDepth;
-        var newDepth = currentEffective + 1;
-        if (newDepth <= 5) targetOl.dataset.depthOverride = String(newDepth);
-      }
-      window._aiRefreshAllLists(editor);
-      var r = document.createRange();
-      r.selectNodeContents(li);
-      r.collapse(false);
-      var s = window.getSelection();
-      s.removeAllRanges();
-      s.addRange(r);
-      return true;
-    };
-
-    window._aiOutdentCurrentLi = function(editor){
-      var li = window._aiGetCurrentLi(editor);
-      if (!li) return false;
-      var parentOl = li.parentNode;
-      if (!parentOl) return false;
-
-      // depth-override가 있으면 그것부터 감소
-      var override = parentOl.dataset.depthOverride;
-      if (override != null && override !== '') {
-        var currentOverride = parseInt(override, 10);
-        var currentDepth = window._aiGetListDepth(parentOl, editor);
-        if (currentOverride > currentDepth) {
-          // override 감소
-          var newOverride = currentOverride - 1;
-          if (newOverride <= currentDepth) {
-            delete parentOl.dataset.depthOverride;
-          } else {
-            parentOl.dataset.depthOverride = String(newOverride);
-          }
-          window._aiRefreshAllLists(editor);
-          return true;
-        }
-      }
-
-      // 일반 outdent (nesting 기반)
-      var hostLi = parentOl.parentNode;
-      if (!hostLi || hostLi.tagName !== 'LI') return false;
-      var grandOl = hostLi.parentNode;
-      if (!grandOl || grandOl.tagName !== 'OL') return false;
-      if (hostLi.nextSibling) grandOl.insertBefore(li, hostLi.nextSibling);
-      else grandOl.appendChild(li);
-      if (!parentOl.querySelector('li')) parentOl.remove();
-      window._aiRefreshAllLists(editor);
-      var r = document.createRange();
-      r.selectNodeContents(li);
-      r.collapse(false);
-      var s = window.getSelection();
-      s.removeAllRanges();
-      s.addRange(r);
-      return true;
-    };
-
-    window._aiContinueOl = function(editor, targetLi){
-      if (!targetLi || targetLi.tagName !== 'LI') return;
-      var srcOl = targetLi.parentNode;
-      if (!srcOl || srcOl.tagName !== 'OL') return;
-      var workOl = window._aiSplitOlAtLi(srcOl, targetLi);
-      var prev = window._aiFindPrevOl(editor, workOl);
-      if (!prev) { alert('앞에 이어붙일 리스트가 없어'); if (window._aiRefreshAllLists) window._aiRefreshAllLists(editor); return; }
-      var prevStart = parseInt(prev.dataset.start || '1', 10) || 1;
-      var prevCount = Array.prototype.filter.call(prev.children, function(x){ return x.tagName === 'LI'; }).length;
-      window._aiApplyStart(workOl, prevStart + prevCount);
-      if (window._aiRefreshAllLists) window._aiRefreshAllLists(editor);
-    };
-
-    window._aiRestartOl = function(editor, targetLi){
-      if (!targetLi || targetLi.tagName !== 'LI') return;
-      var srcOl = targetLi.parentNode;
-      if (!srcOl || srcOl.tagName !== 'OL') return;
-      var workOl = window._aiSplitOlAtLi(srcOl, targetLi);
-      window._aiApplyStart(workOl, 1);
-      if (window._aiRefreshAllLists) window._aiRefreshAllLists(editor);
-    };
-
-    window._aiSetStartOl = function(editor, targetLi){
-      if (!targetLi || targetLi.tagName !== 'LI') return;
-      var srcOl = targetLi.parentNode;
-      if (!srcOl || srcOl.tagName !== 'OL') return;
-      // 현재 li의 실제 번호 (data-start + index)
-      var lis = Array.prototype.filter.call(srcOl.children, function(x){ return x.tagName === 'LI'; });
-      var idx = lis.indexOf(targetLi);
-      var srcStart = parseInt(srcOl.dataset.start || '1', 10) || 1;
-      var current = srcStart + idx;
-      var v = prompt('이 항목의 번호', String(current));
-      if (v == null) return;
-      var n = parseInt(String(v).trim(), 10);
-      if (!n || n < 1) { alert('1 이상의 숫자를 입력해'); return; }
-      var workOl = window._aiSplitOlAtLi(srcOl, targetLi);
-      window._aiApplyStart(workOl, n);
-      if (window._aiRefreshAllLists) window._aiRefreshAllLists(editor);
-    };
-  }
-
-  if (!el) return;
-
-  // observer는 attached 플래그와 독립적으로 항상 부착 시도
-  if (!el.__aiListObserver) {
-    function _mergeAdjacentAiListsGlobal(root){
-      if (!root) return;
-      var ols = root.querySelectorAll('ol.ov-num');
-      for (var i = 0; i < ols.length; i++){
-        var ol = ols[i];
-        var prev = ol.previousElementSibling;
-        while (prev && prev.tagName === 'OL' && prev.classList.contains('ov-num') && prev.dataset.manualSplit !== '1' && ol.dataset.manualSplit !== '1') {
-          while (ol.firstChild) prev.appendChild(ol.firstChild);
-          ol.remove();
-          ol = prev;
-          prev = ol.previousElementSibling;
-        }
-        var next = ol.nextElementSibling;
-        while (next && next.tagName === 'OL' && next.classList.contains('ov-num') && next.dataset.manualSplit !== '1' && ol.dataset.manualSplit !== '1') {
-          while (next.firstChild) ol.appendChild(next.firstChild);
-          next.remove();
-          next = ol.nextElementSibling;
-        }
-        ol.style.counterReset = '';
-      }
-    }
-    var _mergeTimer = null;
-    el.__aiListObserver = new MutationObserver(function(){
-      if (_mergeTimer) return;
-      _mergeTimer = setTimeout(function(){
-        _mergeTimer = null;
-        _mergeAdjacentAiListsGlobal(el);
-      }, 50);
-    });
-    el.__aiListObserver.observe(el, { childList: true, subtree: true });
-  }
-
-  if (el.__autoListAttached) return;
-  el.__autoListAttached = true;
-
-  var NL = String.fromCharCode(10);
-
-  function _getCurrentLineText(){
-    var sel = window.getSelection();
-    if (!sel.rangeCount) return { line: '', range: null };
-    var range = sel.getRangeAt(0);
-    var node = range.startContainer;
-    if (node.nodeType !== 3) return { line: '', range: range };
-    var text = node.textContent || '';
-    var leftText = text.substring(0, range.startOffset);
-    var lastBr = leftText.lastIndexOf(NL);
-    var lineStart = lastBr === -1 ? 0 : lastBr + 1;
-    var line = leftText.substring(lineStart);
-    return { line: line, range: range, node: node, lineStart: lineStart };
-  }
-
-  function _detectExistingListLine(line){
-    var m = line.match(/^(\\s*)(\\d+)([\\)\\.])\\s+(.*)$/);
-    if (m) return { type: 'num', indent: m[1], num: parseInt(m[2],10), sep: m[3], content: m[4] };
-    m = line.match(/^(\\s*)([-*\\u00B7])\\s+(.*)$/);
-    if (m) return { type: 'bullet', indent: m[1], bullet: m[2], content: m[3] };
-    return null;
-  }
-
-  el.addEventListener('keydown', function(e){
-    if (e.key !== 'Enter' || e.shiftKey) return;
-    var info = _getCurrentLineText();
-    var existing = _detectExistingListLine(info.line);
-    if (!existing) return;
-
-    if (!existing.content.trim()) {
-      e.preventDefault();
-      var sel = window.getSelection();
-      if (sel.rangeCount && info.node) {
-        var range = document.createRange();
-        range.setStart(info.node, info.lineStart);
-        range.setEnd(info.node, sel.getRangeAt(0).startOffset);
-        range.deleteContents();
-      }
-      document.execCommand('insertLineBreak');
-      return;
-    }
-
-    e.preventDefault();
-    var nextPrefix;
-    if (existing.type === 'num') {
-      nextPrefix = existing.indent + (existing.num + 1) + existing.sep + ' ';
-    } else {
-      nextPrefix = existing.indent + existing.bullet + ' ';
-    }
-    document.execCommand('insertLineBreak');
-    document.execCommand('insertText', false, nextPrefix);
-  });
-};
-</script>
-
-<script>
-(function(){
-  const PAGE_LABEL = {
-    home: '홈 대시보드',
-    report: '보고',
-    production: '생산',
-    inbound: '입고',
-    outbound: '출하',
-  };
-
-  document.querySelectorAll('.nav-item').forEach(function(el){
-    el.addEventListener('click', function(){
-      document.querySelectorAll('.nav-item').forEach(function(x){ x.classList.remove('active'); });
-      el.classList.add('active');
-      const pg = el.getAttribute('data-page');
-      document.getElementById('v2-crumb-page').textContent = PAGE_LABEL[pg] || pg;
-      renderPage(pg);
-    });
-  });
-
-  function renderPage(pg){
-    const c = document.getElementById('v2-content');
-    if (pg === 'report') {
-      c.innerHTML = window.renderReportPageHTML(); // 홈 안내 화면 (보고 UI 제거됨)
-    } else {
-      const icons = { home:'🏠', production:'🏭', inbound:'📥', outbound:'📤' };
-      c.innerHTML = '<div class="placeholder"><div class="big">'+(icons[pg]||'✦')+'</div><div class="title">'+(PAGE_LABEL[pg]||pg)+'</div><div class="sub">개발 중 — 곧 오픈됩니다</div></div>';
-    }
-  }
-
-  // ============================================================
-  // Admin v2 · Report Page (KPI + Upload + List)
-  // ============================================================
-  window.renderReportPageHTML = function(){
-    return ''
-      + '<div class="ov-page">'
-      +   '<div style="padding:64px 24px;text-align:center;color:#6B7280;">'
-      +     '<div style="font-size:48px;margin-bottom:16px;">🏠</div>'
-      +     '<div style="font-size:20px;font-weight:800;color:#35527C;margin-bottom:10px;">홈 대시보드</div>'
-      +     '<div style="font-size:14px;line-height:1.7;">좌측 <b>모델 관리</b> 메뉴에서 프로젝트별 모델·주차별 계획·현황을 등록하고 관리하세요.</div>'
-      +   '</div>'
-      + '</div>';
-  };
-
-  window.openNewProjectModal = async function(){
-    var mask = document.getElementById('ov-newproj-mask');
-    var nameEl = document.getElementById('ov-np-name');
-    var sidebarSel = document.getElementById('v2-division-select');
-    // 초기 로드 시 첫 프로젝트 데이터 로드
-    if (sel.value) {
-      window._projIsEss = ['sdi', 'fluence', 'epc_power'].includes(sel.value);
-      loadModels(sel.value, tableBox);
-    }
-    var divisionId = sidebarSel ? sidebarSel.value : 'semiconductor';
-    if (!mask) return;
-    if (nameEl) nameEl.value = '';
-    if (window._npClearSuggest) window._npClearSuggest();
-    mask.classList.add('open');
-    var divLabel = '';
-    if (sidebarSel) {
-      var opt = sidebarSel.options[sidebarSel.selectedIndex];
-      if (opt) divLabel = opt.textContent || '';
-    }
-    var curDivEl = document.getElementById('ov-np-current-div');
-    if (curDivEl) curDivEl.textContent = divLabel ? '(' + divLabel + ')' : '';
-    await window._npLoadProjectButtons(divisionId);
-    setTimeout(function(){ if (nameEl) nameEl.focus(); }, 50);
-  };
-
-  window._npLoadProjectButtons = async function(divisionId){
-    var box = document.getElementById('ov-np-project-buttons');
-    if (!box) return;
-    while (box.firstChild) box.removeChild(box.firstChild);
-    if (!divisionId) {
-      var hint = document.createElement('div');
-      hint.style.color = '#9CA3AF';
-      hint.style.fontSize = '13px';
-      hint.textContent = '사업부를 선택하세요';
-      box.appendChild(hint);
-      return;
-    }
-    var loading = document.createElement('div');
-    loading.style.color = '#9CA3AF';
-    loading.style.fontSize = '13px';
-    loading.textContent = '불러오는 중...';
-    box.appendChild(loading);
-    try {
-      var sidebarSel = document.getElementById('v2-division-select');
-      var currentDiv = sidebarSel ? sidebarSel.value : 'semiconductor';
-      var r = await fetch('/admin/config/projects?division_id=' + encodeURIComponent(currentDiv), { credentials: 'same-origin' });
-      var d = await r.json();
-      var items = (d && d.projects) || [];
-      while (box.firstChild) box.removeChild(box.firstChild);
-      if (!items.length) {
-        var empty = document.createElement('div');
-        empty.style.color = '#9CA3AF';
-        empty.style.fontSize = '13px';
-        empty.textContent = '등록된 프로젝트가 없습니다';
-        box.appendChild(empty);
-        return;
-      }
-      items.forEach(function(p){
-        var label = p.label || p.id;
-        var btn = document.createElement('button');
-        btn.type = 'button';
-        btn.textContent = label;
-        btn.style.padding = '8px 14px';
-        btn.style.border = '1px solid #D1D5DB';
-        btn.style.borderRadius = '6px';
-        btn.style.background = '#ffffff';
-        btn.style.fontSize = '13px';
-        btn.style.cursor = 'pointer';
-        btn.addEventListener('mouseenter', function(){ btn.style.background = '#F3F4F6'; btn.style.borderColor = '#2563EB'; });
-        btn.addEventListener('mouseleave', function(){ btn.style.background = '#ffffff'; btn.style.borderColor = '#D1D5DB'; });
-        btn.addEventListener('click', function(){
-          var nameEl = document.getElementById('ov-np-name');
-          if (nameEl) nameEl.value = label;
-          window.submitNewProject();
-        });
-        box.appendChild(btn);
-      });
-    } catch(e) {
-      while (box.firstChild) box.removeChild(box.firstChild);
-      var err = document.createElement('div');
-      err.style.color = '#EF4444';
-      err.style.fontSize = '13px';
-      err.textContent = '로드 실패';
-      box.appendChild(err);
-    }
-  };
-
-  window._pendingDeleteDocId = null;
-  window.openDeleteConfirm = function(docId, title){
-    var mask = document.getElementById('ov-delconf-mask');
-    var body = document.getElementById('ov-delconf-body');
-    var status = document.getElementById('ov-delconf-status');
-    if (!mask) return;
-    window._pendingDeleteDocId = docId;
-    if (body) {
-      while (body.firstChild) body.removeChild(body.firstChild);
-      var p1 = document.createElement('div');
-      p1.textContent = '다음 항목을 삭제하시겠습니까?';
-      var p2 = document.createElement('div');
-      p2.style.marginTop = '6px';
-      p2.style.fontWeight = '600';
-      p2.style.color = '#1F2937';
-      p2.textContent = title || docId;
-      body.appendChild(p1);
-      body.appendChild(p2);
-    }
-    if (status) { status.textContent = ''; status.style.color = ''; }
-    mask.classList.add('open');
-  };
-  window.closeDeleteConfirm = function(){
-    var mask = document.getElementById('ov-delconf-mask');
-    if (mask) mask.classList.remove('open');
-    window._pendingDeleteDocId = null;
-  };
-  window.executeDelete = async function(){
-    var docId = window._pendingDeleteDocId;
-    var status = document.getElementById('ov-delconf-status');
-    var confirmBtn = document.getElementById('ov-delconf-confirm');
-    if (!docId) return;
-    if (status) { status.textContent = '삭제 중...'; status.style.color = '#6B7280'; }
-    if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.style.opacity = '0.6'; }
-    try {
-      var res = await fetch('/admin/reports/' + encodeURIComponent(docId), {
-        method: 'DELETE',
-        credentials: 'same-origin',
-      });
-      if (!res.ok) {
-        var detail = 'HTTP ' + res.status;
-        try {
-          var err = await res.json();
-          if (err && err.detail) detail = err.detail;
-        } catch(_) {}
-        if (status) { status.textContent = '❌ 삭제 실패: ' + detail; status.style.color = '#DC2626'; }
-        return;
-      }
-      if (status) { status.textContent = '✅ 삭제 완료'; status.style.color = '#059669'; }
-      setTimeout(function(){
-        window.closeDeleteConfirm();
-        if (window.loadAdminV2Reports) window.loadAdminV2Reports();
-      }, 500);
-    } catch(e) {
-      if (status) { status.textContent = '❌ 네트워크 오류: ' + (e.message || e); status.style.color = '#DC2626'; }
-    } finally {
-      if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.style.opacity = '1'; }
-    }
-  };
-
-    var _npSuggestTimer = null;
-  window._npClearSuggest = function(){
-    var box = document.getElementById('ov-np-suggest');
-    if (!box) return;
-    while (box.firstChild) box.removeChild(box.firstChild);
-  };
-  window._npBuildSuggestBox = function(kind, msg, btnLabel, onAccept, onReject){
-    var box = document.getElementById('ov-np-suggest');
-    if (!box) return;
-    while (box.firstChild) box.removeChild(box.firstChild);
-    var wrap = document.createElement('div');
-    wrap.style.padding = '10px 12px';
-    wrap.style.borderRadius = '6px';
-    wrap.style.fontSize = '13px';
-    wrap.style.display = 'flex';
-    wrap.style.flexWrap = 'wrap';
-    wrap.style.alignItems = 'center';
-    wrap.style.gap = '8px';
-    if (kind === 'warn') {
-      wrap.style.background = '#FEF3C7';
-      wrap.style.border = '1px solid #F59E0B';
-    } else {
-      wrap.style.background = '#DBEAFE';
-      wrap.style.border = '1px solid #3B82F6';
-    }
-    var txt = document.createElement('span');
-    txt.textContent = msg;
-    txt.style.flex = '1';
-    wrap.appendChild(txt);
-    var acceptBtn = document.createElement('button');
-    acceptBtn.type = 'button';
-    acceptBtn.textContent = btnLabel;
-    acceptBtn.style.padding = '4px 10px';
-    acceptBtn.style.border = 'none';
-    acceptBtn.style.borderRadius = '4px';
-    acceptBtn.style.fontSize = '12px';
-    acceptBtn.style.cursor = 'pointer';
-    acceptBtn.style.color = '#ffffff';
-    acceptBtn.style.background = (kind === 'warn') ? '#F59E0B' : '#3B82F6';
-    acceptBtn.addEventListener('click', onAccept);
-    wrap.appendChild(acceptBtn);
-    if (onReject) {
-      var rejectBtn = document.createElement('button');
-      rejectBtn.type = 'button';
-      rejectBtn.textContent = '아니오';
-      rejectBtn.style.padding = '4px 10px';
-      rejectBtn.style.border = '1px solid #D1D5DB';
-      rejectBtn.style.borderRadius = '4px';
-      rejectBtn.style.fontSize = '12px';
-      rejectBtn.style.cursor = 'pointer';
-      rejectBtn.style.background = '#ffffff';
-      rejectBtn.style.color = '#374151';
-      rejectBtn.addEventListener('click', onReject);
-      wrap.appendChild(rejectBtn);
-    }
-    box.appendChild(wrap);
-  };
-  window._npBuildLoadingBox = function(msg){
-    var box = document.getElementById('ov-np-suggest');
-    if (!box) return;
-    while (box.firstChild) box.removeChild(box.firstChild);
-    var wrap = document.createElement('div');
-    wrap.style.padding = '10px 12px';
-    wrap.style.borderRadius = '6px';
-    wrap.style.fontSize = '13px';
-    wrap.style.background = '#F3F4F6';
-    wrap.style.border = '1px solid #D1D5DB';
-    wrap.style.color = '#6B7280';
-    wrap.textContent = msg || 'AI로 확인 중...';
-    box.appendChild(wrap);
-  };
-
-  window._npBuildAiSuggestBox = function(resolved, confidence, query, sidebarDivId){
-    var box = document.getElementById('ov-np-suggest');
-    if (!box) return;
-    while (box.firstChild) box.removeChild(box.firstChild);
-    var wrap = document.createElement('div');
-    wrap.style.padding = '10px 12px';
-    wrap.style.borderRadius = '6px';
-    wrap.style.fontSize = '13px';
-    wrap.style.display = 'flex';
-    wrap.style.flexWrap = 'wrap';
-    wrap.style.alignItems = 'center';
-    wrap.style.gap = '8px';
-    wrap.style.background = '#EDE9FE';
-    wrap.style.border = '1px solid #8B5CF6';
-    var badge = document.createElement('span');
-    badge.textContent = '🤖 AI';
-    badge.style.fontSize = '11px';
-    badge.style.padding = '2px 6px';
-    badge.style.background = '#8B5CF6';
-    badge.style.color = '#ffffff';
-    badge.style.borderRadius = '4px';
-    badge.style.fontWeight = '700';
-    wrap.appendChild(badge);
-    var txt = document.createElement('span');
-    txt.textContent = '혹시 ' + resolved.label + ' 프로젝트인가요? (신뢰도 ' + Math.round(confidence * 100) + '%)';
-    txt.style.flex = '1';
-    wrap.appendChild(txt);
-    var acceptBtn = document.createElement('button');
-    acceptBtn.type = 'button';
-    acceptBtn.textContent = '네, ' + resolved.label;
-    acceptBtn.style.padding = '4px 10px';
-    acceptBtn.style.border = 'none';
-    acceptBtn.style.borderRadius = '4px';
-    acceptBtn.style.fontSize = '12px';
-    acceptBtn.style.cursor = 'pointer';
-    acceptBtn.style.color = '#ffffff';
-    acceptBtn.style.background = '#8B5CF6';
-    acceptBtn.addEventListener('click', async function(){
-      // alias 저장 (백그라운드, 실패해도 진행)
-      try {
-        await fetch('/admin/projects/alias', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin',
-          body: JSON.stringify({ project_id: resolved.id, alias: query })
-        });
-      } catch(_) {}
-      var nameEl = document.getElementById('ov-np-name');
-      if (nameEl) nameEl.value = resolved.label;
-      window.submitNewProject();
-    });
-    wrap.appendChild(acceptBtn);
-    var rejectBtn = document.createElement('button');
-    rejectBtn.type = 'button';
-    rejectBtn.textContent = '아니오';
-    rejectBtn.style.padding = '4px 10px';
-    rejectBtn.style.border = '1px solid #D1D5DB';
-    rejectBtn.style.borderRadius = '4px';
-    rejectBtn.style.fontSize = '12px';
-    rejectBtn.style.cursor = 'pointer';
-    rejectBtn.style.background = '#ffffff';
-    rejectBtn.style.color = '#374151';
-    rejectBtn.addEventListener('click', function(){
-      window._npClearSuggest();
-    });
-    wrap.appendChild(rejectBtn);
-    box.appendChild(wrap);
-  };
-
-  window._onNewProjectNameInput = function(){
-    var nameEl = document.getElementById('ov-np-name');
-    if (!nameEl) return;
-    var q = (nameEl.value || '').trim();
-    if (_npSuggestTimer) clearTimeout(_npSuggestTimer);
-    if (!q) { window._npClearSuggest(); return; }
-    _npSuggestTimer = setTimeout(async function(){
-      try {
-        var r = await fetch('/admin/projects/suggest?query=' + encodeURIComponent(q) + '&limit=3', { credentials: 'same-origin' });
-        var d = await r.json();
-        var exact = d.exact_match;
-        var sug = d.suggestions || [];
-        if (exact) {
-          window._npBuildSuggestBox(
-            'warn',
-            '이미 등록된 프로젝트입니다: ' + exact.label,
-            '이 프로젝트로 진행',
-            function(){
-              nameEl.value = exact.label;
-              window.submitNewProject();
-            },
-            null
-          );
-          return;
-        }
-        if (sug.length > 0 && sug[0].similarity >= 0.6) {
-          var top = sug[0];
-          window._npBuildSuggestBox(
-            'info',
-            '혹시 ' + top.label + ' 프로젝트인가요?',
-            '네, ' + top.label,
-            function(){
-              nameEl.value = top.label;
-              window.submitNewProject();
-            },
-            function(){
-              window._npClearSuggest();
-            }
-          );
-          return;
-        }
-        // fuzzy 실패 -> AI resolver 호출 (최소 2자)
-        if (q.length < 2) {
-          window._npClearSuggest();
-          return;
-        }
-        var sidebarSel = document.getElementById('v2-division-select');
-        var divisionId = sidebarSel ? sidebarSel.value : '';
-        window._npBuildLoadingBox('🤖 AI로 확인 중...');
-        try {
-          var ar = await fetch('/admin/projects/resolve', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'same-origin',
-            body: JSON.stringify({ query: q, division_id: divisionId })
-          });
-          var ad = await ar.json();
-          if (ad && ad.resolved && ad.confidence >= 0.6) {
-            window._npBuildAiSuggestBox(ad.resolved, ad.confidence, q, divisionId);
-          } else {
-            window._npClearSuggest();
-          }
-        } catch(_) {
-          window._npClearSuggest();
-        }
-      } catch(e) {
-        window._npClearSuggest();
-      }
-    }, 500);
-  };
-  window.closeNewProjectModal = function(){
-    const mask = document.getElementById('ov-newproj-mask');
-    if (mask) mask.classList.remove('open');
-  };
-  window.submitNewProject = async function(){
-    const name = (document.getElementById('ov-np-name').value || '').trim();
-    if (!name) { alert('프로젝트명을 입력해주세요'); return; }
-    const divisionSel = document.getElementById('v2-division-select');
-    const divisionId = ((divisionSel && divisionSel.value) ? divisionSel.value : 'semiconductor').trim() || 'semiconductor';
-    // ★ 중복 검사 — 같은 division에 같은 프로젝트명이 이미 있으면 차단
-    try {
-      const _sel = document.getElementById('v2-division-select');
-      const _curDiv = (_sel && _sel.value ? _sel.value : '').trim();
-      const _all = Array.isArray(window._v2AllReports) ? window._v2AllReports : [];
-      const _dup = _all.find(function(r){
-        const _rd = (r.division_id
-                || (r.products && r.products[0] && r.products[0].division_id)
-                || '').trim();
-        const _sameDiv = _curDiv === 'semiconductor'
-          ? (!_rd || _rd === 'semiconductor')
-          : (_rd === _curDiv);
-        if (!_sameDiv) return false;
-        const _pname = ((r.products && r.products[0] && r.products[0].name) || '').trim();
-        return _pname === name;
-      });
-      if (_dup) {
-        alert('⚠️ "' + name + '" 프로젝트가 이미 존재합니다. 기존 보고서를 열어서 편집해주세요.');
-        window.closeNewProjectModal && window.closeNewProjectModal();
-        return;
-      }
-    } catch(_e) {
-      console.warn('중복 검사 실패, 계속 진행:', _e);
-    }
-    // 현재 ISO 주차 자동 계산
-    function getISOWeek(d){
-      const dt = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
-      const dayNum = dt.getUTCDay() || 7;
-      dt.setUTCDate(dt.getUTCDate() + 4 - dayNum);
-      const yearStart = new Date(Date.UTC(dt.getUTCFullYear(),0,1));
-      return Math.ceil((((dt - yearStart) / 86400000) + 1)/7);
-    }
-    const week = getISOWeek(new Date());
-    try {
-      const res = await fetch('/admin/reports', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project_name: name, week: week, headline: '', division_id: divisionId })
-      });
-      if (!res.ok) { alert('생성 실패'); return; }
-      window.closeNewProjectModal();
-      if (window.loadAdminV2Reports) window.loadAdminV2Reports();
-    } catch(e) {
-      alert('오류: ' + e.message);
-    }
-  };
-
-// ─────────────────────────────────────────────
-// admin/v2 사업부 필터 헬퍼
-// ─────────────────────────────────────────────
-window._v2FilterByDivision = function(all){
-    const sel = document.getElementById('v2-division-select');
-    const currentDiv = (sel && sel.value ? sel.value : '').trim();
-    const arr = Array.isArray(all) ? all : [];
-    if (!currentDiv) return arr;
-    return arr.filter(function(r){
-      const rd = (r.division_id
-              || (r.products && r.products[0] && r.products[0].division_id)
-              || (r.products && r.products[0] && r.products[0]._fallback_division_id)
-              || '').trim();
-      if (currentDiv === 'semiconductor') {
-        return !rd || rd === 'semiconductor';
-      }
-      return rd === currentDiv;
-    });
-};
-
-window.renderAdminV2ByDivision = function(){
-    if (typeof window.loadAdminV2Reports === 'function') {
-      window.loadAdminV2Reports();
-    }
-};
-
-  window.loadAdminV2Reports = async function(){
-    return; // 보고 기능 제거됨
-    try {
-      const res = await fetch('/admin/reports/all');
-      const data = await res.json();
-      window._v2AllReports = Array.isArray(data.reports) ? data.reports : [];
-    let reports = window._v2FilterByDivision(window._v2AllReports);
-      // 최신순 정렬 (upload_timestamp desc)
-      reports.sort(function(a, b){
-        return (b.upload_timestamp || '').localeCompare(a.upload_timestamp || '');
-      });
-
-      const listEl = document.getElementById('ov-report-list');
-      if (!listEl) return;
-
-      const __showAll = window._v2ShowAllReports === true;
-      const recent = __showAll ? reports : reports.slice(0, 3);
-
-      // 더 보기 버튼 처리
-      const __moreBtn = document.getElementById('ov-load-more-btn');
-      if (__moreBtn) {
-        if (reports.length <= 3) {
-          __moreBtn.style.display = 'none';
-        } else {
-          __moreBtn.style.display = '';
-          __moreBtn.textContent = __showAll ? '접기' : ('보고 더 보기 (' + (reports.length - 3) + '개)');
-          __moreBtn.onclick = function(){
-            window._v2ShowAllReports = !window._v2ShowAllReports;
-            window.loadAdminV2Reports();
-          };
-        }
-      }
-      if (recent.length === 0) {
-        listEl.innerHTML = '<div style="color:#9CA3AF;font-size:14px;padding:20px;text-align:center;">등록된 보고가 없습니다.</div>';
-      } else {
-        listEl.innerHTML = recent.map(function(r){
-          const title = r.display_title || r.file_name || '제목 없음';
-          const fileName = r.file_name || '파일 없음';
-          const size = r.file_size || '';
-          const firstProduct = (r.products && r.products[0]) || {};
-          const preview = firstProduct.headline || '';
-          const status = (r.report_status || 'published').toString();
-          const dDay = r.d_day;
-
-          let badgeClass = 'green';
-          let badgeText = '발행 완료';
-          let barClass = 'green';
-          let dDayText = '';
-          let dDayColor = '#7A8595';
-
-          if (status === 'ai_processing') {
-            badgeClass = 'blue'; badgeText = 'AI 처리 중'; barClass = 'orange';
-          } else if (status === 'review_pending') {
-            badgeClass = 'amber'; badgeText = '검토 대기'; barClass = 'red';
-          }
-
-          if (dDay === null || dDay === undefined) {
-            dDayText = '';
-          } else if (dDay === 0) {
-            dDayText = 'D-day';
-            dDayColor = '#C1272D';
-          } else if (dDay > 0) {
-            dDayText = 'D-' + dDay;
-            dDayColor = '#C1272D';
-          } else {
-            dDayText = '완료';
-            dDayColor = '#7A8595';
-          }
-
-          // 수기 프로젝트는 파일 없음 → 상태배지/D-day/AI 검토중 preview 다 숨김
-          const isManual = !!r.is_manual;
-          const hideStatus = isManual;
-          const showPreview = !isManual && preview && preview !== 'AI 검토중';
-
-          const sizeText = size ? ' · ' + size : '';
-          const isHidden = !!r.hidden;
-          const hideLabel = isHidden ? '숨김 해제' : '숨기기';
-          const itemClass = 'ov-report-item' + (isHidden ? ' is-hidden' : '');
-          return ''
-            + '<div class="' + itemClass + '">'
-            +   '<div class="ov-report-bar ' + barClass + '"></div>'
-            +   '<div class="ov-report-main">'
-            +     '<div class="ov-report-project">' + title + '</div>'
-            +     '<div class="ov-report-file">📎 ' + fileName + sizeText + '</div>'
-            +     (showPreview ? '<div class="ov-report-preview">' + preview + '</div>' : '')
-            +   '</div>'
-            +   '<div class="ov-report-side">'
-            +     (hideStatus ? '' : ('<div style="display:flex;align-items:center;gap:14px;">'
-            +       '<div class="ov-badge ' + badgeClass + '">' + badgeText + '</div>'
-            +       (dDayText ? '<div style="font-size:15px;font-weight:800;color:' + dDayColor + ';min-width:46px;text-align:right;">' + dDayText + '</div>' : '')
-            +     '</div>'))
-            +     '<div class="ov-side-top-actions">'
-            +       '<button class="ov-hide-btn ov-hide-report' + (isHidden ? ' is-active' : '') + '" type="button" data-doc="' + (r.doc_id || '') + '">' + hideLabel + '</button>'
-            +       '<button class="ov-del-btn ov-del-report" type="button" data-doc="' + (r.doc_id || '') + '" data-title="' + ((r.display_title || r.doc_id || '')).replace(/"/g, '&quot;') + '">삭제</button>'
-            +     '</div>'
-            +     '<button class="ov-open-btn ov-open-report" type="button" data-doc="' + (r.doc_id || '') + '" data-product="' + (((r.products && r.products[0] && r.products[0].name) || '')).replace(/"/g, '') + '" data-split-project="' + ((r._split_project || '')).replace(/"/g, '') + '">열기</button>'
-            +   '</div>'
-            + '</div>';
-        }).join('');
-      }
-
-      const published = reports.filter(function(r){ return (r.report_status || 'published') === 'published'; }).length;
-      const review = reports.filter(function(r){ return (r.report_status || '') === 'review_pending'; }).length;
-      const ai = reports.filter(function(r){ return (r.report_status || '') === 'ai_processing'; }).length;
-
-      // KPI 갱신 JS 제거됨 (보고 UI 삭제)
-      if (pbEl) pbEl.textContent = String(published);
-
-      // + 새 프로젝트 버튼 (재바인딩 안전)
-      const newBtn = document.getElementById('ov-new-project-btn');
-      if (newBtn && !newBtn._bound) {
-        newBtn._bound = true;
-        newBtn.addEventListener('click', window.openNewProjectModal);
-      }
-      const cancelBtn = document.getElementById('ov-np-cancel');
-      if (cancelBtn && !cancelBtn._bound) {
-        cancelBtn._bound = true;
-        cancelBtn.addEventListener('click', window.closeNewProjectModal);
-      }
-      const confirmBtn = document.getElementById('ov-np-confirm');
-      if (confirmBtn && !confirmBtn._bound) {
-        confirmBtn._bound = true;
-        confirmBtn.addEventListener('click', window.submitNewProject);
-      }
-      const maskEl = document.getElementById('ov-newproj-mask');
-      if (maskEl && !maskEl._bound) {
-        maskEl._bound = true;
-        maskEl.addEventListener('click', function(e){
-          if (e.target === maskEl) window.closeNewProjectModal();
-        });
-      }
-      const delCancel = document.getElementById('ov-delconf-cancel');
-      if (delCancel && !delCancel._bound) {
-        delCancel._bound = true;
-        delCancel.addEventListener('click', window.closeDeleteConfirm);
-      }
-      const delConfirm = document.getElementById('ov-delconf-confirm');
-      if (delConfirm && !delConfirm._bound) {
-        delConfirm._bound = true;
-        delConfirm.addEventListener('click', window.executeDelete);
-      }
-      const delMask = document.getElementById('ov-delconf-mask');
-      if (delMask && !delMask._bound) {
-        delMask._bound = true;
-        delMask.addEventListener('click', function(e){
-          if (e.target === delMask) window.closeDeleteConfirm();
-        });
-      }
-      // 모달 사업부 드롭다운은 제거됨 - 사이드바 v2-division-select 값 자동 참조
-      const nameInputBind = document.getElementById('ov-np-name');
-      if (nameInputBind && !nameInputBind._suggestBound) {
-        nameInputBind._suggestBound = true;
-        nameInputBind.addEventListener('input', window._onNewProjectNameInput);
-      }
-
-      // 열기 버튼 이벤트 바인딩
-      document.querySelectorAll('.ov-open-report').forEach(function(btn){
-        btn.addEventListener('click', function(){
-          const doc = btn.getAttribute('data-doc') || '';
-          const prod = btn.getAttribute('data-product') || '';
-          const splitProject = btn.getAttribute('data-split-project') || '';
-          if (window.openReportEdit) window.openReportEdit(doc, prod, splitProject);
-        });
-      });
-      document.querySelectorAll('.ov-del-report').forEach(function(btn){
-        btn.addEventListener('click', function(){
-          var doc = btn.getAttribute('data-doc') || '';
-          var title = btn.getAttribute('data-title') || '';
-          if (doc) window.openDeleteConfirm(doc, title);
-        });
-      });
-      document.querySelectorAll('.ov-hide-report').forEach(function(btn){
-        btn.addEventListener('click', async function(){
-          const doc = btn.getAttribute('data-doc') || '';
-          if (!doc) return;
-          btn.disabled = true;
-          try {
-            const res = await fetch('/admin/reports/' + encodeURIComponent(doc) + '/hide', { method: 'POST' });
-            if (!res.ok) { alert('숨김 처리 실패'); btn.disabled = false; return; }
-            if (window.loadAdminV2Reports) window.loadAdminV2Reports();
-          } catch(e) {
-            alert('숨김 처리 오류: ' + e.message);
-            btn.disabled = false;
-          }
-        });
-      });
-    } catch (e) {
-      console.error('loadAdminV2Reports failed', e);
-    }
-  };
-
-  // ============================================================
-  // Admin v2 · 보고 편집 (raw_text)
-  // ============================================================
-  window._currentEditContext = { divisionId: '', cardTitle: '' };
-
-  window.renderEditPageHTML = function(ctx){
-    ctx = ctx || {};
-    const projectLabel = ctx.projectLabel || '보고';
-    const statusLabel = ctx.statusLabel || '';
-    const statusClass = ctx.statusClass || 'green';
-    const subLine = ctx.subLine || '';
-    return ''
-      + '<style>'
-      + '.ov-edit-topbar{display:flex;align-items:center;justify-content:space-between;background:#fff;border:1px solid #E6EBF2;border-radius:20px;padding:14px 18px;margin-bottom:20px;box-shadow:0 6px 18px rgba(15,44,89,0.04);}'
-      + '.ov-back-btn{border:1px solid #DCE4EF;background:#fff;color:#35527C;border-radius:12px;padding:9px 14px;font-size:14px;font-weight:700;cursor:pointer;}'
-      + '.ov-edit-title{font-size:16px;color:#111827;font-weight:800;}'
-      + '.ov-save-btn{border:0;background:#0F2C59;color:#fff;border-radius:12px;padding:10px 18px;font-size:14px;font-weight:800;cursor:pointer;}'
-      + '.ov-header-card{background:#fff;border:1px solid #E6EBF2;border-radius:22px;padding:22px 24px;margin-bottom:18px;box-shadow:0 6px 18px rgba(15,44,89,0.04);}'
-      + '.ov-header-title{display:flex;align-items:center;gap:12px;font-size:26px;font-weight:800;color:#0F2C59;letter-spacing:-0.3px;margin-bottom:8px;}'
-      + '.ov-header-sub{font-size:14px;color:#6E7785;font-weight:600;}'
-      + '.ov-tabs{display:inline-flex;gap:6px;background:#F1F5FB;border-radius:14px;padding:4px;margin-bottom:20px;}'
-      + '.ov-tab{border:0;background:transparent;color:#6E7785;padding:8px 16px;font-size:13px;font-weight:700;border-radius:10px;cursor:pointer;}'
-      + '.ov-tab.active{background:#0F2C59;color:#fff;}'
-      + '.ov-tab-wrap{display:inline-flex;align-items:center;gap:4px;}'
-      + '.ov-tab-actions{display:inline-flex;align-items:center;gap:4px;opacity:0;pointer-events:none;transition:opacity .15s ease;}'
-      + '.ov-tab-wrap:hover .ov-tab-actions{opacity:1;pointer-events:auto;}'
-      + '.ov-tab-icon{width:24px;height:24px;border:0;border-radius:7px;background:#E8EEF7;color:#5B7BB0;font-size:12px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;padding:0;}'
-      + '.ov-tab-icon:hover{background:#D8E5F7;}'
-      + '.ov-tab-icon.ov-tab-del:hover{background:#FEE7E7;color:#B8302E;}'
-      + '.ov-section{background:#fff;border:1px solid #E6EBF2;border-radius:22px;padding:20px;margin-bottom:18px;box-shadow:0 6px 18px rgba(15,44,89,0.04);}'
-      + '.ov-section-title{font-size:18px;font-weight:800;color:#0F2C59;margin-bottom:14px;display:flex;align-items:center;gap:10px;}'
-      + '.ov-section-num{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;background:#0F2C59;color:#fff;font-size:13px;font-weight:800;}'
-      + '.ov-placeholder{border:2px dashed #D9E3F1;background:#F8FBFF;border-radius:16px;padding:22px;text-align:center;color:#8593A6;font-size:14px;font-weight:600;}'
-      + '.ov-kpi-slot-wrap{margin-top:16px;}'
-      + '.ov-kpi-slot-label{font-size:13px;color:#6E7785;font-weight:700;margin-bottom:10px;padding-left:4px;}'
-      + '.ov-kpi-slot{background:#F8FBFF;border:1px solid #E6EBF2;border-radius:18px;padding:18px;}'
-      + '.ov-badge-inline{display:inline-flex;align-items:center;border-radius:999px;padding:6px 12px;font-size:12px;font-weight:800;}'
-      + '.ov-badge-inline.green{background:#E7F8F0;color:#117A52;}'
-      + '.ov-badge-inline.amber{background:#FFF3D9;color:#9A6700;}'
-      + '.ov-badge-inline.blue{background:#E7F0FB;color:#23538C;}'
-      + '.ov-badge-inline.red{background:#FEE7E7;color:#B8302E;}'
-      + '.ov-kpi-grid-months{display:grid;grid-template-columns:repeat(3, minmax(0,1fr));gap:12px;margin-bottom:12px;}'
-      + '.ov-kpi-grid-weeks{display:grid;grid-template-columns:repeat(5, minmax(0,1fr));gap:10px;}'
-      + '.ov-kpi-cell{background:#fff;border:1px solid #E6EBF2;border-radius:14px;padding:14px;}'
-      + '.ov-kpi-cell.actual{border-color:#B9E1CE;}'
-      + '.ov-kpi-cell.plan{border-color:#D9E3F1;}'
-      + '.ov-kpi-cell-label{font-size:12px;color:#6E7785;font-weight:700;margin-bottom:4px;}'
-      + '.ov-kpi-cell-value{font-size:20px;color:#0F2C59;font-weight:800;line-height:1.1;}'
-      + '.ov-kpi-cell-unit{font-size:12px;color:#7A8595;font-weight:600;margin-left:4px;}'
-      + '.ov-kpi-cell-sub{font-size:11px;color:#8593A6;font-weight:600;margin-top:4px;}'
-      + '.ov-kpi-cell-badge{font-size:10px;font-weight:800;padding:2px 6px;border-radius:6px;margin-left:6px;vertical-align:middle;}'
-      + '.ov-kpi-cell-badge.actual{background:#E7F8F0;color:#117A52;}'
-      + '.ov-kpi-cell-badge.plan{background:#EAF0FB;color:#2E5B94;}'
-      + '.ov-issue-list{display:flex;flex-direction:column;gap:10px;}'
-      + '.ov-issue-row{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:12px 14px;background:#F8FBFF;border:1px solid #E6EBF2;border-radius:14px;}'
-      + '.ov-issue-text{font-size:14px;color:#111827;font-weight:700;line-height:1.45;flex:1;}'
-      + '.ov-issue-dday{font-size:12px;font-weight:800;color:#B8302E;white-space:nowrap;}'
-      + '.ov-list-dash{padding-left:20px;} .ov-list-dash li{position:relative;list-style:none;} .ov-list-dash li::before{content:"－";position:absolute;left:-16px;color:#6E7785;}'
-      + '.ov-list-triangle{padding-left:22px;} .ov-list-triangle li{position:relative;list-style:none;} .ov-list-triangle li::before{content:"▶";position:absolute;left:-18px;color:#2E5B94;font-size:0.85em;top:0.15em;}'
-      + '.ov-list-check{padding-left:22px;} .ov-list-check li{position:relative;list-style:none;} .ov-list-check li::before{content:"✓";position:absolute;left:-18px;color:#117A52;font-weight:800;}'
-      + '.ov-list-star{padding-left:22px;} .ov-list-star li{position:relative;list-style:none;} .ov-list-star li::before{content:"★";position:absolute;left:-20px;color:#D9A400;}'
-      + '.ov-list-arrow{padding-left:24px;} .ov-list-arrow li{position:relative;list-style:none;} .ov-list-arrow li::before{content:"➜";position:absolute;left:-20px;color:#2E5B94;}'
-      + '.ov-list-diamond{padding-left:22px;} .ov-list-diamond li{position:relative;list-style:none;} .ov-list-diamond li::before{content:"◆";position:absolute;left:-18px;color:#8B5CF6;}'
-      + '.ov-list-dot{padding-left:18px;} .ov-list-dot li{position:relative;list-style:none;} .ov-list-dot li::before{content:"·";position:absolute;left:-12px;color:#6E7785;font-weight:800;}'
-      + '.ov-list-circled{padding-left:26px;counter-reset:ov-circled;} .ov-list-circled li{position:relative;list-style:none;counter-increment:ov-circled;} .ov-list-circled li::before{content:counter(ov-circled,decimal);position:absolute;left:-22px;display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border:1.5px solid #12325F;border-radius:50%;font-size:10px;font-weight:800;color:#111827;top:0.2em;}'
-      + '.ov-list-paren{padding-left:22px;counter-reset:ov-paren;} .ov-list-paren li{position:relative;list-style:none;counter-increment:ov-paren;} .ov-list-paren li::before{content:counter(ov-paren) ")";position:absolute;left:-18px;color:#111827;font-weight:700;}'
-      + '</style>'
-      + '<div class="ov-edit-topbar" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">'
-      + '  <button class="ov-back-btn" type="button" id="ov-back-btn" style="flex-shrink:0;">← 목록으로</button>'
-      + '  <div class="ov-edit-title" id="ov-edit-title" style="flex:1;text-align:center;font-size:16px;font-weight:800;color:#111827;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + projectLabel + '</div>'
-      + '  <div style="flex-shrink:0;width:100px;"></div>'
-      + '</div>'
-      + (ctx.isManual
-          ? '<div id="ov-sections-container"></div>'
-          : ('<div class="ov-tabs" id="ov-ppt-tabs">'
-            + '  <button class="ov-tab active" type="button" data-ppt-jump="0">① 현황</button>'
-            + '  <button class="ov-tab" type="button" data-ppt-jump="1">② 주차별 출하실적</button>'
-            + '  <button class="ov-tab" type="button" data-ppt-jump="2">③ 주요내용</button>'
-            + '</div>'
-            + '<div class="ov-section">'
-            + '  <div class="ov-section-title"><span class="ov-section-num">1</span>현황</div>'
-            + '  <div id="ov-current-status" class="ov-placeholder">현황 요약 (headline) 이 여기에 표시됩니다.</div>'
-            + '</div>'
-            + '<div class="ov-section">'
-            + '  <div class="ov-section-title"><span class="ov-section-num">2</span>주차별 출하실적</div>'
-            + '  <div class="ov-placeholder" style="margin-bottom:14px;">📥 출하실적 엑셀 업로드 · 개발 중</div>'
-            + '  <div class="ov-placeholder" style="margin-bottom:14px;">📊 주차별 출하실적 표 · 개발 중</div>'
-            + '  <div class="ov-kpi-slot-wrap">'
-            + '    <div class="ov-kpi-slot-label">↓ 표에서 파생 · KPI 카드 (자동 계산)</div>'
-            + '    <div class="ov-kpi-slot" id="ov-kpi-slot">'
-            + '      <div style="color:#8593A6;font-size:13px;text-align:center;padding:12px;">KPI 데이터 로드 중...</div>'
-            + '    </div>'
-            + '  </div>'
-            + '</div>'
-            + '<div class="ov-section">'
-            + '  <div class="ov-section-title"><span class="ov-section-num">3</span>주요내용</div>'
-            + '  <div id="ov-issues-slot">'
-            + '    <div class="ov-placeholder">주요내용 블록 · 개발 중</div>'
-            + '  </div>'
-            + '</div>'));
-  };
-
-  // KPI 카드 렌더 헬퍼
-  window.renderKpiCardInline = function(card, issues){
-    if (!card) {
-      return '<div style="color:#8593A6;font-size:13px;text-align:center;padding:12px;">이 프로젝트는 KPI 데이터가 없습니다.</div>';
-    }
-    const months = Array.isArray(card.months) ? card.months : [];
-    const weeks = Array.isArray(card.weeks) ? card.weeks : [];
-    const unit = card.unit_label || '만불';
-
-    let html = '';
-
-    if (months.length > 0) {
-      html += '<div class="ov-kpi-grid-months">';
-      months.forEach(function(m){
-        const typeClass = m.type === 'actual' ? 'actual' : 'plan';
-        const badgeText = m.type === 'actual' ? '실적' : '계획';
-        const monthKey = m.month_key || m.key || '';
-        html += ''
-          + '<div class="ov-kpi-cell ' + typeClass + '">'
-          + '  <div class="ov-kpi-cell-label">' + (m.month || '') + '<span class="ov-kpi-cell-badge ' + typeClass + '">' + badgeText + '</span></div>'
-          + '  <div class="ov-kpi-cell-value">' + (m.total != null ? Number(m.total).toFixed(2) : '-') + '<span class="ov-kpi-cell-unit">' + unit + '</span></div>'
-          + '  <div class="ov-kpi-cell-sub">EFEM ' + (m.efem != null ? Number(m.efem).toFixed(2) : '-') + ' · VTM ' + (m.vtm != null ? Number(m.vtm).toFixed(2) : '-') + '</div>'
-          + '</div>';
-      });
-      html += '</div>';
-    }
-
-    if (weeks.length > 0) {
-      html += '<div class="ov-kpi-grid-weeks">';
-      weeks.forEach(function(w){
-        const typeClass = w.type === 'actual' ? 'actual' : 'plan';
-        const badgeText = w.type === 'actual' ? '실적' : '계획';
-        const weekKey = w.week_key || w.key || w.week || '';
-        html += ''
-          + '<div class="ov-kpi-cell ' + typeClass + '">'
-          + '  <div class="ov-kpi-cell-label">' + (w.week || '') + '<span class="ov-kpi-cell-badge ' + typeClass + '">' + badgeText + '</span></div>'
-          + '  <div class="ov-kpi-cell-value">' + (w.total != null ? Number(w.total).toFixed(2) : '-') + '<span class="ov-kpi-cell-unit">' + unit + '</span></div>'
-          + '  <div class="ov-kpi-cell-sub">EFEM ' + (w.efem != null ? Number(w.efem).toFixed(2) : '-') + ' · VTM ' + (w.vtm != null ? Number(w.vtm).toFixed(2) : '-') + '</div>'
-          + '</div>';
-      });
-      html += '</div>';
-    }
-
-    if (Array.isArray(issues) && issues.length > 0) {
-      html += '<div style="margin-top:14px;padding-top:14px;border-top:1px dashed #D9E3F1;">';
-      html += '<div style="font-size:12px;color:#6E7785;font-weight:700;margin-bottom:8px;">이슈 라인 (참고)</div>';
-      html += '<div class="ov-issue-list">';
-      issues.forEach(function(ii){
-        const text = ii.text || '';
-        const dueDate = ii.due_date || '';
-        let ddayText = '';
-        if (dueDate && ii.show_dday !== false) {
-          try {
-            const d = new Date(dueDate);
-            const today = new Date();
-            const diff = Math.round((d - today) / (1000*60*60*24));
-            const mmdd = (d.getMonth()+1) + '/' + d.getDate();
-            if (diff === 0) ddayText = 'D-day · ' + mmdd;
-            else if (diff > 0) ddayText = 'D-' + diff + ' · ' + mmdd;
-            else ddayText = 'D+' + Math.abs(diff) + ' 지남 · ' + mmdd;
-          } catch(_){}
-        }
-        html += ''
-          + '<div class="ov-issue-row">'
-          + '  <div class="ov-issue-text">' + text + '</div>'
-          + (ddayText ? '<div class="ov-issue-dday">' + ddayText + '</div>' : '')
-          + '</div>';
-      });
-      html += '</div></div>';
-    }
-
-    return html;
-  };
-
-  window.openReportEdit = async function(docId, productName, splitProject){
-    const c = document.getElementById('v2-content-inner') || document.getElementById('v2-content');
-    if (!c) return;
-
-    // 1) 보고 메타 조회 (admin은 숨김 포함 전체를 봐야 하므로 /admin/reports/all 사용)
-    let target = null;
-    try {
-      const res = await fetch('/admin/reports/all');
-      const data = await res.json();
-      const reports = Array.isArray(data.reports) ? data.reports : [];
-      target = reports.find(function(r){
-        return r.doc_id === docId && ((r._split_project || '') === (splitProject || ''));
-      }) || reports.find(function(r){
-        return r.doc_id === docId;
-      }) || reports.find(function(r){
-        return ((r._split_project || '') === (splitProject || ''));
-      }) || reports.find(function(r){
-        const names = []
-          .concat(r.manual_projects || [])
-          .concat(((r.parsed || {}).projects) || [])
-          .concat((r.products || []).map(function(p){ return p && p.name ? p.name : ''; }));
-        return names.some(function(n){ return String(n || '').trim() === String(productName || '').trim(); });
-      }) || null;
-      if (!target) {
-        console.warn('열기: 해당 보고를 찾을 수 없음', docId, splitProject);
-        alert('해당 보고를 찾을 수 없습니다. 목록을 새로고침합니다.');
-        if (window.backToReportList) window.backToReportList();
-        return;
-      }
-    } catch(e){
-      console.error(e);
-      alert('보고 조회 실패: ' + e.message);
-      return;
-    }
-
-    // 2) 헤더 컨텍스트 구성
-    const parsed = (target && target.parsed) || {};
-    const projects = parsed.projects || [];
-    const _base = projects.length ? projects.join(', ') : (target && target.file_name) || '보고';
-    // week_override > parsed.week > 현재 주차 (자동 계산)
-    let _week = (target && target.week_override) || parsed.week || '';
-    if (!_week) {
-      const _now = new Date();
-      const _start = new Date(_now.getFullYear(), 0, 1);
-      const _days = Math.floor((_now - _start) / (24 * 60 * 60 * 1000));
-      _week = Math.ceil((_days + _start.getDay() + 1) / 7);
-    }
-    const projectLabel = _base
-      ? (_week ? _base + ' · W' + _week + ' 주간보고' : _base)
-      : ((target && target.display_title) || '보고');
-    const week = _week || '';
-    const date = parsed.date || (target && (target.report_meta || {}).date) || '';
-    const firstProduct = (target && target.products && target.products[0]) || {};
-    const headline = firstProduct.headline || '';
-
-    let statusLabel = '발행 완료';
-    let statusClass = 'green';
-    if (target && target.report_status === 'ai_processing') { statusLabel = 'AI 처리 중'; statusClass = 'amber'; }
-    else if (target && target.report_status === 'review_pending') { statusLabel = '검토 대기'; statusClass = 'red'; }
-
-    const subParts = [];
-    if (date) subParts.push('보고일자 ' + date);
-    if (week) subParts.push('W' + week);
-    if (headline) subParts.push(headline);
-    const subLine = subParts.join(' · ');
-
-    // 3) 스켈레톤 렌더
-    const isManual = !!(target && target.is_manual);
-    c.innerHTML = window.renderEditPageHTML({
-      fileName: (target && target.file_name) || (isManual ? '(수기 프로젝트)' : '편집'),
-      projectLabel: projectLabel,
-      statusLabel: isManual ? '' : statusLabel,
-      statusClass: statusClass,
-      subLine: isManual ? '' : subLine,
-      isManual: isManual
-    });
-
-    // 수기 프로젝트: sections CRUD 지원
-    let sectionsState = [];
-    let sectionsDirty = false;
-    const SECTION_ALIASES = {
-      '현황': ['현황','상황','진행현황','진행상황'],
-      '주차별 출하실적': ['주차별 출하실적','출하','출하실적','주차실적','실적','shipment'],
-      '주차별 계획': ['주차별 계획','계획','주차계획','주간계획','plan'],
-      '주요내용': ['주요내용','주요','핵심내용','핵심','main'],
-      '이슈/리스크': ['이슈/리스크','이슈','리스크','문제','특이사항','issue','risk'],
-      '요청사항': ['요청사항','요청','지원요청','request']
-    };
-    function _normSectionName(s){
-      return String(s || '').trim().toLowerCase().replace(/\\s+/g,' ');
-    }
-    function _findAliasCanonical(input){
-      const n = _normSectionName(input);
-      if (!n) return null;
-      for (const canonical in SECTION_ALIASES) {
-        const list = SECTION_ALIASES[canonical];
-        for (let i=0;i<list.length;i++){
-          if (_normSectionName(list[i]) === n) return canonical;
-        }
-      }
-      return null;
-    }
-    function _genSecId(){
-      return 'sec_' + Math.random().toString(36).slice(2,10);
-    }
-    function _markSectionsDirty(){
-      sectionsDirty = true;
-      markDirty();
-    }
-
-    if (isManual) {
-      sectionsState = JSON.parse(JSON.stringify(firstProduct.sections || []));
-
-      // ─── 편집 컨텍스트 설정 (일정 관리 패널용) ───
-      try {
-        // divisionId 우선순위: target.division_id → 사이드바 선택값
-        let divIdFromTarget = (target && (target.division_id || target.divisionId)) || '';
-        if (!divIdFromTarget) {
-          const sidebarSel = document.getElementById('v2-division-select')
-                          || document.getElementById('sidebarDivisionSelect')
-                          || document.querySelector('select[name="division"]')
-                          || document.querySelector('[data-role="division-select"]');
-          if (sidebarSel) divIdFromTarget = sidebarSel.value || '';
-        }
-        // 마지막 fallback: URL/hash에서 division 추출
-        if (!divIdFromTarget) {
-          const m = location.hash.match(/division[=/]([\\w-]+)/);
-          if (m) divIdFromTarget = m[1];
-        }
-
-        // cardTitle 우선순위: manual_projects[0] → firstProduct.name → projectLabel 앞부분
-        let cardTitleClean = '';
-        const mp = (target && target.manual_projects) || [];
-        if (mp.length > 0) cardTitleClean = String(mp[0]).trim();
-        if (!cardTitleClean && firstProduct && firstProduct.name) {
-          cardTitleClean = String(firstProduct.name).trim();
-        }
-        if (!cardTitleClean && projectLabel) {
-          // "챔버 · W30 주간보고" 같은 형태에서 "챔버" 부분만
-          cardTitleClean = String(projectLabel).split('·')[0].trim();
-        }
-
-        window._currentEditContext = {
-          divisionId: divIdFromTarget,
-          cardTitle: cardTitleClean
-        };
-        console.log('[일정 패널] 컨텍스트:', window._currentEditContext);
-      } catch(e) { console.error('컨텍스트 설정 실패', e); }
-
-      // ─── 일정 관리 패널용 items 캐시 로드 (현재 카드만 notes에서 로드) ───
-      window._notesItemsCache = {};
-      (async function _loadNotesForSchedule(){
-        try {
-          let divId = (window._currentEditContext || {}).divisionId || '';
-          const cardTitle = (window._currentEditContext || {}).cardTitle || '';
-          if (!divId) {
-            const sel = document.getElementById('v2-division-select');
-            if (sel) divId = sel.value || '';
-          }
-          if (!divId || !cardTitle) return;
-          const r = await fetch('/notes?division_id=' + encodeURIComponent(divId), { credentials: 'same-origin' });
-          if (!r.ok) return;
-          const j = await r.json();
-          const cards = (j.cards) || ((j.notes || {}).cards) || [];
-          const card = cards.find(function(c){ return (c.title || '').trim() === cardTitle.trim(); });
-          if (!card) return;
-          const map = {};
-          (card.sections || []).forEach(function(sec){
-            map[sec.title || ''] = Array.isArray(sec.items) ? sec.items : [];
-          });
-          window._notesItemsCache = map;
-          if (window._renderManualSections) window._renderManualSections();
-        } catch(e) { console.error('notes items 로드 실패', e); }
-      })();
-      const sectionsRoot = document.getElementById('ov-sections-container');
-
-      // === Tab/Shift+Tab/Backspace/Ctrl+Z Document-level Delegation ===
-      // 재렌더링돼도 리스너 안 죽게 document에 1회만 등록.
-      // 기존 editBox 개별 리스너(5349,5370,5511,5661,5964,5980)는
-      // stopImmediatePropagation()으로 무력화됨.
-      if (!document.__aiTabDelegationInstalled) {
-        document.__aiTabDelegationInstalled = true;
-
-        document.addEventListener('keydown', function(ev){
-          var target = ev.target;
-          if (!target || !target.closest) return;
-
-          var aiBox = target.closest('.ov-ai-diff-edit');
-          var origBox = target.closest('.ov-block-text-body');
-          var editBox = aiBox || origBox;
-          if (!editBox) return;
-
-          var isAi = !!aiBox;
-          var isMod = ev.metaKey || ev.ctrlKey;
-
-          // undo API 분기
-          var pushUndo = isAi ? editBox._aiPushUndo : editBox._origPushUndo;
-          var undoFn = isAi ? editBox._aiUndo : editBox._origUndo;
-          var redoFn = isAi ? editBox._aiRedo : editBox._origRedo;
-          var getCur = isAi ? editBox._aiGetCursorOffset : editBox._origGetCursorOffset;
-          var setCur = isAi ? editBox._aiSetCursorOffset : editBox._origSetCursorOffset;
-
-          // ─────────────────────────────────
-          // Ctrl+Z / Cmd+Z / Ctrl+Shift+Z / Ctrl+Y
-          // ─────────────────────────────────
-          if (isMod && (ev.key === 'z' || ev.key === 'Z')) {
-            if (!undoFn || !redoFn) return;
-            ev.preventDefault();
-            if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-            if (ev.shiftKey) redoFn();
-            else undoFn();
-            return;
-          }
-          if (isMod && (ev.key === 'y' || ev.key === 'Y')) {
-            if (!redoFn) return;
-            ev.preventDefault();
-            if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-            redoFn();
-            return;
-          }
-
-          // ─────────────────────────────────
-          // Tab / Shift+Tab
-          // ─────────────────────────────────
-          if (ev.key === 'Tab') {
-            if (!window._aiCollectSelectedNodes) return;
-            // 자동 마이그레이션 + selection 복원
-            // 개행 문자로 뭉친 텍스트를 개별 div로 분리하고 커서를 새 div로 재설정
-            if (window._aiSplitTextByNewlines && !editBox.__aiLineSplit) {
-              var _savedSel = window.getSelection();
-              var _savedAnchor = _savedSel && _savedSel.anchorNode;
-              var _savedOffset = _savedSel && _savedSel.anchorOffset;
-              var _savedText = null;
-              if (_savedAnchor && _savedAnchor.nodeType === 3) {
-                _savedText = _savedAnchor.nodeValue;
-              }
-              window._aiSplitTextByNewlines(editBox);
-              if (_savedText) {
-                try {
-                  var walker = document.createTreeWalker(editBox, NodeFilter.SHOW_TEXT, null, false);
-                  var found = null;
-                  while (walker.nextNode()) {
-                    var n = walker.currentNode;
-                    if (n.nodeValue === _savedText ||
-                        (_savedText.length > 5 && n.nodeValue.indexOf(_savedText.substring(0, 20)) >= 0)) {
-                      found = n;
-                      break;
-                    }
-                  }
-                  if (found) {
-                    var range = document.createRange();
-                    var newOffset = Math.min(_savedOffset || 0, found.nodeValue.length);
-                    range.setStart(found, newOffset);
-                    range.collapse(true);
-                    var s = window.getSelection();
-                    s.removeAllRanges();
-                    s.addRange(range);
-                  }
-                } catch(e) {}
-              }
-            }
-            var collected = window._aiCollectSelectedNodes(editBox);
-            if (collected.lis.length === 0 && collected.blocks.length === 0) return;
-
-            ev.preventDefault();
-            if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-            if (pushUndo) pushUndo();
-
-            var savedOffset = getCur ? getCur() : -1;
-            var lis = collected.lis.slice();
-            var blocks = collected.blocks.slice();
-
-            if (ev.shiftKey) {
-              // Shift+Tab: outdent / unlist (아래부터 처리)
-              var sortedLisOut = lis.slice().sort(function(a, b){
-                var pos = a.compareDocumentPosition(b);
-                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return 1;
-                if (pos & Node.DOCUMENT_POSITION_PRECEDING) return -1;
-                return 0;
-              });
-              sortedLisOut.forEach(function(li){
-                if (!li.parentNode) return;
-                var parentOl = li.parentNode;
-                var ovr = parentOl.dataset.depthOverride;
-                if (ovr != null && ovr !== '') {
-                  var currentOvr = parseInt(ovr, 10);
-                  var currentDep = window._aiGetListDepth(parentOl, editBox);
-                  if (currentOvr > currentDep) {
-                    var newOvr = currentOvr - 1;
-                    if (newOvr <= currentDep) delete parentOl.dataset.depthOverride;
-                    else parentOl.dataset.depthOverride = String(newOvr);
-                    return;
-                  }
-                }
-                var hostLi = parentOl ? parentOl.parentNode : null;
-                var isTopLevel = !hostLi || hostLi.tagName !== 'LI';
-                if (isTopLevel) {
-                  if (window._aiUnlistCurrentLi) window._aiUnlistCurrentLi(editBox, li);
-                } else {
-                  var grandOl = hostLi.parentNode;
-                  if (grandOl && grandOl.tagName === 'OL') {
-                    if (hostLi.nextSibling) grandOl.insertBefore(li, hostLi.nextSibling);
-                    else grandOl.appendChild(li);
-                    if (!parentOl.querySelector('li')) parentOl.remove();
-                  }
-                }
-              });
-              blocks.forEach(function(block){
-                var cur = parseInt(block.dataset.indent || '0', 10) || 0;
-                if (cur > 0) {
-                  block.setAttribute('data-indent', String(cur - 1));
-                  if (String(cur - 1) === '0') block.removeAttribute('data-indent');
-                } else if (block.dataset.indent) {
-                  delete block.dataset.indent;
-                }
-              });
-            } else {
-              // Tab: indent (옵션 3 - selection 모든 li depth 증가)
-              var sortedLis = lis.slice().sort(function(a, b){
-                var pos = a.compareDocumentPosition(b);
-                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-                if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-                return 0;
-              });
-              sortedLis.forEach(function(li, i){
-                if (!li.parentNode) return;
-                var parentOl = li.parentNode;
-                var prevLi = li.previousElementSibling;
-                var hasPrevLi = prevLi && prevLi.tagName === 'LI' && sortedLis.indexOf(prevLi) < 0;
-
-                if (hasPrevLi) {
-                  var childOl = window._aiEnsureChildOl(prevLi, window._aiStyleForDepth(window._aiGetListDepth(parentOl, editBox) + 1));
-                  childOl.appendChild(li);
-                  if (!parentOl.querySelector('li')) parentOl.remove();
-                } else {
-                  // 이전 li가 없어도 자리는 유지: 원래 ol을 li 위치에서 분할
-                  // [앞 li들이 있던 원래 ol] [분리된 li의 새 ol] [뒤 li들의 새 ol]
-                  var siblings = Array.prototype.filter.call(parentOl.children, function(x){ return x.tagName === 'LI'; });
-                  var targetOl = parentOl;
-                  if (siblings.length > 1) {
-                    // li 뒤에 남는 li들 수집
-                    var trailingLis = [];
-                    var cur = li.nextElementSibling;
-                    while (cur) {
-                      var next = cur.nextElementSibling;
-                      if (cur.tagName === 'LI') trailingLis.push(cur);
-                      cur = next;
-                    }
-
-                    // 새 ol 생성 (분리된 li용)
-                    var isolatedOl = document.createElement('ol');
-                    isolatedOl.className = parentOl.className;
-                    isolatedOl.dataset.start = '1';
-                    isolatedOl.dataset.manualSplit = '1';
-                    parentOl.dataset.manualSplit = '1';
-
-                    // 뒤 li가 있으면 별도 ol로 감쌈 (parentOl 뒤에)
-                    var trailingOl = null;
-                    if (trailingLis.length > 0) {
-                      trailingOl = document.createElement('ol');
-                      trailingOl.className = parentOl.className;
-                      trailingOl.dataset.manualSplit = '1';
-                      // parentOl의 start 값 계산: 원래 start + 지금까지 남은 li 개수
-                      var origStart = parseInt(parentOl.dataset.start || parentOl.getAttribute('start') || '1', 10) || 1;
-                      var remainingCount = siblings.indexOf(li); // li 앞의 li 개수
-                      trailingOl.dataset.start = String(origStart + remainingCount + 1);
-                      trailingLis.forEach(function(tli){ trailingOl.appendChild(tli); });
-                    }
-
-                    // 순서: parentOl(앞 li들) → isolatedOl(분리 li) → trailingOl(뒤 li들)
-                    // li를 isolatedOl로 이동
-                    isolatedOl.appendChild(li);
-
-                    // isolatedOl을 parentOl 바로 뒤에 삽입
-                    if (parentOl.nextSibling) parentOl.parentNode.insertBefore(isolatedOl, parentOl.nextSibling);
-                    else parentOl.parentNode.appendChild(isolatedOl);
-
-                    // trailingOl을 isolatedOl 바로 뒤에 삽입
-                    if (trailingOl) {
-                      if (isolatedOl.nextSibling) isolatedOl.parentNode.insertBefore(trailingOl, isolatedOl.nextSibling);
-                      else isolatedOl.parentNode.appendChild(trailingOl);
-                    }
-
-                    // parentOl이 비었으면 제거 (li가 첫 번째였을 때)
-                    if (!parentOl.querySelector('li')) parentOl.remove();
-
-                    targetOl = isolatedOl;
-                  }
-                  var currentDepth = window._aiGetListDepth(targetOl, editBox);
-                  var override = targetOl.dataset.depthOverride;
-                  var currentEffective = (override != null && override !== '') ? parseInt(override, 10) : currentDepth;
-                  var newDepth = currentEffective + 1;
-                  if (newDepth <= 5) targetOl.dataset.depthOverride = String(newDepth);
-                }
-              });
-              blocks.forEach(function(block){
-                var cur = parseInt(block.dataset.indent || '0', 10) || 0;
-                if (cur < 5) block.setAttribute('data-indent', String(cur + 1));
-              });
-            }
-
-            if (window._aiRefreshAllLists) window._aiRefreshAllLists(editBox);
-            if (savedOffset >= 0 && setCur) setCur(savedOffset);
-
-            // body 동기화 + dirty
-            try {
-              var si2 = parseInt(editBox.getAttribute('data-sec-idx'), 10);
-              var bi2 = parseInt(editBox.getAttribute('data-blk-idx'), 10);
-              if (sectionsState[si2] && sectionsState[si2].blocks && sectionsState[si2].blocks[bi2]) {
-                // data-indent 속성을 실제 HTML 속성으로 동기화 (innerHTML에 포함되도록)
-                editBox.querySelectorAll('[data-indent]').forEach(function(el) {
-                  if (el.dataset.indent && el.dataset.indent !== '0') {
-                    el.setAttribute('data-indent', el.dataset.indent);
-                  }
-                });
-                // HTML → items 변환 (구조화된 저장)
-                var items = window._htmlToItems(editBox.innerHTML);
-                sectionsState[si2].blocks[bi2].items = items;  // HTML 대신 items 저장
-                sectionsState[si2].blocks[bi2].body = editBox.innerHTML;  // 기존 호환용
-                _markSectionsDirty();
-              }
-            } catch(e) {}
-            return;
-          }
-
-          // ─────────────────────────────────
-          // Backspace at line start (outdent/unlist)
-          // ─────────────────────────────────
-          if (ev.key === 'Backspace') {
-            if (!window._aiIsAtLineStart) return;
-            var check = window._aiIsAtLineStart(editBox);
-            if (!check || !check.atStart) return;
-            var info = check.info;
-            if (!info || info.type !== 'li') return;
-
-            var li = info.node;
-            var parentOl = li.parentNode;
-            var hostLi = parentOl ? parentOl.parentNode : null;
-            var isTopLevel = !hostLi || hostLi.tagName !== 'LI';
-
-            ev.preventDefault();
-            if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-            if (pushUndo) pushUndo();
-
-            if (isTopLevel) {
-              if (window._aiUnlistCurrentLi) window._aiUnlistCurrentLi(editBox, li);
-            } else {
-              var grandOl = hostLi.parentNode;
-              if (grandOl && grandOl.tagName === 'OL') {
-                if (hostLi.nextSibling) grandOl.insertBefore(li, hostLi.nextSibling);
-                else grandOl.appendChild(li);
-                if (!parentOl.querySelector('li')) parentOl.remove();
-                if (window._aiRefreshAllLists) window._aiRefreshAllLists(editBox);
-                var r = document.createRange();
-                r.selectNodeContents(li);
-                r.collapse(true);
-                var s = window.getSelection();
-                if (s) { s.removeAllRanges(); s.addRange(r); }
-              }
-            }
-
-            try {
-              var si3 = parseInt(editBox.getAttribute('data-sec-idx'), 10);
-              var bi3 = parseInt(editBox.getAttribute('data-blk-idx'), 10);
-              if (sectionsState[si3] && sectionsState[si3].blocks && sectionsState[si3].blocks[bi3]) {
-                // data-indent 속성을 HTML에 확실히 반영
-                editBox.querySelectorAll('[data-indent]').forEach(function(el) {
-                  if (el.dataset.indent && el.dataset.indent !== '0') {
-                    el.setAttribute('data-indent', el.dataset.indent);
-                  }
-                });
-                                sectionsState[si3].blocks[bi3].body = editBox.innerHTML;
-                _markSectionsDirty();
-              }
-            } catch(e) {}
-            return;
-          }
-        }, true); // ← capture phase
-      }
-      // === /Document-level Delegation ===
-
-      // 섹션별 편집 모드 상태 (기본 표시 모드)
-      if (!window._sectionEditMode) window._sectionEditMode = {};
-
-      async function _reloadNotesCache(){
-        try {
-          let divId = (window._currentEditContext || {}).divisionId || '';
-          const cardTitle = (window._currentEditContext || {}).cardTitle || '';
-          if (!divId) {
-            const sel = document.getElementById('v2-division-select');
-            if (sel) divId = sel.value || '';
-          }
-          if (!divId || !cardTitle) return;
-          const r = await fetch('/notes?division_id=' + encodeURIComponent(divId), { credentials: 'same-origin' });
-          if (!r.ok) return;
-          const j = await r.json();
-          const cards = (j.cards) || ((j.notes || {}).cards) || [];
-          const card = cards.find(function(c){ return (c.title || '').trim() === cardTitle.trim(); });
-          const map = {};
-          if (card) {
-            (card.sections || []).forEach(function(sec){
-              map[sec.title || ''] = sec.items || [];
-            });
-          }
-          window._notesItemsCache = map;
-        } catch(e) { console.error('notes cache reload 실패', e); }
-      }
-
-            window._renderManualSections = function(){
-        if (!sectionsRoot) return;
-        let html = '';
-        // 상단 탭바 (시각적 표시 + 스크롤)
-        if (sectionsState.length) {
-          html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:12px;flex-wrap:wrap;">'
-               +   '<div class="ov-tabs" style="margin-bottom:0;flex:1;overflow-x:auto;">'
-               +     sectionsState.map(function(sec, idx){
-                       const t = (sec.title || '(제목 없음)');
-                       const nums = ['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩'];
-                       const numStr = idx < nums.length ? nums[idx] : (idx+1) + '.';
-                       return '<div class="ov-tab-wrap">'
-                       + '<button type="button" class="ov-tab ov-sec-draggable ' + (idx === 0 ? 'active' : '') + '" draggable="true" data-sec-jump="' + idx + '" data-sec-drag-idx="' + idx + '" title="드래그하여 순서 변경">' + numStr + ' ' + t + '</button>'
-                       + '<span class="ov-tab-actions">'
-                       +   '<button type="button" class="ov-tab-icon ov-sec-tab-rename-btn" data-sec-idx="' + idx + '" title="섹션명 수정">✏️</button>'
-                       +   '<button type="button" class="ov-tab-icon ov-tab-del ov-sec-del-btn" data-sec-idx="' + idx + '" title="섹션 삭제">🗑️</button>'
-                       + '</span>'
-                       + '</div>';
-                     }).join('')
-               +   '</div>'
-               +   '<button type="button" id="ov-sec-add-btn" style="background:#0F2C59;color:#fff;border:0;border-radius:10px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap;">+ 섹션 추가</button>'
-               + '</div>';
-        } else {
-          html += '<div style="display:flex;justify-content:flex-end;margin-bottom:14px;">'
-               +   '<button type="button" id="ov-sec-add-btn" style="background:#0F2C59;color:#fff;border:0;border-radius:10px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;">+ 섹션 추가</button>'
-               + '</div>';
-        }
-        if (!sectionsState.length) {
-          html += '<div class="ov-section"><div class="ov-placeholder">섹션이 없습니다. 위의 「+ 섹션 추가」로 추가하세요.</div></div>';
-        } else {
-          html += sectionsState.map(function(sec, idx){
-            const title = sec.title || '(제목 없음)';
-            const secId = sec.id || '';
-            const blocks = sec.blocks || [];
-            let body = '';
-            if (!blocks.length) {
-              body = '<div class="ov-placeholder">비어 있는 섹션입니다. (Phase 4: 텍스트/파일 블록 추가 예정)</div>';
-            } else {
-              const editing = !!window._sectionEditMode[idx];
-              body = blocks.map(function(b, bIdx){
-                if (b && b.kind === 'text') {
-                  const txt = (b.body || '');
-                  if (editing) {
-                    const editorId = 'txt-' + idx + '-' + bIdx;
-                    const toolbar = ''
-                      + '<div class="ov-rt-toolbar" style="display:flex;flex-wrap:wrap;gap:4px;padding:6px 8px;background:#EEF4FB;border:1px solid #D9E3F1;border-bottom:0;border-radius:10px 10px 0 0;font-size:12px;" data-editor="' + editorId + '">'
-                      +   '<select data-cmd="formatBlock" title="크기" style="border:1px solid #D9E3F1;border-radius:6px;padding:2px 4px;background:#fff;font-size:12px;cursor:pointer;">'
-                      +     '<option value="div">본문</option>'
-                      +     '<option value="h2">제목</option>'
-                      +     '<option value="h3">소제목</option>'
-                      +   '</select>'
-                      +   '<button type="button" data-cmd="bold" title="굵게" style="width:26px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;font-weight:800;">B</button>'
-                      +   '<button type="button" data-cmd="italic" title="기울임" style="width:26px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;font-style:italic;">I</button>'
-                      +   '<button type="button" data-cmd="underline" title="밑줄" style="width:26px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;text-decoration:underline;">U</button>'
-                      +   '<button type="button" data-cmd="strikeThrough" title="취소선" style="width:26px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;text-decoration:line-through;">S</button>'
-                      +   '<button type="button" class="word-color-btn" data-color-cmd="foreColor" data-default-color="#000000" title="글자색" style="display:inline-flex;align-items:center;justify-content:center;gap:4px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;padding:0 6px;height:26px;cursor:pointer;">'
-                      +   '<span style="font-weight:800;font-size:13px;line-height:1;color:#111827;">A</span>'
-                      +   '<span class="word-color-preview" style="display:inline-block;width:12px;height:3px;border-radius:999px;background:#000000;"></span>'
-                      +   '</button>'
-                      +   '<button type="button" class="word-color-btn" data-color-cmd="hiliteColor" data-default-color="#FFF3B0" title="배경색" style="display:inline-flex;align-items:center;justify-content:center;gap:4px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;padding:0 6px;height:26px;cursor:pointer;">'
-                      +   '<span style="font-weight:700;font-size:12px;line-height:1;color:#111827;">형광</span>'
-                      +   '<span class="word-color-preview" style="display:inline-block;width:12px;height:8px;border-radius:3px;background:#FFF3B0;border:1px solid #E5E7EB;"></span>'
-                      +   '</button>'
-                      +   '<button type="button" data-cmd="justifyLeft" title="왼쪽 정렬" style="width:28px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;padding:0;display:inline-flex;align-items:center;justify-content:center;"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#4b5563\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><line x1=\"17\" y1=\"10\" x2=\"3\" y2=\"10\"></line><line x1=\"21\" y1=\"6\" x2=\"3\" y2=\"6\"></line><line x1=\"21\" y1=\"14\" x2=\"3\" y2=\"14\"></line><line x1=\"17\" y1=\"18\" x2=\"3\" y2=\"18\"></line></svg></button>'
-                      +   '<button type="button" data-cmd="justifyCenter" title="가운데 정렬" style="width:28px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;padding:0;display:inline-flex;align-items:center;justify-content:center;"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#4b5563\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><line x1=\"18\" y1=\"10\" x2=\"6\" y2=\"10\"></line><line x1=\"21\" y1=\"6\" x2=\"3\" y2=\"6\"></line><line x1=\"21\" y1=\"14\" x2=\"3\" y2=\"14\"></line><line x1=\"18\" y1=\"18\" x2=\"6\" y2=\"18\"></line></svg></button>'
-                      +   '<button type="button" data-cmd="justifyRight" title="오른쪽 정렬" style="width:28px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;padding:0;display:inline-flex;align-items:center;justify-content:center;"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#4b5563\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><line x1=\"21\" y1=\"10\" x2=\"7\" y2=\"10\"></line><line x1=\"21\" y1=\"6\" x2=\"3\" y2=\"6\"></line><line x1=\"21\" y1=\"14\" x2=\"3\" y2=\"14\"></line><line x1=\"21\" y1=\"18\" x2=\"7\" y2=\"18\"></line></svg></button>'
-                      +   '<button type="button" data-cmd="outdent" title="내어쓰기" style="width:28px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;padding:0;display:inline-flex;align-items:center;justify-content:center;"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#4b5563\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><polyline points=\"7 8 3 12 7 16\"></polyline><line x1=\"21\" y1=\"12\" x2=\"11\" y2=\"12\"></line><line x1=\"21\" y1=\"6\" x2=\"11\" y2=\"6\"></line><line x1=\"21\" y1=\"18\" x2=\"11\" y2=\"18\"></line></svg></button>'
-                      +   '<button type="button" data-cmd="indent" title="들여쓰기" style="width:28px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;padding:0;display:inline-flex;align-items:center;justify-content:center;"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#4b5563\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><polyline points=\"3 8 7 12 3 16\"></polyline><line x1=\"21\" y1=\"12\" x2=\"11\" y2=\"12\"></line><line x1=\"21\" y1=\"6\" x2=\"11\" y2=\"6\"></line><line x1=\"21\" y1=\"18\" x2=\"11\" y2=\"18\"></line></svg></button>'
-                      +   '<button type="button" data-cmd="insertUnorderedList" title="글머리 기호" style="width:28px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;padding:0;display:inline-flex;align-items:center;justify-content:center;"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#4b5563\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><line x1=\"8\" y1=\"6\" x2=\"21\" y2=\"6\"></line><line x1=\"8\" y1=\"12\" x2=\"21\" y2=\"12\"></line><line x1=\"8\" y1=\"18\" x2=\"21\" y2=\"18\"></line><circle cx=\"4\" cy=\"6\" r=\"1.5\" fill=\"#4b5563\"></circle><circle cx=\"4\" cy=\"12\" r=\"1.5\" fill=\"#4b5563\"></circle><circle cx=\"4\" cy=\"18\" r=\"1.5\" fill=\"#4b5563\"></circle></svg></button>'
-                      +   '<select data-list-style="ul" title="불릿 종류" style="border:1px solid #D9E3F1;border-radius:6px;padding:2px 4px;background:#fff;font-size:12px;cursor:pointer;">'
-                      +     '<option value="disc">●</option>'
-                      +     '<option value="circle">○</option>'
-                      +     '<option value="square">■</option>'
-                      +     '<option value="ov-dash">－</option>'
-                      +     '<option value="ov-triangle">▶</option>'
-                      +     '<option value="ov-check">✓</option>'
-                      +     '<option value="ov-star">★</option>'
-                      +     '<option value="ov-arrow">➜</option>'
-                      +     '<option value="ov-diamond">◆</option>'
-                      +     '<option value="ov-dot">·</option>'
-                      +   '</select>'
-                      +   '<button type="button" data-cmd="insertOrderedList" title="번호 매기기" style="width:28px;height:26px;border:1px solid #D9E3F1;background:#fff;border-radius:6px;cursor:pointer;padding:0;display:inline-flex;align-items:center;justify-content:center;"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#4b5563\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><line x1=\"10\" y1=\"6\" x2=\"21\" y2=\"6\"></line><line x1=\"10\" y1=\"12\" x2=\"21\" y2=\"12\"></line><line x1=\"10\" y1=\"18\" x2=\"21\" y2=\"18\"></line><text x=\"2\" y=\"8\" font-size=\"6\" fill=\"#4b5563\" stroke=\"none\" font-family=\"Arial\" font-weight=\"700\">1</text><text x=\"2\" y=\"14\" font-size=\"6\" fill=\"#4b5563\" stroke=\"none\" font-family=\"Arial\" font-weight=\"700\">2</text><text x=\"2\" y=\"20\" font-size=\"6\" fill=\"#4b5563\" stroke=\"none\" font-family=\"Arial\" font-weight=\"700\">3</text></svg></button>'
-                      +   '<select data-list-style="ol" title="번호 종류 (오른쪽 클릭으로 이어/재시작)" style="border:1px solid #D9E3F1;border-radius:6px;padding:2px 4px;background:#fff;font-size:12px;cursor:pointer;">'
-                      +     '<option value="decimal">1.</option>'
-                      +     '<option value="ov-circled">①</option>'
-                      +     '<option value="ov-paren">1)</option>'
-                      +     '<option value="lower-alpha">a.</option>'
-                      +     '<option value="upper-alpha">A.</option>'
-                      +     '<option value="lower-roman">i.</option>'
-                      +     '<option value="upper-roman">I.</option>'
-                      +   '</select>'
-                                            + '</div>';
-                    return '<div class="ov-block ov-block-text" data-sec-idx="' + idx + '" data-blk-idx="' + bIdx + '" style="position:relative;margin-bottom:10px;background:#F8FBFF;border:1px solid #E6EBF2;border-radius:12px;">'
-                      +   toolbar
-                      +   '<div contenteditable="true" spellcheck="false" class="ov-block-text-body" data-sec-idx="' + idx + '" data-blk-idx="' + bIdx + '" id="' + editorId + '" style="outline:none;font-size:14px;color:#111827;line-height:1.6;white-space:pre-wrap;min-height:60px;padding:12px 14px;border-top:0;">' + txt + '</div>'
-                      +   '<div style="position:absolute;top:6px;right:6px;display:flex;gap:2px;z-index:2;">'
-                      +     '<button type="button" class="ov-block-up" data-sec-idx="' + idx + '" data-blk-idx="' + bIdx + '" ' + (bIdx === 0 ? 'disabled' : '') + ' style="background:transparent;color:' + (bIdx === 0 ? '#CBD5E1' : '#5B7BB0') + ';border:0;font-size:14px;cursor:' + (bIdx === 0 ? 'not-allowed' : 'pointer') + ';padding:2px 6px;" title="위로">▲</button>'
-                      +     '<button type="button" class="ov-block-down" data-sec-idx="' + idx + '" data-blk-idx="' + bIdx + '" ' + (bIdx === blocks.length - 1 ? 'disabled' : '') + ' style="background:transparent;color:' + (bIdx === blocks.length - 1 ? '#CBD5E1' : '#5B7BB0') + ';border:0;font-size:14px;cursor:' + (bIdx === blocks.length - 1 ? 'not-allowed' : 'pointer') + ';padding:2px 6px;" title="아래로">▼</button>'
-                      +     '<button type="button" class="ov-block-ai" data-sec-idx="' + idx + '" data-blk-idx="' + bIdx + '" style="background:#F3EEFB;color:#7C3AED;border:1px solid #DDD6FE;font-size:11px;cursor:pointer;padding:3px 8px;font-weight:700;border-radius:6px;margin-right:2px;" title="AI 정리">🤖 AI 정리</button>'
-                      +     '<button type="button" class="ov-block-del" data-sec-idx="' + idx + '" data-blk-idx="' + bIdx + '" style="background:transparent;color:#B8302E;border:0;font-size:16px;cursor:pointer;padding:2px 6px;" title="삭제">✕</button>'
-                      +   '</div>'
-                      + '</div>';
-                  }
-                  // 표시 모드: 그냥 예쁘게 + 일정 관리 패널
-                  const secTitle = sec.title || '';
-                  const itemsForSec = (window._notesItemsCache || {})[secTitle] || [];
-                  const visibleItems = itemsForSec.filter(function(it){
-                    return it && it.text && it.text.trim() && it.type !== 'photo';
-                  });
-                  let panelHtml = '';
-                  if (visibleItems.length > 0) {
-                    const rows = visibleItems.map(function(it){
-                      const autoRaw = it.due_date_auto || '';
-                      const override = it.due_date_override || '';
-                      const autoHidden = !!it.auto_due_hidden;
-                      // autoHidden 이면 auto 를 표시상 없는 값으로 처리
-                      const auto = autoHidden ? '' : autoRaw;
-                      const isOverride = !!override;
-                      const effective = override || auto;
-                      const mmdd = effective ? (effective.slice(5,7) + '/' + effective.slice(8,10)) : '';
-                      // 상태 판별:
-                      //   - autoHidden=true: 상태 4 (자동값 숨겨짐) → + 날짜 지정 + ↺(자동 복원)
-                      //   - effective 있음: 상태 2/3 → chip 표시
-                      //   - 그 외: 상태 1 → + 날짜 지정
-                      const chipLabel = effective
-                        ? (isOverride ? ('수동 ' + mmdd) : ('자동 ' + mmdd))
-                        : '+ 날짜 지정';
-                      const chipStyle = effective
-                        ? (isOverride
-                            ? 'background:#DBEAFE;color:#1E40AF;border:1px solid #93C5FD;'
-                            : 'background:#F1F3F5;color:#6B7280;border:1px solid #E5E7EB;')
-                        : 'background:transparent;color:#9CA3AF;border:1px dashed #D1D5DB;';
-                      // ↺ 버튼: 수동값 있을 때 (상태 3) or 자동 숨겨짐 (상태 4)
-                      let resetBtn = '';
-                      if (isOverride) {
-                        resetBtn = '<button type="button" class="ov-due-reset" data-item-id="' + (it.item_id || '') + '" data-auto="' + auto + '" data-mode="override" title="자동값(' + (auto ? auto.slice(5).replace('-','/') : '') + ')으로 되돌리기" style="background:transparent;border:0;color:#1E40AF;cursor:pointer;padding:0 4px;font-size:14px;line-height:1;margin-left:2px;">↺</button>';
-                      } else if (autoHidden) {
-                        resetBtn = '<button type="button" class="ov-due-reset" data-item-id="' + (it.item_id || '') + '" data-mode="hidden" title="자동값 복원" style="background:transparent;border:0;color:#6B7280;cursor:pointer;padding:0 4px;font-size:14px;line-height:1;margin-left:2px;">↺</button>';
-                      }
-                      const textEsc = (it.text || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-                      return '<div class="ov-schedule-row" style="display:flex;align-items:center;gap:10px;padding:6px 10px;border-bottom:1px solid #F0F4F9;">'
-                        +   '<div style="flex:1;font-size:13px;color:#111827;line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:pre-wrap;">' + textEsc + '</div>'
-                        +   '<button type="button" class="ov-due-chip" data-item-id="' + (it.item_id || '') + '" data-auto="' + auto + '" data-override="' + override + '" data-section-title="' + secTitle.replace(/"/g,'&quot;') + '" title="자동: ' + (auto || '없음') + (override ? (' / 수동: ' + override) : '') + ' | 클릭하여 날짜 변경" style="' + chipStyle + 'border-radius:12px;padding:3px 10px;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;flex-shrink:0;">' + chipLabel + '</button>'
-                        +   resetBtn
-                        + '</div>';
-                    }).join('');
-                    panelHtml = '<div class="ov-schedule-panel" data-sec-idx="' + idx + '" style="margin-top:8px;padding:8px 12px 4px;background:#F8FBFF;border:1px solid #E6EBF2;border-radius:10px;">'
-                      +   '<div style="font-size:12px;font-weight:700;color:#5B7BB0;margin-bottom:6px;">📅 이 섹션의 일정</div>'
-                      +   rows
-                      + '</div>';
-                  }
-                  return '<div class="ov-rt-view" style="padding:6px 4px;font-size:14px;color:#111827;line-height:1.65;white-space:pre-wrap;">' + txt + '</div>' + panelHtml;
-                }
-                if (b && b.kind === 'file') {
-                  const fname = b.file_name || '(파일)';
-                  const url = b.url || '';
-                  const isImage = /\\.(png|jpg|jpeg|gif|webp|bmp)$/i.test(fname);
-                  const isExcel = /\\.(xlsx|xls)$/i.test(fname);
-                  const previewHtml = (isImage && url)
-                    ? '<div style="margin:8px 0;text-align:center;"><img src="' + url + '" alt="' + fname + '" style="max-width:100%;max-height:320px;border-radius:8px;border:1px solid #E6EBF2;"></div>'
-                    : (isExcel && url)
-                      ? '<div class="ov-xlsx-preview" data-doc="' + docId + '" data-file="' + fname + '" style="margin:8px 0;padding:10px;background:#fff;border:1px dashed #D9E3F1;border-radius:8px;font-size:12px;color:#8593A6;">엑셀 미리보기 로드 중...</div>'
-                      : '';
-                  if (editing) {
-                    return '<div class="ov-block ov-block-file" data-sec-idx="' + idx + '" data-blk-idx="' + bIdx + '" style="position:relative;padding:10px 14px;margin-bottom:10px;background:#F8FBFF;border:1px solid #E6EBF2;border-radius:12px;font-size:13px;color:#111827;">'
-                      +   '<div style="display:flex;align-items:center;gap:8px;padding-right:26px;">'
-                      +     '<span>📎</span>'
-                      +     (url ? '<a href="' + url + '" target="_blank" style="color:#2E5B94;text-decoration:none;font-weight:700;">' + fname + '</a>' : '<span style="font-weight:700;">' + fname + '</span>')
-                      +   '</div>'
-                      +   previewHtml
-                      +   '<div style="position:absolute;top:6px;right:6px;display:flex;gap:2px;z-index:2;">'
-                      +     '<button type="button" class="ov-block-up" data-sec-idx="' + idx + '" data-blk-idx="' + bIdx + '" ' + (bIdx === 0 ? 'disabled' : '') + ' style="background:transparent;color:' + (bIdx === 0 ? '#CBD5E1' : '#5B7BB0') + ';border:0;font-size:14px;cursor:' + (bIdx === 0 ? 'not-allowed' : 'pointer') + ';padding:2px 6px;" title="위로">▲</button>'
-                      +     '<button type="button" class="ov-block-down" data-sec-idx="' + idx + '" data-blk-idx="' + bIdx + '" ' + (bIdx === blocks.length - 1 ? 'disabled' : '') + ' style="background:transparent;color:' + (bIdx === blocks.length - 1 ? '#CBD5E1' : '#5B7BB0') + ';border:0;font-size:14px;cursor:' + (bIdx === blocks.length - 1 ? 'not-allowed' : 'pointer') + ';padding:2px 6px;" title="아래로">▼</button>'
-                      +     '<button type="button" class="ov-block-del" data-sec-idx="' + idx + '" data-blk-idx="' + bIdx + '" style="background:transparent;color:#B8302E;border:0;font-size:16px;cursor:pointer;padding:2px 6px;" title="삭제">✕</button>'
-                      +   '</div>'
-                      + '</div>';
-                  }
-                  // 표시 모드
-                  return '<div style="padding:8px 12px;margin-bottom:6px;background:#F8FBFF;border:1px solid #E6EBF2;border-radius:10px;font-size:13px;color:#111827;">'
-                    +   '<div style="display:flex;align-items:center;gap:8px;">'
-                    +     '<span>📎</span>'
-                    +     (url ? '<a href="' + url + '" target="_blank" style="color:#2E5B94;text-decoration:none;font-weight:700;">' + fname + '</a>' : '<span style="font-weight:700;">' + fname + '</span>')
-                    +   '</div>'
-                    +   previewHtml
-                    + '</div>';
-                }
-                return '';
-              }).join('');
-              // 편집 모드일 때만 블록 추가 버튼 표시
-              if (editing) {
-                body += '<div style="display:flex;gap:8px;margin-top:10px;">'
-                  +      '<button type="button" class="ov-block-add-text" data-sec-idx="' + idx + '" style="background:#EEF4FB;color:#2E5B94;border:0;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;">+ 텍스트</button>'
-                  +      '<label class="ov-block-add-file-label" style="background:#EEF4FB;color:#2E5B94;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;">+ 파일<input type="file" data-sec-idx="' + idx + '" class="ov-block-add-file" style="display:none;"></label>'
-                  +    '</div>';
-              }
-            }
-            // 빈 섹션이면서 편집 모드라면 블록 추가 버튼 노출
-            if (!blocks.length && !!window._sectionEditMode[idx]) {
-              body = '<div class="ov-placeholder">비어 있는 섹션입니다. 아래 「+ 텍스트」 「+ 파일」 로 추가하세요.</div>'
-                +    '<div style="display:flex;gap:8px;margin-top:10px;">'
-                +      '<button type="button" class="ov-block-add-text" data-sec-idx="' + idx + '" style="background:#EEF4FB;color:#2E5B94;border:0;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;">+ 텍스트</button>'
-                +      '<label class="ov-block-add-file-label" style="background:#EEF4FB;color:#2E5B94;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;">+ 파일<input type="file" data-sec-idx="' + idx + '" class="ov-block-add-file" style="display:none;"></label>'
-                +    '</div>';
-            }
-            const isEditing = !!window._sectionEditMode[idx];
-            const headBtns = isEditing
-              ? ('<button type="button" class="ov-sec-done-btn" data-sec-idx="' + idx + '" style="background:#0F2C59;color:#fff;border:0;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;">완료</button>'
-                + '<button type="button" class="ov-sec-rename-btn" data-sec-idx="' + idx + '" style="background:#EEF4FB;color:#2E5B94;border:0;border-radius:8px;padding:6px 10px;font-size:12px;font-weight:700;cursor:pointer;">이름 수정</button>'
-                + '<button type="button" class="ov-sec-del-btn" data-sec-idx="' + idx + '" style="background:#FEE7E7;color:#B8302E;border:0;border-radius:8px;padding:6px 10px;font-size:12px;font-weight:700;cursor:pointer;">삭제</button>')
-              : ('<button type="button" class="ov-sec-edit-btn" data-sec-idx="' + idx + '" style="background:#EEF4FB;color:#2E5B94;border:0;border-radius:8px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;">✏ 수정</button>');
-
-            // 매출 계산 박스 (주차별 계획 섹션 + 편집 모드 전용)
-            var salesBoxHtml = '';
-            var _secT = (sec.title || '').trim();
-            var _isWeeklyPlan = (_secT === '주차별 계획' || _secT === '주차별계획' || _secT === '주차계획' || _secT === '주간계획');
-            if (_isWeeklyPlan && isEditing) {
-              var _sd = sec.sales_data || {};
-              var _prices = _sd.prices || {};
-              var _weeks = Array.isArray(_sd.weeks) ? _sd.weeks : [];
-              var _ss = String(sec.sales_summary || '(완료 버튼을 누르면 자동 계산됩니다)').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-              var _sc = String(sec.sales_computed_at || '');
-              var _open = (Object.keys(_prices).length || _weeks.length) ? '▼' : '▶';
-              var _display = (Object.keys(_prices).length || _weeks.length) ? 'block' : 'none';
-              
-              // 판가 행 렌더
-              var _pricesHtml = '';
-              Object.keys(_prices).forEach(function(mname){
-                _pricesHtml += ''
-                  + '<div class="ov-sales-price-row" data-model="' + mname + '" style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">'
-                  +   '<input type="text" class="ov-sales-price-name" value="' + mname + '" style="width:100px;padding:4px 8px;border:1px solid #C5D0E0;border-radius:4px;font-size:12px;" placeholder="모델명">'
-                  +   '<input type="number" class="ov-sales-price-val" value="' + (_prices[mname] || 0) + '" step="0.1" style="width:80px;padding:4px 8px;border:1px solid #C5D0E0;border-radius:4px;font-size:12px;text-align:right;">'
-                  +   '<span style="font-size:11px;color:#7C8594;">만불</span>'
-                  +   '<button type="button" class="ov-sales-price-del" style="margin-left:auto;background:#FEE7E7;color:#B8302E;border:0;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;">삭제</button>'
-                  + '</div>';
-              });
-              if (!Object.keys(_prices).length) {
-                _pricesHtml = '<div style="color:#7C8594;font-size:11px;padding:4px 0;">모델을 추가하세요.</div>';
-              }
-              
-              // 주차별 렌더
-              var _weeksHtml = '';
-              _weeks.forEach(function(w, wi){
-                var _wnum = w.week || '';
-                var _wmodels = w.models || {};
-                var _rowsHtml = '';
-                Object.keys(_prices).forEach(function(mname){
-                  var _mv = _wmodels[mname] || {plan: 0, actual: 0};
-                  _rowsHtml += ''
-                    + '<div style="display:flex;align-items:center;gap:6px;margin:3px 0 3px 20px;">'
-                    +   '<span style="width:80px;font-size:12px;color:#111827;">' + mname + '</span>'
-                    +   '<span style="font-size:11px;color:#7C8594;">계</span>'
-                    +   '<input type="number" class="ov-sales-plan" data-week="' + _wnum + '" data-model="' + mname + '" value="' + (_mv.plan || 0) + '" style="width:56px;padding:3px 6px;border:1px solid #C5D0E0;border-radius:4px;font-size:12px;text-align:right;">'
-                    +   '<span style="font-size:11px;color:#7C8594;">실</span>'
-                    +   '<input type="number" class="ov-sales-actual" data-week="' + _wnum + '" data-model="' + mname + '" value="' + (_mv.actual || 0) + '" style="width:56px;padding:3px 6px;border:1px solid #C5D0E0;border-radius:4px;font-size:12px;text-align:right;">'
-                    + '</div>';
-                });
-                if (!Object.keys(_prices).length) {
-                  _rowsHtml = '<div style="color:#7C8594;font-size:11px;padding:4px 0 4px 20px;">먼저 모델을 추가하세요.</div>';
-                }
-                _weeksHtml += ''
-                  + '<div class="ov-sales-week-box" data-week-idx="' + wi + '" style="padding:8px;margin-bottom:6px;background:#fff;border:1px solid #E5EAF0;border-radius:6px;">'
-                  +   '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">'
-                  +     '<span style="font-size:12px;font-weight:700;color:#111827;">주차 W</span>'
-                  +     '<input type="number" class="ov-sales-week-num" value="' + _wnum + '" style="width:60px;padding:4px 8px;border:1px solid #C5D0E0;border-radius:4px;font-size:12px;text-align:center;">'
-                  +     '<button type="button" class="ov-sales-week-del" style="margin-left:auto;background:#FEE7E7;color:#B8302E;border:0;border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;">삭제</button>'
-                  +   '</div>'
-                  +   _rowsHtml
-                  + '</div>';
-              });
-              if (!_weeks.length) {
-                _weeksHtml = '<div style="color:#7C8594;font-size:11px;padding:4px 0;">주차를 추가하세요.</div>';
-              }
-              
-              salesBoxHtml = ''
-                + '<div class="ov-sales-box" data-sec-idx="' + idx + '" style="margin-top:12px;padding:10px;background:#F7F9FC;border:1px dashed #C5D0E0;border-radius:8px;">'
-                +   '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">'
-                +     '<button type="button" class="ov-sales-toggle" data-sec-idx="' + idx + '" style="background:none;border:0;color:#111827;font-weight:700;font-size:13px;cursor:pointer;padding:4px 0;">'
-                +       _open + ' 💰 매출 계산'
-                +     '</button>'
-                +     '<label class="ov-sales-vis-label" data-sec-idx="' + idx + '" style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:#7C8594;cursor:pointer;user-select:none;">'
-                +       '<input type="checkbox" class="ov-sales-vis" data-sec-idx="' + idx + '" ' + ((sec.sales_visible === false) ? '' : 'checked') + ' style="cursor:pointer;">'
-                +       '<span>앱에 매출 표시</span>'
-                +     '</label>'
-                +   '</div>'
-                +   '<div class="ov-sales-body" style="display:' + _display + ';margin-top:8px;">'
-                +     '<div class="ov-sales-info" data-sec-idx="' + idx + '" style="font-size:11px;color:#7C8594;margin-bottom:8px;padding:6px 8px;background:#EEF3FB;border-radius:6px;">엑셀 파일 인식 중...</div>'
-                +     '<div style="font-size:11px;font-weight:700;color:#111827;margin-bottom:6px;">💵 판가 입력 (만불)</div>'
-                +     '<div class="ov-sales-prices" data-sec-idx="' + idx + '" style="padding:4px 0;"><div style="color:#7C8594;font-size:11px;">엑셀을 먼저 첨부해 주세요.</div></div>'
-                +     '<div style="margin-top:10px;padding:8px 10px;background:#EEF3FB;border-radius:6px;font-size:13px;color:#111827;">'
-                +       '<span style="opacity:0.6;">계산 결과:</span>'
-                +       '<div style="margin-top:4px;font-weight:700;">' + _ss + '</div>'
-                +       (_sc ? '<div style="margin-top:4px;font-size:11px;color:#7C8594;">계산 시각: ' + _sc + '</div>' : '')
-                +     '</div>'
-                +     '<div style="margin-top:6px;font-size:11px;color:#7C8594;">완료 버튼을 누르면 자동 저장되고 매출이 계산됩니다.</div>'
-                +   '</div>'
-                + '</div>';
-            }
-            
-                        return '<div class="ov-section" data-sec-id="' + secId + '" data-sec-idx="' + idx + '">'
-              +   '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">'
-              +     '<div class="ov-section-title" style="margin:0;">'
-              +       '<span class="ov-section-num">' + (idx+1) + '</span>'
-              +       '<span class="ov-sec-title-text" data-sec-idx="' + idx + '" style="cursor:text;">' + title + '</span>'
-              +     '</div>'
-              +     '<div style="display:flex;gap:6px;">' + headBtns + '</div>'
-              +   '</div>'
-              +   body
-              +   salesBoxHtml
-              + '</div>';
-          }).join('');
-        }
-        sectionsRoot.innerHTML = html;
-
-        // ─── 일정 칩 이벤트 바인딩 ───
-        sectionsRoot.querySelectorAll('.ov-due-chip').forEach(function(chip){
-          chip.addEventListener('click', function(ev){
-            ev.stopPropagation();
-            const itemId = chip.getAttribute('data-item-id');
-            const auto = chip.getAttribute('data-auto') || '';
-            const override = chip.getAttribute('data-override') || '';
-            if (!itemId) { alert('item_id 없음 — 저장 후 다시 시도'); return; }
-
-            // 기존 popover 제거
-            document.querySelectorAll('.date-popover-custom').forEach(function(n){ n.remove(); });
-
-            // 커스텀 popover 생성
-            const pop = document.createElement('div');
-            pop.className = 'date-popover-custom';
-            pop.style.cssText = 'position:fixed;background:#fff;border:1px solid #d1d5db;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,0.15);padding:14px;z-index:9999;display:flex;flex-direction:column;gap:12px;min-width:260px;';
-            const rect = chip.getBoundingClientRect();
-            // 화면 밖으로 나가지 않게 위치 조정
-            const popW = 280;
-            let popLeft = rect.left;
-            if (popLeft + popW > window.innerWidth - 10) {
-              popLeft = window.innerWidth - popW - 10;
-            }
-            pop.style.left = popLeft + 'px';
-            pop.style.top = (rect.bottom + 6) + 'px';
-
-            const inp = document.createElement('input');
-            inp.type = 'date';
-            inp.value = override || auto || '';
-            inp.style.cssText = 'padding:6px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;width:100%;';
-
-            const btnRow = document.createElement('div');
-            btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;';
-
-            const btnSave = document.createElement('button');
-            btnSave.type = 'button';
-            btnSave.textContent = '저장';
-            btnSave.style.cssText = 'padding:6px 14px;background:#2563eb;color:#fff;border:0;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;';
-
-            const btnDelete = document.createElement('button');
-            btnDelete.type = 'button';
-            btnDelete.textContent = '삭제';
-            btnDelete.style.cssText = 'padding:6px 14px;background:#fff;color:#b91c1c;border:1px solid #d1d5db;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;';
-
-            btnRow.appendChild(btnDelete);
-            btnRow.appendChild(btnSave);
-            pop.appendChild(inp);
-            pop.appendChild(btnRow);
-            document.body.appendChild(pop);
-            setTimeout(function(){ inp.focus(); try { inp.showPicker && inp.showPicker(); } catch(e) {} }, 100);
-
-            // 외부 클릭 시 닫기
-            function closePop(){ if (pop.parentNode) pop.remove(); document.removeEventListener('mousedown', outsideClick, true); }
-            function outsideClick(e){ if (!pop.contains(e.target) && e.target !== chip) closePop(); }
-            setTimeout(function(){ document.addEventListener('mousedown', outsideClick, true); }, 100);
-
-            btnSave.addEventListener('click', async function(){
-              const val = inp.value;
-              if (!val) { alert('날짜를 선택하세요'); return; }
-              try {
-                const divId = (window._currentEditContext || {}).divisionId || '';
-                const cardTitle = (window._currentEditContext || {}).cardTitle || '';
-                const r = await fetch('/admin/notes/item/due_override', {
-                  method: 'POST',
-                  headers: {'Content-Type':'application/json'},
-                  credentials: 'same-origin',
-                  body: JSON.stringify({
-                    division_id: divId,
-                    card_title: cardTitle,
-                    item_id: itemId,
-                    due_date: val
-                  })
-                });
-                const j = await r.json();
-                if (!r.ok) { alert('저장 실패: ' + (j.detail || r.status)); return; }
-                alert('일정 저장 완료: ' + val);
-                closePop();
-                await _reloadNotesCache();
-                if (window._renderManualSections) window._renderManualSections();
-              } catch(e) { alert('오류: ' + e.message); }
-            });
-
-            btnDelete.addEventListener('click', async function(){
-              closePop();
-              if (!confirm('이 일정을 삭제하시겠습니까? (자동 파싱된 날짜도 함께 숨겨집니다)')) return;
-              try {
-                const divId = (window._currentEditContext || {}).divisionId || '';
-                const cardTitle = (window._currentEditContext || {}).cardTitle || '';
-                const r = await fetch('/admin/notes/item/hide_auto_due', {
-                  method: 'POST',
-                  headers: {'Content-Type':'application/json'},
-                  credentials: 'same-origin',
-                  body: JSON.stringify({
-                    division_id: divId,
-                    card_title: cardTitle,
-                    item_id: itemId
-                  })
-                });
-                const j = await r.json();
-                if (!r.ok) { alert('삭제 실패: ' + (j.detail || r.status)); return; }
-                alert('일정이 삭제되었습니다');
-                closePop();
-                await _reloadNotesCache();
-                if (window._renderManualSections) window._renderManualSections();
-              } catch(e) { alert('오류: ' + e.message); }
-            });
-          });
-        });
-
-        sectionsRoot.querySelectorAll('.ov-due-reset').forEach(function(btn){
-          btn.addEventListener('click', async function(ev){
-            ev.stopPropagation();
-            const mode = btn.getAttribute('data-mode') || 'override';
-            const _itemId = btn.getAttribute('data-item-id');
-            if (!_itemId) return;
-            
-            // 상태 4: 자동값 복원
-            if (mode === 'hidden') {
-              if (!confirm('숨긴 자동 일정을 복원하시겠습니까?')) return;
-              try {
-                const divId = (window._currentEditContext || {}).divisionId || '';
-                const cardTitle = (window._currentEditContext || {}).cardTitle || '';
-                const r = await fetch('/admin/notes/item/hide_auto_due', {
-                  method: 'DELETE',
-                  headers: {'Content-Type':'application/json'},
-                  credentials: 'same-origin',
-                  body: JSON.stringify({
-                    division_id: divId,
-                    card_title: cardTitle,
-                    item_id: _itemId
-                  })
-                });
-                const j = await r.json();
-                if (!r.ok) { alert('복원 실패: ' + (j.detail || r.status)); return; }
-                alert('자동 일정이 복원되었습니다');
-                await _reloadNotesCache();
-                if (window._renderManualSections) window._renderManualSections();
-              } catch(e) { alert('오류: ' + e.message); }
-              return;
-            }
-            
-            // 상태 3: 기존 수동값 리셋 (아래는 원래 로직)
-            const itemId = btn.getAttribute('data-item-id');
-            if (!itemId) return;
-            const autoVal = btn.getAttribute('data-auto') || '';
-            const autoLabel = autoVal ? autoVal.slice(5).replace('-','/') : '자동값';
-            if (!confirm('수동 지정을 취소하고 자동값(' + autoLabel + ')으로 되돌릴까요?')) return;
-            try {
-              const divId = (window._currentEditContext || {}).divisionId || '';
-              const cardTitle = (window._currentEditContext || {}).cardTitle || '';
-              const r = await fetch('/admin/notes/item/due_override', {
-                method: 'DELETE',
-                headers: {'Content-Type':'application/json'},
-                credentials: 'same-origin',
-                body: JSON.stringify({
-                  division_id: divId,
-                  card_title: cardTitle,
-                  item_id: itemId
-                })
-              });
-              const j = await r.json();
-              if (!r.ok) { alert('리셋 실패: ' + (j.detail || r.status)); return; }
-              alert('일정이 삭제되었습니다 (자동값으로 복귀)');
-              await _reloadNotesCache();
-              if (window._renderManualSections) window._renderManualSections();
-            } catch(e) { alert('오류: ' + e.message); }
-          });
-        });
-
-        // 이벤트 바인딩
-        const addBtn = document.getElementById('ov-sec-add-btn');
-        if (addBtn) addBtn.addEventListener('click', function(){ window._addSectionFlow(); });
-        // 탭 클릭 → 해당 섹션으로 스크롤
-        // ─── 섹션 탭 드래그 앤 드롭 (순서 변경) ───
-        (function(){
-          let _dragSrcIdx = null;
-          sectionsRoot.querySelectorAll('.ov-sec-draggable').forEach(function(btn){
-            btn.addEventListener('dragstart', function(e){
-              _dragSrcIdx = parseInt(btn.getAttribute('data-sec-drag-idx'), 10);
-              try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(_dragSrcIdx)); } catch(_){}
-              btn.style.opacity = '0.4';
-            });
-            btn.addEventListener('dragend', function(){
-              btn.style.opacity = '';
-              sectionsRoot.querySelectorAll('.ov-sec-draggable').forEach(function(b){
-                b.style.borderLeft = '';
-                b.style.borderRight = '';
-              });
-            });
-            btn.addEventListener('dragover', function(e){
-              e.preventDefault();
-              try { e.dataTransfer.dropEffect = 'move'; } catch(_){}
-              const tgtIdx = parseInt(btn.getAttribute('data-sec-drag-idx'), 10);
-              if (_dragSrcIdx === null || _dragSrcIdx === tgtIdx) return;
-              sectionsRoot.querySelectorAll('.ov-sec-draggable').forEach(function(b){
-                b.style.borderLeft = '';
-                b.style.borderRight = '';
-              });
-              if (tgtIdx > _dragSrcIdx) {
-                btn.style.borderRight = '3px solid #0F2C59';
-              } else {
-                btn.style.borderLeft = '3px solid #0F2C59';
-              }
-            });
-            btn.addEventListener('dragleave', function(){
-              btn.style.borderLeft = '';
-              btn.style.borderRight = '';
-            });
-            btn.addEventListener('drop', function(e){
-              e.preventDefault();
-              btn.style.borderLeft = '';
-              btn.style.borderRight = '';
-              const tgtIdx = parseInt(btn.getAttribute('data-sec-drag-idx'), 10);
-              if (_dragSrcIdx === null || _dragSrcIdx === tgtIdx) { _dragSrcIdx = null; return; }
-              if (!Array.isArray(sectionsState)) { _dragSrcIdx = null; return; }
-              const moved = sectionsState.splice(_dragSrcIdx, 1)[0];
-              sectionsState.splice(tgtIdx, 0, moved);
-              _dragSrcIdx = null;
-              try { _markSectionsDirty && _markSectionsDirty(); } catch(_){}
-              if (window._renderManualSections) window._renderManualSections();
-            });
-          });
-        })();
-
-        // ─── 섹션 탭 드래그 앤 드롭 ───
-        (function(){
-          let _dragSrcIdx = null;
-          sectionsRoot.querySelectorAll('.ov-sec-draggable').forEach(function(btn){
-            btn.addEventListener('dragstart', function(e){
-              _dragSrcIdx = parseInt(btn.getAttribute('data-sec-drag-idx'), 10);
-              try {
-                e.dataTransfer.effectAllowed = 'move';
-                e.dataTransfer.setData('text/plain', String(_dragSrcIdx));
-              } catch(_){}
-              btn.style.opacity = '0.4';
-            });
-            btn.addEventListener('dragend', function(){
-              btn.style.opacity = '';
-              sectionsRoot.querySelectorAll('.ov-sec-draggable').forEach(function(b){
-                b.style.borderLeft = '';
-                b.style.borderRight = '';
-              });
-            });
-            btn.addEventListener('dragover', function(e){
-              e.preventDefault();
-              try { e.dataTransfer.dropEffect = 'move'; } catch(_){}
-              const tgtIdx = parseInt(btn.getAttribute('data-sec-drag-idx'), 10);
-              if (_dragSrcIdx === null || _dragSrcIdx === tgtIdx) return;
-              sectionsRoot.querySelectorAll('.ov-sec-draggable').forEach(function(b){
-                b.style.borderLeft = '';
-                b.style.borderRight = '';
-              });
-              if (tgtIdx > _dragSrcIdx) btn.style.borderRight = '3px solid #0F2C59';
-              else btn.style.borderLeft = '3px solid #0F2C59';
-            });
-            btn.addEventListener('dragleave', function(){
-              btn.style.borderLeft = '';
-              btn.style.borderRight = '';
-            });
-            btn.addEventListener('drop', function(e){
-              e.preventDefault();
-              btn.style.borderLeft = '';
-              btn.style.borderRight = '';
-              const tgtIdx = parseInt(btn.getAttribute('data-sec-drag-idx'), 10);
-              if (_dragSrcIdx === null || _dragSrcIdx === tgtIdx) { _dragSrcIdx = null; return; }
-              if (!Array.isArray(sectionsState)) { _dragSrcIdx = null; return; }
-              const moved = sectionsState.splice(_dragSrcIdx, 1)[0];
-              sectionsState.splice(tgtIdx, 0, moved);
-              _dragSrcIdx = null;
-              try { _markSectionsDirty && _markSectionsDirty(); } catch(_){}
-              if (window._renderManualSections) window._renderManualSections();
-            });
-          });
-        })();
-
-        sectionsRoot.querySelectorAll('[data-sec-jump]').forEach(function(tab){
-          tab.addEventListener('click', function(){
-            const i = parseInt(tab.getAttribute('data-sec-jump'), 10);
-            const targetEl = sectionsRoot.querySelector('[data-sec-idx="' + i + '"]');
-            if (targetEl) {
-              targetEl.scrollIntoView({behavior: 'smooth', block: 'start'});
-              // active 상태 갱신
-              sectionsRoot.querySelectorAll('[data-sec-jump]').forEach(function(t){ t.classList.remove('active'); });
-              tab.classList.add('active');
-            }
-          });
-        });
-        // 수정/완료 버튼 바인딩
-        sectionsRoot.querySelectorAll('.ov-sec-edit-btn').forEach(function(btn){
-          btn.addEventListener('click', function(){
-            const i = parseInt(btn.getAttribute('data-sec-idx'), 10);
-            window._sectionEditMode[i] = true;
-            window._renderManualSections();
-          });
-        });
-        // 매출 계산 박스 토글 + 입력 → sectionsState 동기화
-        // ===== 매출 계산 박스 (폼 UI) =====
-        (function bindSalesVisibility(){
-          sectionsRoot.querySelectorAll('.ov-sales-vis').forEach(function(cb){
-            cb.addEventListener('change', function(){
-              var sIdx = parseInt(cb.getAttribute('data-sec-idx'), 10);
-              if (isNaN(sIdx)) return;
-              if (!sectionsState[sIdx]) return;
-              sectionsState[sIdx].sales_visible = !!cb.checked;
-              if (typeof _markSectionsDirty === 'function') _markSectionsDirty();
-            });
-          });
-        })();
-
-        // ============================================================
-        // [SALES v3] xlsx 자동 파싱 + 판가만 입력
-        // ============================================================
-        function _findSectionXlsx(secIdx){
-          // sectionsState[secIdx] 안에서 xlsx 파일 참조 찾기
-          // reports_latest.json 구조: section.blocks[].kind='file', file_name, url
-          // notes.json fallback: section.items[].photo_ref
-          var sec = sectionsState[secIdx];
-          if (!sec) return null;
-          
-          function extractFilename(raw){
-            if (!raw) return null;
-            var s = String(raw);
-            var lo = s.toLowerCase();
-            if (lo.indexOf('.xlsx') < 0 && lo.indexOf('.xlsm') < 0) return null;
-            // /admin/manual-files/{doc_id}/{filename} 패턴
-            var m = s.match(/\\/admin\\/manual-files\\/[^\\/]+\\/([^\\/?#]+)/);
-            if (m) return decodeURIComponent(m[1]);
-            // 그냥 파일명일 수도
-            return s.split('/').pop().split('?')[0];
-          }
-          
-          // 1) blocks[] 탐색 (편집 화면 기본 구조)
-          var blocks = sec.blocks || [];
-          for (var i = 0; i < blocks.length; i++) {
-            var b = blocks[i] || {};
-            if (b.kind === 'file' || b.kind === 'xlsx') {
-              var fn = extractFilename(b.url) || extractFilename(b.file_url) || extractFilename(b.file_name) || extractFilename(b.href);
-              if (fn) return fn;
-            }
-            // kind 상관없이 URL 필드 훑기
-            var candidates = [b.url, b.file_url, b.file_name, b.href, b.text, b.photo_ref];
-            for (var k = 0; k < candidates.length; k++) {
-              var fn2 = extractFilename(candidates[k]);
-              if (fn2) return fn2;
-            }
-          }
-          
-          // 2) items[] 탐색 (notes.json fallback)
-          var items = sec.items || [];
-          for (var j = 0; j < items.length; j++) {
-            var it = items[j] || {};
-            var refs = [it.url, it.file_url, it.file_name, it.href, it.text, it.photo_ref];
-            for (var m2 = 0; m2 < refs.length; m2++) {
-              var fn3 = extractFilename(refs[m2]);
-              if (fn3) return fn3;
-            }
-          }
-          
-          return null;
-        }
-        
-        function _renderSalesPrices(secIdx, parsed, existingPrices){
-          var box = sectionsRoot.querySelector('.ov-sales-box[data-sec-idx="' + secIdx + '"]');
-          if (!box) return;
-          var infoEl = box.querySelector('.ov-sales-info');
-          var pricesEl = box.querySelector('.ov-sales-prices');
-          if (!pricesEl) return;
-          
-          var models = (parsed && parsed.models) || [];
-          var weeks = (parsed && parsed.weeks) || [];
-          
-          if (!models.length) {
-            if (infoEl) infoEl.textContent = '⚠️ 엑셀에서 모델을 인식하지 못했습니다.';
-            pricesEl.innerHTML = '<div style="color:#7C8594;font-size:11px;">엑셀 형식을 확인해 주세요.</div>';
-            return;
-          }
-          
-          var weekLabels = weeks.map(function(w){ return 'W' + w.week; }).join(', ');
-          if (infoEl) {
-            infoEl.innerHTML = '📊 인식된 모델: <b>' + models.join(', ') + '</b><br>📅 인식된 주차: ' + weekLabels;
-          }
-          
-          var prices = existingPrices || {};
-          var html = models.map(function(m){
-            var v = (prices[m] !== undefined && prices[m] !== null) ? prices[m] : '';
-            return '<div class="ov-sales-price-row" data-model="' + m + '" style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
-              +   '<div style="min-width:120px;font-size:12px;font-weight:600;color:#111827;">' + m + '</div>'
-              +   '<input type="number" step="0.1" class="ov-sales-price-input" data-sec-idx="' + secIdx + '" data-model="' + m + '" value="' + v + '" placeholder="판가" style="flex:1;padding:4px 8px;border:1px solid #C5D0E0;border-radius:4px;font-size:12px;" />'
-              +   '<span style="font-size:11px;color:#7C8594;">만불</span>'
-              + '</div>';
-          }).join('');
-          pricesEl.innerHTML = html;
-          
-          // 입력 이벤트 바인딩
-          pricesEl.querySelectorAll('.ov-sales-price-input').forEach(function(inp){
-            if (inp._bound) return;
-            inp._bound = true;
-            inp.addEventListener('input', function(){
-              var idx = parseInt(inp.dataset.secIdx, 10);
-              var name = inp.dataset.model;
-              if (!sectionsState[idx]) return;
-              sectionsState[idx].sales_prices = sectionsState[idx].sales_prices || {};
-              sectionsState[idx].sales_prices[name] = parseFloat(inp.value || '0') || 0;
-              if (typeof _markSectionsDirty === 'function') _markSectionsDirty();
-            });
-          });
-        }
-        
-        async function _loadSalesForSection(secIdx){
-          var box = sectionsRoot.querySelector('.ov-sales-box[data-sec-idx="' + secIdx + '"]');
-          if (!box) return;
-          var infoEl = box.querySelector('.ov-sales-info');
-          var pricesEl = box.querySelector('.ov-sales-prices');
-          
-          var xlsxName = _findSectionXlsx(secIdx);
-          if (!xlsxName) {
-            if (infoEl) infoEl.textContent = '📎 엑셀 파일이 아직 첨부되지 않았습니다.';
-            if (pricesEl) pricesEl.innerHTML = '<div style="color:#7C8594;font-size:11px;">주차별 계획 섹션에 엑셀을 첨부하세요.</div>';
-            return;
-          }
-          
-          if (infoEl) infoEl.textContent = '⏳ 엑셀 파싱 중: ' + xlsxName;
-          
-          try {
-            var res = await fetch('/admin/reports/' + encodeURIComponent(docId) + '/section-parse-xlsx', {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({filename: xlsxName})
-            });
-            if (!res.ok) {
-              var t = await res.text();
-              throw new Error('HTTP ' + res.status + ': ' + t);
-            }
-            var data = await res.json();
-            var existingPrices = (sectionsState[secIdx] && sectionsState[secIdx].sales_prices) || {};
-            _renderSalesPrices(secIdx, data.parsed, existingPrices);
-          } catch(e) {
-            if (infoEl) infoEl.textContent = '❌ 파싱 실패: ' + e.message;
-            if (pricesEl) pricesEl.innerHTML = '';
-          }
-        }
-        
-        // toggle 이벤트 (열릴 때 xlsx 자동 파싱)
-        sectionsRoot.querySelectorAll('.ov-sales-toggle').forEach(function(btn){
-          if (btn._bound) return;
-          btn._bound = true;
-          btn.addEventListener('click', function(){
-            var body = btn.parentElement.querySelector('.ov-sales-body');
-            if (!body) return;
-            var isHidden = body.style.display === 'none' || !body.style.display;
-            body.style.display = isHidden ? 'block' : 'none';
-            btn.textContent = (isHidden ? '▼' : '▶') + ' 💰 매출 계산';
-            if (isHidden) {
-              var secIdx = parseInt(btn.dataset.secIdx, 10);
-              _loadSalesForSection(secIdx);
-            }
-          });
-        });
-        
-        // 이미 펼쳐진 박스가 있으면 자동 로드
-        sectionsRoot.querySelectorAll('.ov-sales-box').forEach(function(box){
-          var body = box.querySelector('.ov-sales-body');
-          if (body && body.style.display === 'block') {
-            var secIdx = parseInt(box.dataset.secIdx, 10);
-            _loadSalesForSection(secIdx);
-          }
-        });
-        
-                        // ─── 편집 세션 알람 지연 발송 헬퍼 ───
-        window._manualEditAlarmSession = window._manualEditAlarmSession || {
-          active: false,
-          sent: false,
-          docId: null
-        };
-
-        window._markManualEditAlarmSessionActive = function() {
-          try {
-            if (typeof isManual !== 'undefined' && isManual && typeof docId !== 'undefined' && docId) {
-              window._manualEditAlarmSession.active = true;
-              window._manualEditAlarmSession.sent = false;
-              window._manualEditAlarmSession.docId = docId;
-            }
-          } catch (e) {
-            console.warn('edit session mark failed:', e);
-          }
-        }
-
-        window._flushManualEditAlarmSession = function() {
-          try {
-            var s = window._manualEditAlarmSession;
-            if (!s || !s.active || s.sent || !s.docId) return;
-            s.sent = true;
-            var url = '/admin/reports/' + encodeURIComponent(s.docId) + '/edit_done';
-            if (navigator.sendBeacon) {
-              navigator.sendBeacon(url, '');
-            } else {
-              fetch(url, { method: 'POST', keepalive: true, credentials: 'same-origin' }).catch(function(){});
-            }
-          } catch (e) {
-            console.warn('edit_done flush failed:', e);
-          }
-        }
-
-        if (!window._manualEditAlarmSessionBound) {
-          window._manualEditAlarmSessionBound = true;
-
-          // 탭 닫기 / 새로고침 / 다른 페이지 이동
-          window.addEventListener('pagehide', function() {
-            window._flushManualEditAlarmSession();
-          });
-
-          // 사파리/일부 브라우저 보완
-          document.addEventListener('visibilitychange', function() {
-            if (document.visibilityState === 'hidden') {
-              window._flushManualEditAlarmSession();
-            }
-          });
-
-          // SPA 내부 네비게이션: 캡처 단계에서 모든 클릭 감지
-          // 보고서 카드 / 네비 아이템 / 뒤로가기 등 클릭 시 세션 flush
-          document.addEventListener('click', function(ev) {
-            try {
-              var s = window._manualEditAlarmSession;
-              if (!s || !s.active || s.sent || !s.docId) return;
-              var t = ev.target;
-              if (!t || !t.closest) return;
-              // 네비게이션성 클릭 대상: 사이드바, 보고서 카드 열기, 목록 버튼 등
-              var nav = t.closest('.nav-item, .ov-open-report, .ov-report-item, a[href], button[data-nav]');
-              // 단, 현재 보고서 내부의 편집 관련 클릭은 제외
-              var inner = t.closest('.ov-sec-done-btn, .ov-block-add-text, .ov-block-add-file, .ov-rt-toolbar, [contenteditable]');
-              if (nav && !inner) {
-                window._flushManualEditAlarmSession();
-              }
-            } catch (e) {}
-          }, true);
-        }
-
-        sectionsRoot.querySelectorAll('.ov-sec-done-btn').forEach(function(btn){
-          btn.addEventListener('click', async function(){
-            const i = parseInt(btn.getAttribute('data-sec-idx'), 10);
-            // 1) 서버 저장 (수기 프로젝트만)
-            if (typeof isManual !== 'undefined' && isManual && typeof docId !== 'undefined') {
-              const origLabel = btn.textContent;
-              btn.disabled = true;
-              btn.textContent = '💾 저장 중...';
-              try {
-                const payload = { products: [{ sections: sectionsState }], edit_mode: true };
-                const res = await fetch('/admin/reports/' + encodeURIComponent(docId), {
-                  method: 'PUT',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify(payload)
-                });
-                if (!res.ok) {
-                  alert('저장 실패: HTTP ' + res.status);
-                  btn.textContent = origLabel;
-                  btn.disabled = false;
-                  return;
-                }
-                btn.textContent = '✓ 저장됨';
-                window._markManualEditAlarmSessionActive();
-                // ── P3: 저장 후 캐시 리로드 (auto값이 바뀌었을 수 있음) ──
-                try {
-                  if (typeof _reloadNotesCache === 'function') {
-                    await _reloadNotesCache();
-                  }
-                } catch(e) { console.warn('cache reload skipped:', e); }
-                setTimeout(function(){
-                  window._sectionEditMode[i] = false;
-                  window._renderManualSections();
-                }, 400);
-              } catch(e) {
-                alert('저장 오류: ' + e.message);
-                btn.textContent = origLabel;
-                btn.disabled = false;
-                return;
-              }
-            } else {
-              // 비수기 프로젝트: 편집 모드만 종료
-              window._sectionEditMode[i] = false;
-              window._renderManualSections();
-            }
-          });
-        });
-        // 블록 이벤트 바인딩
-        sectionsRoot.querySelectorAll('.ov-block-add-text').forEach(function(btn){
-          btn.addEventListener('click', function(){
-            const i = parseInt(btn.getAttribute('data-sec-idx'), 10);
-            if (!sectionsState[i]) return;
-            if (!Array.isArray(sectionsState[i].blocks)) sectionsState[i].blocks = [];
-            sectionsState[i].blocks.push({ kind: 'text', body: '' });
-            _markSectionsDirty();
-            window._renderManualSections();
-          });
-        });
-        sectionsRoot.querySelectorAll('.ov-block-add-file').forEach(function(input){
-          input.addEventListener('change', async function(){
-            const i = parseInt(input.getAttribute('data-sec-idx'), 10);
-            const f = input.files && input.files[0];
-            if (!f) return;
-            const fd = new FormData();
-            fd.append('file', f);
-            try {
-              const res = await fetch('/admin/reports/' + encodeURIComponent(docId) + '/section-file', {
-                method: 'POST', body: fd
-              });
-              if (!res.ok) { alert('파일 업로드 실패'); return; }
-              const j = await res.json();
-              if (!sectionsState[i]) return;
-              if (!Array.isArray(sectionsState[i].blocks)) sectionsState[i].blocks = [];
-              sectionsState[i].blocks.push({ kind: 'file', file_name: j.file_name, url: j.url, size: j.size });
-              _markSectionsDirty();
-              window._renderManualSections();
-            } catch(e){ alert('업로드 오류: ' + e.message); }
-          });
-        });
-        sectionsRoot.querySelectorAll('.ov-block-up').forEach(function(btn){
-          btn.addEventListener('click', function(){
-            if (btn.hasAttribute('disabled')) return;
-            const si = parseInt(btn.getAttribute('data-sec-idx'), 10);
-            const bi = parseInt(btn.getAttribute('data-blk-idx'), 10);
-            const sec = sectionsState[si];
-            if (!sec || !Array.isArray(sec.blocks)) return;
-            if (bi <= 0) return;
-            const tmp = sec.blocks[bi - 1];
-            sec.blocks[bi - 1] = sec.blocks[bi];
-            sec.blocks[bi] = tmp;
-            _markSectionsDirty();
-            window._renderManualSections();
-          });
-        });
-        sectionsRoot.querySelectorAll('.ov-block-down').forEach(function(btn){
-          btn.addEventListener('click', function(){
-            if (btn.hasAttribute('disabled')) return;
-            const si = parseInt(btn.getAttribute('data-sec-idx'), 10);
-            const bi = parseInt(btn.getAttribute('data-blk-idx'), 10);
-            const sec = sectionsState[si];
-            if (!sec || !Array.isArray(sec.blocks)) return;
-            if (bi >= sec.blocks.length - 1) return;
-            const tmp = sec.blocks[bi + 1];
-            sec.blocks[bi + 1] = sec.blocks[bi];
-            sec.blocks[bi] = tmp;
-            _markSectionsDirty();
-            window._renderManualSections();
-          });
-        });
-        sectionsRoot.querySelectorAll('.ov-block-ai').forEach(function(btn){
-          btn.addEventListener('click', async function(){
-            const si = parseInt(btn.getAttribute('data-sec-idx'), 10);
-            const bi = parseInt(btn.getAttribute('data-blk-idx'), 10);
-            const sec = sectionsState[si];
-            const blk = sec && Array.isArray(sec.blocks) ? sec.blocks[bi] : null;
-            if (!sec || !blk) return;
-            const _kind = blk.kind || blk.type;
-            if (_kind !== 'text') return;
-
-            const original = String(blk.body || '').trim();
-            if (!original) {
-              alert('비어 있는 텍스트는 다듬을 수 없습니다.');
-              return;
-            }
-
-            const oldText = btn.textContent;
-            btn.textContent = '…';
-            btn.disabled = true;
-
-            try {
-              const r = await fetch('/admin/reports/' + encodeURIComponent(docId) + '/polish-text', {
-                method: 'POST',
-                credentials: 'same-origin',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  text: original,
-                  section_title: String(sec.title || '')
-                })
-              });
-
-              let j = {};
-              try { j = await r.json(); } catch(_) {}
-
-              if (!r.ok) {
-                throw new Error((j && j.detail) ? String(j.detail) : ('HTTP ' + r.status));
-              }
-
-              const polished = String((j && j.polished) || '').trim();
-              if (!polished) {
-                throw new Error('빈 응답');
-              }
-
-              const diffHtmlRaw = String((j && j.diff_html) || '');
-              const diffHtml = (window._normalizeAiNumberedHtml ? window._normalizeAiNumberedHtml(diffHtmlRaw) : diffHtmlRaw);
-
-              // 블록에 diff overlay 삽입 + 적용/취소 버튼
-              const blockEl = btn.closest('.ov-block');
-              const target = blockEl ? blockEl.querySelector('.ov-block-text-body') : null;
-              if (!target) {
-                if (!confirm('결과를 적용할까요?')) return;
-                blk.body = polished;
-                _markSectionsDirty();
-                window._renderManualSections();
-                return;
-              }
-
-              const originalHtml = target.innerHTML;
-              target.setAttribute('contenteditable', 'false');
-              target.innerHTML = ''
-                + '<div style="font-size:11px;font-weight:700;color:#7C3AED;margin-bottom:8px;display:flex;align-items:center;gap:6px;">'
-                +   '<span>🤖 AI 정리 결과 (빨강=삭제, 초록=추가, 클릭해서 직접 수정 가능)</span>'
-                + '</div>'
-                + '<style>'
-                +   '.ov-ai-diff-edit ol.ov-num{margin:0;padding-left:1.8em;list-style:none;}'
-                +   '.ov-ai-diff-edit ol.ov-num > li{position:relative;margin:0 0 6px 0;line-height:1.8;}'
-                +   '.ov-ai-diff-edit ol.ov-num-dot{counter-reset:aiitem 0;}'
-                +   '.ov-ai-diff-edit ol.ov-num-dot > li{counter-increment:aiitem;}'
-                +   '.ov-ai-diff-edit ol.ov-num-dot > li::before{content:counter(aiitem) ". ";position:absolute;left:-1.8em;top:0;font-weight:700;color:#111827;}'
-                +   '.ov-ai-diff-edit ol.ov-num-paren{counter-reset:aiitem 0;}'
-                +   '.ov-ai-diff-edit ol.ov-num-paren > li{counter-increment:aiitem;}'
-                +   '.ov-ai-diff-edit ol.ov-num-paren > li::before{content:counter(aiitem) ") ";position:absolute;left:-1.8em;top:0;font-weight:700;color:#111827;}'
-                +   '.ov-ai-diff-edit ol.ov-num-circled > li::before{content:attr(data-marker) " ";position:absolute;left:-1.8em;top:0;font-weight:700;color:#111827;}'
-                +   '.ov-ai-diff-edit [data-indent="1"]{margin-left:24px;}'
-                +   '.ov-ai-diff-edit [data-indent="2"]{margin-left:48px;}'
-                +   '.ov-ai-diff-edit [data-indent="3"]{margin-left:72px;}'
-                +   '.ov-ai-diff-edit [data-indent="4"]{margin-left:96px;}'
-                +   '.ov-ai-diff-edit [data-indent="5"]{margin-left:120px;}'
-                +   '.ov-ai-diff-edit ol.ov-num ol.ov-num{margin-top:6px;}'
-                +   '.ov-ai-diff-edit ol.ov-list-paren{counter-reset:none !important;padding-left:1.8em !important;}'
-                +   '.ov-ai-diff-edit ol.ov-list-paren > li{counter-increment:unset !important;}'
-                +   '.ov-ai-diff-edit ol.ov-list-paren > li::before{content:none !important;}'
-                + '</style>'
-                + '<div class="ov-ai-diff-edit" contenteditable="true" spellcheck="false" style="outline:none;padding:12px 14px;background:#FFFFFF;border:1px solid #DDD6FE;border-radius:8px;line-height:1.9;min-height:80px;">'
-                + diffHtml
-                + '</div>'
-                + '<div style="font-size:11px;color:#8593A6;margin-top:6px;">💡 팁: 빨강(삭제 예정)을 지우고 초록(추가)만 남기려면 <b>[적용]</b>을 누르세요. 원본 유지하려면 삭제선 텍스트를 그대로 두면 됩니다.</div>';
-
-              const editBox = target.querySelector('.ov-ai-diff-edit');
-              // === AI edit box: Tab / Shift+Tab + 우클릭 메뉴 ===
-              if (editBox && !editBox.__aiAttachContextMenu) {
-                editBox.__aiAttachContextMenu = true;
-
-                // === undo/redo 스택 ===
-                editBox._aiUndoStack = [];
-                editBox._aiRedoStack = [];
-                editBox._aiUndoDebounce = null;
-                editBox._aiUndoMax = 50;
-
-                editBox._aiGetCursorOffset = function(){
-                  var sel = window.getSelection();
-                  if (!sel.rangeCount) return -1;
-                  var range = sel.getRangeAt(0);
-                  if (!editBox.contains(range.startContainer)) return -1;
-                  var pre = range.cloneRange();
-                  pre.selectNodeContents(editBox);
-                  pre.setEnd(range.startContainer, range.startOffset);
-                  return pre.toString().length;
-                };
-
-                editBox._aiSetCursorOffset = function(offset){
-                  if (offset < 0) return;
-                  var walker = document.createTreeWalker(editBox, NodeFilter.SHOW_TEXT, null, false);
-                  var node, count = 0;
-                  while ((node = walker.nextNode())) {
-                    var len = node.textContent.length;
-                    if (count + len >= offset) {
-                      var range = document.createRange();
-                      range.setStart(node, Math.max(0, offset - count));
-                      range.collapse(true);
-                      var sel = window.getSelection();
-                      sel.removeAllRanges();
-                      sel.addRange(range);
-                      return;
-                    }
-                    count += len;
-                  }
-                };
-
-                editBox._aiPushUndo = function(){
-                  var snap = { html: editBox.innerHTML, offset: editBox._aiGetCursorOffset() };
-                  var top = editBox._aiUndoStack[editBox._aiUndoStack.length - 1];
-                  if (top && top.html === snap.html) return;
-                  editBox._aiUndoStack.push(snap);
-                  if (editBox._aiUndoStack.length > editBox._aiUndoMax) editBox._aiUndoStack.shift();
-                  editBox._aiRedoStack = [];
-                };
-
-                editBox._aiPushUndoDebounced = function(){
-                  if (editBox._aiUndoDebounce) clearTimeout(editBox._aiUndoDebounce);
-                  editBox._aiUndoDebounce = setTimeout(function(){
-                    editBox._aiPushUndo();
-                    editBox._aiUndoDebounce = null;
-                  }, 500);
-                };
-
-                editBox._aiUndo = function(){
-                  if (editBox._aiUndoStack.length === 0) return;
-                  var current = { html: editBox.innerHTML, offset: editBox._aiGetCursorOffset() };
-                  var prev = editBox._aiUndoStack.pop();
-                  editBox._aiRedoStack.push(current);
-                  editBox.innerHTML = prev.html;
-                  if (window._aiRefreshAllLists) window._aiRefreshAllLists(editBox);
-                  editBox._aiSetCursorOffset(prev.offset);
-                };
-
-                editBox._aiRedo = function(){
-                  if (editBox._aiRedoStack.length === 0) return;
-                  var current = { html: editBox.innerHTML, offset: editBox._aiGetCursorOffset() };
-                  var next = editBox._aiRedoStack.pop();
-                  editBox._aiUndoStack.push(current);
-                  editBox.innerHTML = next.html;
-                  if (window._aiRefreshAllLists) window._aiRefreshAllLists(editBox);
-                  editBox._aiSetCursorOffset(next.offset);
-                };
-
-                // 초기 스냅샷
-                setTimeout(function(){ editBox._aiPushUndo(); }, 10);
-
-                // 타이핑 시 debounced 스냅샷
-                editBox.addEventListener('input', function(){
-                  editBox._aiPushUndoDebounced();
-                });
-
-                // Ctrl+Z / Cmd+Z 인터셉트
-                editBox.addEventListener('keydown', function(ev){
-                  var isMod = ev.metaKey || ev.ctrlKey;
-                  if (!isMod) return;
-                  if (ev.key === 'z' || ev.key === 'Z') {
-                    ev.preventDefault();
-                    if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-                    if (ev.shiftKey) editBox._aiRedo();
-                    else editBox._aiUndo();
-                  } else if (ev.key === 'y' || ev.key === 'Y') {
-                    ev.preventDefault();
-                    if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-                    editBox._aiRedo();
-                  }
-                }, true);
-
-                // 렌더 직후 모든 ol에 depth 기반 style 적용
-                setTimeout(function(){
-                  if (window._aiRefreshAllLists) window._aiRefreshAllLists(editBox);
-                }, 0);
-
-                // Tab / Shift+Tab keydown
-                editBox.addEventListener('keydown', function(ev){
-                  if (ev.key !== 'Tab') return;
-                  if (!window._aiCollectSelectedNodes) return;
-                  var collected = window._aiCollectSelectedNodes(editBox);
-                  if (collected.lis.length === 0 && collected.blocks.length === 0) return;
-
-                  ev.preventDefault();
-                  if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-                  if (editBox._aiPushUndo) editBox._aiPushUndo();
-
-                  // 커서 위치 저장 (텍스트 오프셋)
-                  var savedOffset = editBox._aiGetCursorOffset ? editBox._aiGetCursorOffset() : -1;
-
-                  // li 처리: outdent는 상위부터, indent는 하위부터 (안전한 순회)
-                  var lis = collected.lis.slice();
-                  var blocks = collected.blocks.slice();
-
-                  if (ev.shiftKey) {
-                    // Shift+Tab: outdent / unlist
-                    // 역순 정렬 (아래부터 처리해야 위 li 위치가 안 밀림)
-                    var sortedLisOut = lis.slice().sort(function(a, b){
-                      var pos = a.compareDocumentPosition(b);
-                      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return 1;
-                      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return -1;
-                      return 0;
-                    });
-                    sortedLisOut.forEach(function(li){
-                      if (!li.parentNode) return;
-                      var parentOl = li.parentNode;
-
-                      // depth-override 감소 먼저
-                      var ovr = parentOl.dataset.depthOverride;
-                      if (ovr != null && ovr !== '') {
-                        var currentOvr = parseInt(ovr, 10);
-                        var currentDep = window._aiGetListDepth(parentOl, editBox);
-                        if (currentOvr > currentDep) {
-                          var newOvr = currentOvr - 1;
-                          if (newOvr <= currentDep) delete parentOl.dataset.depthOverride;
-                          else parentOl.dataset.depthOverride = String(newOvr);
-                          return;
-                        }
-                      }
-
-                      var hostLi = parentOl ? parentOl.parentNode : null;
-                      var isTopLevel = !hostLi || hostLi.tagName !== 'LI';
-                      if (isTopLevel) {
-                        window._aiUnlistCurrentLi(editBox, li);
-                      } else {
-                        var grandOl = hostLi.parentNode;
-                        if (grandOl && grandOl.tagName === 'OL') {
-                          if (hostLi.nextSibling) grandOl.insertBefore(li, hostLi.nextSibling);
-                          else grandOl.appendChild(li);
-                          if (!parentOl.querySelector('li')) parentOl.remove();
-                        }
-                      }
-                    });
-                    blocks.forEach(function(block){
-                      var cur = parseInt(block.dataset.indent || '0', 10) || 0;
-                      if (cur > 0) {
-                        block.setAttribute('data-indent', String(cur - 1));
-                        if (String(cur - 1) === '0') block.removeAttribute('data-indent');
-                      } else if (block.dataset.indent) {
-                        delete block.dataset.indent;
-                      }
-                    });
-                  } else {
-                    // Tab: indent (옵션 3: selection 모든 li의 depth 무조건 증가)
-                    var sortedLis = lis.slice().sort(function(a, b){
-                      var pos = a.compareDocumentPosition(b);
-                      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-                      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-                      return 0;
-                    });
-                    sortedLis.forEach(function(li, i){
-                      if (!li.parentNode) return;
-                      var parentOl = li.parentNode;
-                      var prevLi = li.previousElementSibling;
-                      var hasPrevLi = prevLi && prevLi.tagName === 'LI' && sortedLis.indexOf(prevLi) < 0;
-
-                      if (hasPrevLi) {
-                        // 앞에 selection 아닌 형제 li 있음 → 그 자식 ol로 이동
-                        var childOl = window._aiEnsureChildOl(prevLi, window._aiStyleForDepth(window._aiGetListDepth(parentOl, editBox) + 1));
-                        childOl.appendChild(li);
-                        if (!parentOl.querySelector('li')) parentOl.remove();
-                      } else {
-                        // 앞에 형제 li 없음 → 자기 ol 자체의 depth 증가
-                        // 자기 ol에 다른 li 있으면 분리
-                        var siblings = Array.prototype.filter.call(parentOl.children, function(x){ return x.tagName === 'LI'; });
-                        var targetOl = parentOl;
-                        if (siblings.length > 1) {
-                          // 이 li만 새 ol로 분리
-                          var isolatedOl = document.createElement('ol');
-                          isolatedOl.className = parentOl.className;
-                          isolatedOl.dataset.start = '1';
-                          isolatedOl.dataset.manualSplit = '1';
-                          parentOl.dataset.manualSplit = '1';
-                          isolatedOl.appendChild(li);
-                          // parentOl 뒤에 삽입 (li가 원래 첫이면 앞에, 아니면 뒤에)
-                          if (parentOl.nextSibling) parentOl.parentNode.insertBefore(isolatedOl, parentOl.nextSibling);
-                          else parentOl.parentNode.appendChild(isolatedOl);
-                          targetOl = isolatedOl;
-                        }
-                        // targetOl의 depth override 증가
-                        var currentDepth = window._aiGetListDepth(targetOl, editBox);
-                        var override = targetOl.dataset.depthOverride;
-                        var currentEffective = (override != null && override !== '') ? parseInt(override, 10) : currentDepth;
-                        var newDepth = currentEffective + 1;
-                        if (newDepth <= 5) {
-                          targetOl.dataset.depthOverride = String(newDepth);
-                        }
-                      }
-                    });
-                    blocks.forEach(function(block){
-                      var cur = parseInt(block.dataset.indent || '0', 10) || 0;
-                      if (cur < 5) block.setAttribute('data-indent', String(cur + 1));
-                    });
-                  }
-
-                  if (window._aiRefreshAllLists) window._aiRefreshAllLists(editBox);
-                  if (savedOffset >= 0 && editBox._aiSetCursorOffset) editBox._aiSetCursorOffset(savedOffset);
-                }, true);
-
-                // Backspace outdent: 라인 맨 앞에서 Backspace 누르면 indent 해제
-                window._aiIsAtLineStart = function(editor){
-                  var sel = window.getSelection();
-                  if (!sel || !sel.rangeCount) return false;
-                  var range = sel.getRangeAt(0);
-                  if (!range.collapsed) return false;
-
-                  // 시작 컨테이너로부터 부모 li/block 찾기
-                  var info = window._aiFindNodeForRange(range.startContainer, editor);
-                  if (!info) return false;
-
-                  // 노드 시작 지점부터 커서까지 텍스트가 모두 비어있는지 확인
-                  var testRange = document.createRange();
-                  testRange.selectNodeContents(info.node);
-                  testRange.setEnd(range.startContainer, range.startOffset);
-                  var text = testRange.toString();
-                  return { atStart: text.length === 0, info: info };
-                };
-
-                editBox.addEventListener('keydown', function(ev){
-                  if (ev.key !== 'Backspace') return;
-                  var check = window._aiIsAtLineStart(editBox);
-                  if (!check || !check.atStart) return;
-
-                  var info = check.info;
-                  if (info.type === 'li') {
-                    var li = info.node;
-                    var parentOl = li.parentNode;
-                    var hostLi = parentOl ? parentOl.parentNode : null;
-                    var isTopLevel = !hostLi || hostLi.tagName !== 'LI';
-
-                    ev.preventDefault();
-                    if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-                    if (editBox._aiPushUndo) editBox._aiPushUndo();
-
-                    if (isTopLevel) {
-                      window._aiUnlistCurrentLi(editBox, li);
-                    } else {
-                      // outdent
-                      var grandOl = hostLi.parentNode;
-                      if (grandOl && grandOl.tagName === 'OL') {
-                        if (hostLi.nextSibling) grandOl.insertBefore(li, hostLi.nextSibling);
-                        else grandOl.appendChild(li);
-                        if (!parentOl.querySelector('li')) parentOl.remove();
-                        if (window._aiRefreshAllLists) window._aiRefreshAllLists(editBox);
-                        var r = document.createRange();
-                        r.selectNodeContents(li);
-                        r.collapse(true);
-                        var s = window.getSelection();
-                        s.removeAllRanges();
-                        s.addRange(r);
-                      }
-                    }
-                    return;
-                  }
-
-                  if (info.type === 'block') {
-                    var block = info.node;
-                    var curIndent = parseInt(block.dataset.indent || '0', 10) || 0;
-                    if (curIndent > 0) {
-                      ev.preventDefault();
-                      if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-                      if (editBox._aiPushUndo) editBox._aiPushUndo();
-                      block.dataset.indent = String(curIndent - 1);
-                      if (String(cur - 1) === '0') { block.removeAttribute('data-indent'); delete block.dataset.indent; } else { block.setAttribute('data-indent', String(cur - 1)); block.dataset.indent = String(cur - 1); }
-                    }
-                    // indent 0이면 기본 동작 (앞 라인과 병합)
-                  }
-                }, true);
-
-                // 우클릭 메뉴
-                editBox.addEventListener('contextmenu', function(ev){
-                  var node = ev.target;
-                  var inLi = null;
-                  var inOl = null;
-                  while (node && node !== editBox) {
-                    if (node.nodeType === 1) {
-                      if (!inLi && node.tagName === 'LI') inLi = node;
-                      if (node.tagName === 'OL') { inOl = node; break; }
-                    }
-                    node = node.parentNode;
-                  }
-                  if (!inOl) return;
-
-                  // li가 아직 확정 안 됐거나 이 ol의 직계가 아니면 재감지
-                  if (!inLi || inLi.parentNode !== inOl) {
-                    var lis = Array.prototype.filter.call(inOl.children, function(x){ return x.tagName === 'LI'; });
-
-                    // 1) 좌표 기반: 클릭한 Y와 각 li rect를 비교
-                    var candidate = null;
-                    var cy = ev.clientY;
-                    for (var i = 0; i < lis.length; i++) {
-                      var r = lis[i].getBoundingClientRect();
-                      if (cy >= r.top && cy <= r.bottom) { candidate = lis[i]; break; }
-                    }
-                    // 2) 좌표가 li 사이 gap이면 가장 가까운 li
-                    if (!candidate && lis.length) {
-                      var minDist = Infinity;
-                      for (var j = 0; j < lis.length; j++) {
-                        var rr = lis[j].getBoundingClientRect();
-                        var mid = (rr.top + rr.bottom) / 2;
-                        var d = Math.abs(cy - mid);
-                        if (d < minDist) { minDist = d; candidate = lis[j]; }
-                      }
-                    }
-                    // 3) selection fallback
-                    if (!candidate) {
-                      var sel = window.getSelection();
-                      if (sel && sel.rangeCount) {
-                        var cur = sel.getRangeAt(0).startContainer;
-                        while (cur && cur !== inOl) {
-                          if (cur.nodeType === 1 && cur.tagName === 'LI' && cur.parentNode === inOl) { candidate = cur; break; }
-                          cur = cur.parentNode;
-                        }
-                      }
-                    }
-                    // 4) 그래도 없으면 첫 li
-                    if (!candidate) candidate = lis[0] || null;
-
-                    inLi = candidate;
-                  }
-                  ev.preventDefault();
-                  if (ev.stopPropagation) ev.stopPropagation();
-                  if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-
-                  var legacy = document.getElementById('ov-ol-ctxmenu');
-                  if (legacy) legacy.remove();
-
-                  var prev = document.getElementById('ov-ai-ol-ctxmenu');
-                  if (prev) prev.remove();
-                  var menu = document.createElement('div');
-                  menu.id = 'ov-ai-ol-ctxmenu';
-                  menu.style.cssText = 'position:fixed;z-index:9999;background:#fff;border:1px solid #D9E3F1;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.12);padding:4px;min-width:180px;font-size:13px;';
-                  menu.style.left = ev.clientX + 'px';
-                  menu.style.top = ev.clientY + 'px';
-                  menu.innerHTML = ''
-                    + '<div class="ov-ai-ctx-item" data-action="continue" style="padding:8px 12px;cursor:pointer;border-radius:4px;">이전 번호에서 이어쓰기</div>'
-                    + '<div class="ov-ai-ctx-item" data-action="restart" style="padding:8px 12px;cursor:pointer;border-radius:4px;">번호 다시 시작</div>'
-                    + '<div class="ov-ai-ctx-item" data-action="set-start" style="padding:8px 12px;cursor:pointer;border-radius:4px;">번호 설정...</div>'
-                    + '<div style="height:1px;background:#E5EAF2;margin:4px 0;"></div>'
-                    + '<div class="ov-ai-ctx-item" data-action="unlist" style="padding:8px 12px;cursor:pointer;border-radius:4px;">리스트에서 빼기</div>';
-                  document.body.appendChild(menu);
-                  menu.querySelectorAll('.ov-ai-ctx-item').forEach(function(item){
-                    item.addEventListener('mouseenter', function(){ item.style.background = '#EEF4FB'; });
-                    item.addEventListener('mouseleave', function(){ item.style.background = 'transparent'; });
-                    item.addEventListener('click', function(){
-                      var action = item.getAttribute('data-action');
-                      if (editBox._aiPushUndo) editBox._aiPushUndo();
-                      if (action === 'continue') window._aiContinueOl(editBox, inLi);
-                      else if (action === 'restart') window._aiRestartOl(editBox, inLi);
-                      else if (action === 'set-start') window._aiSetStartOl(editBox, inLi);
-                      else if (action === 'unlist') window._aiUnlistCurrentLi(editBox, inLi);
-                      menu.remove();
-                    });
-                  });
-                  setTimeout(function(){
-                    document.addEventListener('click', function _closeOnce(){
-                      var m = document.getElementById('ov-ai-ol-ctxmenu');
-                      if (m) m.remove();
-                      document.removeEventListener('click', _closeOnce);
-                    }, { once: true });
-                  }, 0);
-                });
-              }
-              if (editBox) {
-                if (window._aiSplitTextByNewlines) window._aiSplitTextByNewlines(editBox);
-                window._attachAutoListBehavior(editBox);
-              }
-              if (editBox) {
-                // 자동 리스트 변환 방지
-                editBox.addEventListener('keydown', function(e){
-                  if (e.key === 'Enter') {
-                    var sel = window.getSelection();
-                    var node = sel && sel.rangeCount ? sel.getRangeAt(0).startContainer : null;
-                    var cur = node;
-                    var insideAiList = false;
-                    while (cur && cur !== editBox) {
-                      if (cur.nodeType === 1 && cur.tagName === 'LI' && cur.parentNode && cur.parentNode.classList && cur.parentNode.classList.contains('ov-num')) {
-                        insideAiList = true;
-                        break;
-                      }
-                      cur = cur.parentNode;
-                    }
-                    if (insideAiList) {
-                      e.preventDefault();
-                      if (e.stopImmediatePropagation) e.stopImmediatePropagation();
-
-                      var li = cur;
-                      var ol = li && li.parentNode;
-                      if (!li || !ol || !sel || !sel.rangeCount) return;
-
-                      function _htmlOfRange(r){
-                        var wrap = document.createElement('div');
-                        wrap.appendChild(r.cloneContents());
-                        return wrap.innerHTML;
-                      }
-
-                      function _cleanStartBr(html){
-                        return String(html || '').replace(/^(\\s|&nbsp;|<br\\s*\\/?>)+/ig, '');
-                      }
-
-                      function _cleanEndBr(html){
-                        return String(html || '').replace(/(<br\\s*\\/?>|\\s|&nbsp;)+$/ig, '');
-                      }
-
-                      var rangeNow = sel.getRangeAt(0);
-                      var liText = (li.textContent || '').replace(/\\u00A0/g, ' ').trim();
-
-                      // 빈 항목에서 Enter → 그 자리에서 번호만 제거하고 plain 빈 줄로 전환
-                      if (!liText) {
-                        var parent = ol.parentNode;
-                        var lis = Array.from(ol.children).filter(function(x){ return x.tagName === 'LI'; });
-                        var idx = lis.indexOf(li);
-                        var afterLis = lis.slice(idx + 1);
-
-                        var afterOl = null;
-                        if (afterLis.length) {
-                          afterOl = document.createElement('ol');
-                          afterOl.className = ol.className;
-                          afterOl.style.cssText = ol.style.cssText || '';
-                          // counterReset 안 함 (자동 병합 observer가 처리)
-                          afterLis.forEach(function(x){ afterOl.appendChild(x); });
-                        }
-
-                        var plain = document.createElement('div');
-                        plain.innerHTML = '<br>';
-
-                        li.remove();
-
-                        if (!ol.querySelector('li')) {
-                          if (afterOl) {
-                            parent.insertBefore(plain, ol.nextSibling);
-                            parent.insertBefore(afterOl, plain.nextSibling);
-                          } else {
-                            parent.insertBefore(plain, ol.nextSibling);
-                          }
-                          ol.remove();
-                        } else {
-                          parent.insertBefore(plain, ol.nextSibling);
-                          if (afterOl) parent.insertBefore(afterOl, plain.nextSibling);
-                        }
-
-                        var exitRange = document.createRange();
-                        exitRange.selectNodeContents(plain);
-                        exitRange.collapse(true);
-                        sel.removeAllRanges();
-                        sel.addRange(exitRange);
-                        return;
-                      }
-
-                      // 일반 항목에서 Enter → caret 위치 기준으로 현재 li를 둘로 분할
-                      var beforeRange = document.createRange();
-                      beforeRange.selectNodeContents(li);
-                      beforeRange.setEnd(rangeNow.startContainer, rangeNow.startOffset);
-
-                      var afterRange = document.createRange();
-                      afterRange.selectNodeContents(li);
-                      afterRange.setStart(rangeNow.startContainer, rangeNow.startOffset);
-
-                      var beforeHtml = _cleanEndBr(_htmlOfRange(beforeRange));
-                      var afterHtml = _cleanStartBr(_htmlOfRange(afterRange));
-
-                      li.innerHTML = beforeHtml || '<br>';
-
-                      var newLi = document.createElement('li');
-                      newLi.innerHTML = afterHtml || '<br>';
-
-                      if (li.nextSibling) {
-                        ol.insertBefore(newLi, li.nextSibling);
-                      } else {
-                        ol.appendChild(newLi);
-                      }
-
-                      var newRange = document.createRange();
-                      newRange.selectNodeContents(newLi);
-                      newRange.collapse(true);
-                      sel.removeAllRanges();
-                      sel.addRange(newRange);
-                      return;
-                    }
-                                        // Enter는 <br> 삽입으로 강제 (자동 <li> 생성 방지)
-                    e.preventDefault();
-                    document.execCommand('insertLineBreak');
-                  }
-                });
-                // 붙여넣기 시 서식 제거 옵션 (선택적)
-                editBox.addEventListener('paste', function(e){
-                  // 브라우저 기본 붙여넣기 유지
-                });
-              }
-
-              const bar = document.createElement('div');
-              bar.className = 'ov-diff-bar';
-              bar.style.cssText = 'display:flex;gap:8px;margin-top:8px;justify-content:flex-end;';
-              bar.innerHTML = '<button type="button" class="ov-diff-cancel" style="background:#fff;color:#475467;border:1px solid #D0D5DD;border-radius:6px;padding:6px 14px;font-size:12px;font-weight:600;cursor:pointer;">취소</button>'
-                + '<button type="button" class="ov-diff-apply" style="background:#7C3AED;color:#fff;border:0;border-radius:6px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;">적용</button>';
-
-              blockEl.querySelectorAll('.ov-diff-bar').forEach(function(b){ b.remove(); });
-              blockEl.appendChild(bar);
-
-              bar.querySelector('.ov-diff-apply').addEventListener('click', function(){
-                if (!editBox) { blk.body = polished; _markSectionsDirty(); window._renderManualSections(); return; }
-                // diff 태그 벗기기: <del>(삭제) 제거, <ins>(추가) 는 내용만 남김
-                const clone = editBox.cloneNode(true);
-                clone.querySelectorAll('del').forEach(function(el){ el.remove(); });
-                clone.querySelectorAll('ins').forEach(function(el){
-                  const span = document.createElement('span');
-                  span.innerHTML = el.innerHTML;
-                  el.replaceWith(...span.childNodes);
-                });
-                // 오염 제거: <style> 태그, AI 안내 div 제거
-                clone.querySelectorAll('style').forEach(function(el){ el.remove(); });
-                clone.querySelectorAll('div').forEach(function(el){
-                  var txt = (el.textContent || '').trim();
-                  if (txt.indexOf('🤖 AI 정리 결과') === 0 || txt.indexOf('AI 정리 결과 (빨강=삭제') !== -1) {
-                    el.remove();
-                  }
-                });
-                const finalHtml = String(clone.innerHTML || '').trim();
-                blk.body = finalHtml || polished;
-                _markSectionsDirty();
-                window._renderManualSections();
-              });
-              bar.querySelector('.ov-diff-cancel').addEventListener('click', function(){
-                target.innerHTML = originalHtml;
-                target.setAttribute('contenteditable', 'true');
-                bar.remove();
-              });
-            } catch (e) {
-              alert('AI 다듬기 실패: ' + String((e && e.message) || e));
-            } finally {
-              btn.textContent = oldText;
-              btn.disabled = false;
-            }
-          });
-        });
-        sectionsRoot.querySelectorAll('.ov-block-del').forEach(function(btn){
-          btn.addEventListener('click', function(){
-            const si = parseInt(btn.getAttribute('data-sec-idx'), 10);
-            const bi = parseInt(btn.getAttribute('data-blk-idx'), 10);
-            if (!sectionsState[si] || !sectionsState[si].blocks) return;
-            if (!confirm('이 블록을 삭제하시겠습니까?')) return;
-            sectionsState[si].blocks.splice(bi, 1);
-            _markSectionsDirty();
-            window._renderManualSections();
-          });
-        });
-        // 원본 편집박스에 Tab + undo/redo 이식 (idempotent, 재렌더 안전)
-        window._attachOriginalTextBehavior = function(editBox){
-          if (!editBox || editBox.__originalAttached) return;
-          editBox.__originalAttached = true;
-          if (window._aiSplitTextByNewlines) window._aiSplitTextByNewlines(editBox);
-
-          // 기존 오염 body 청소 (한 번만)
-          if (!editBox.__origBodyCleaned) {
-            editBox.__origBodyCleaned = true;
-            var changed = false;
-            editBox.querySelectorAll('style').forEach(function(el){ el.remove(); changed = true; });
-            editBox.querySelectorAll('div').forEach(function(el){
-              var txt = (el.textContent || '').trim();
-              if (txt.indexOf('🤖 AI 정리 결과') === 0 || txt.indexOf('AI 정리 결과 (빨강=삭제') !== -1) {
-                el.remove();
-                changed = true;
-              }
-            });
-            if (changed) {
-              try {
-                var si = parseInt(editBox.getAttribute('data-sec-idx'), 10);
-                var bi = parseInt(editBox.getAttribute('data-blk-idx'), 10);
-                if (sectionsState[si] && sectionsState[si].blocks && sectionsState[si].blocks[bi]) {
-                // data-indent 속성을 HTML에 확실히 반영
-                editBox.querySelectorAll('[data-indent]').forEach(function(el) {
-                  if (el.dataset.indent && el.dataset.indent !== '0') {
-                    el.setAttribute('data-indent', el.dataset.indent);
-                  }
-                });
-                                  sectionsState[si].blocks[bi].body = editBox.innerHTML;
-                  _markSectionsDirty();
-                }
-              } catch(e) {}
-            }
-          }
-
-          // === undo/redo 스택 (AI 편집박스와 동일 로직) ===
-          editBox._origUndoStack = [];
-          editBox._origRedoStack = [];
-          editBox._origUndoDebounce = null;
-          editBox._origUndoMax = 50;
-
-          editBox._origGetCursorOffset = function(){
-            var sel = window.getSelection();
-            if (!sel.rangeCount) return -1;
-            var range = sel.getRangeAt(0);
-            if (!editBox.contains(range.startContainer)) return -1;
-            var pre = range.cloneRange();
-            pre.selectNodeContents(editBox);
-            pre.setEnd(range.startContainer, range.startOffset);
-            return pre.toString().length;
-          };
-
-          editBox._origSetCursorOffset = function(offset){
-            if (offset < 0) return;
-            var walker = document.createTreeWalker(editBox, NodeFilter.SHOW_TEXT, null, false);
-            var node, count = 0;
-            while ((node = walker.nextNode())) {
-              var len = node.textContent.length;
-              if (count + len >= offset) {
-                var range = document.createRange();
-                range.setStart(node, Math.max(0, offset - count));
-                range.collapse(true);
-                var sel = window.getSelection();
-                sel.removeAllRanges();
-                sel.addRange(range);
-                return;
-              }
-              count += len;
-            }
-          };
-
-          editBox._origPushUndo = function(){
-            var snap = { html: editBox.innerHTML, offset: editBox._origGetCursorOffset() };
-            var top = editBox._origUndoStack[editBox._origUndoStack.length - 1];
-            if (top && top.html === snap.html) return;
-            editBox._origUndoStack.push(snap);
-            if (editBox._origUndoStack.length > editBox._origUndoMax) editBox._origUndoStack.shift();
-            editBox._origRedoStack = [];
-          };
-
-          editBox._origPushUndoDebounced = function(){
-            if (editBox._origUndoDebounce) clearTimeout(editBox._origUndoDebounce);
-            editBox._origUndoDebounce = setTimeout(function(){
-              editBox._origPushUndo();
-              editBox._origUndoDebounce = null;
-            }, 500);
-          };
-
-          editBox._origUndo = function(){
-            if (editBox._origUndoStack.length === 0) return;
-            var current = { html: editBox.innerHTML, offset: editBox._origGetCursorOffset() };
-            var prev = editBox._origUndoStack.pop();
-            editBox._origRedoStack.push(current);
-            editBox.innerHTML = prev.html;
-            editBox._origSetCursorOffset(prev.offset);
-            // dirty 플래그 및 body 동기화
-            try {
-              var si = parseInt(editBox.getAttribute('data-sec-idx'), 10);
-              var bi = parseInt(editBox.getAttribute('data-blk-idx'), 10);
-              if (sectionsState[si] && sectionsState[si].blocks && sectionsState[si].blocks[bi]) {
-                // data-indent 속성을 HTML에 확실히 반영
-                editBox.querySelectorAll('[data-indent]').forEach(function(el) {
-                  if (el.dataset.indent && el.dataset.indent !== '0') {
-                    el.setAttribute('data-indent', el.dataset.indent);
-                  }
-                });
-                                sectionsState[si].blocks[bi].body = editBox.innerHTML;
-                _markSectionsDirty();
-              }
-            } catch(e) {}
-          };
-
-          editBox._origRedo = function(){
-            if (editBox._origRedoStack.length === 0) return;
-            var current = { html: editBox.innerHTML, offset: editBox._origGetCursorOffset() };
-            var next = editBox._origRedoStack.pop();
-            editBox._origUndoStack.push(current);
-            editBox.innerHTML = next.html;
-            editBox._origSetCursorOffset(next.offset);
-            try {
-              var si = parseInt(editBox.getAttribute('data-sec-idx'), 10);
-              var bi = parseInt(editBox.getAttribute('data-blk-idx'), 10);
-              if (sectionsState[si] && sectionsState[si].blocks && sectionsState[si].blocks[bi]) {
-                // data-indent 속성을 HTML에 확실히 반영
-                editBox.querySelectorAll('[data-indent]').forEach(function(el) {
-                  if (el.dataset.indent && el.dataset.indent !== '0') {
-                    el.setAttribute('data-indent', el.dataset.indent);
-                  }
-                });
-                                sectionsState[si].blocks[bi].body = editBox.innerHTML;
-                _markSectionsDirty();
-              }
-            } catch(e) {}
-          };
-
-          // 초기 스냅샷
-          setTimeout(function(){ editBox._origPushUndo(); }, 10);
-
-          // 타이핑 시 debounced push
-          editBox.addEventListener('input', function(){
-            editBox._origPushUndoDebounced();
-          });
-
-          // Ctrl+Z / Cmd+Z / Ctrl+Y 인터셉트
-          editBox.addEventListener('keydown', function(ev){
-            var isMod = ev.metaKey || ev.ctrlKey;
-            if (!isMod) return;
-            if (ev.key === 'z' || ev.key === 'Z') {
-              ev.preventDefault();
-              if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-              if (ev.shiftKey) editBox._origRedo();
-              else editBox._origUndo();
-            } else if (ev.key === 'y' || ev.key === 'Y') {
-              ev.preventDefault();
-              if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-              editBox._origRedo();
-            }
-          }, true);
-
-          // Tab / Shift+Tab (AI 편집박스와 동일 로직 - 우리 헬퍼 재사용)
-          editBox.addEventListener('keydown', function(ev){
-            if (ev.key !== 'Tab') return;
-            if (!window._aiCollectSelectedNodes) return;
-            var collected = window._aiCollectSelectedNodes(editBox);
-            if (collected.lis.length === 0 && collected.blocks.length === 0) return;
-
-            ev.preventDefault();
-            if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
-            if (editBox._origPushUndo) editBox._origPushUndo();
-
-            var savedOffset = editBox._origGetCursorOffset ? editBox._origGetCursorOffset() : -1;
-
-            var lis = collected.lis.slice();
-            var blocks = collected.blocks.slice();
-
-            if (ev.shiftKey) {
-              // Shift+Tab: outdent / unlist
-              var sortedLisOut = lis.slice().sort(function(a, b){
-                var pos = a.compareDocumentPosition(b);
-                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return 1;
-                if (pos & Node.DOCUMENT_POSITION_PRECEDING) return -1;
-                return 0;
-              });
-              sortedLisOut.forEach(function(li){
-                if (!li.parentNode) return;
-                var parentOl = li.parentNode;
-                var ovr = parentOl.dataset.depthOverride;
-                if (ovr != null && ovr !== '') {
-                  var currentOvr = parseInt(ovr, 10);
-                  var currentDep = window._aiGetListDepth(parentOl, editBox);
-                  if (currentOvr > currentDep) {
-                    var newOvr = currentOvr - 1;
-                    if (newOvr <= currentDep) delete parentOl.dataset.depthOverride;
-                    else parentOl.dataset.depthOverride = String(newOvr);
-                    return;
-                  }
-                }
-                var hostLi = parentOl ? parentOl.parentNode : null;
-                var isTopLevel = !hostLi || hostLi.tagName !== 'LI';
-                if (isTopLevel) {
-                  if (window._aiUnlistCurrentLi) window._aiUnlistCurrentLi(editBox, li);
-                } else {
-                  var grandOl = hostLi.parentNode;
-                  if (grandOl && grandOl.tagName === 'OL') {
-                    if (hostLi.nextSibling) grandOl.insertBefore(li, hostLi.nextSibling);
-                    else grandOl.appendChild(li);
-                    if (!parentOl.querySelector('li')) parentOl.remove();
-                  }
-                }
-              });
-              blocks.forEach(function(block){
-                var cur = parseInt(block.dataset.indent || '0', 10) || 0;
-                if (cur > 0) {
-                  block.setAttribute('data-indent', String(cur - 1));
-                  if (String(cur - 1) === '0') block.removeAttribute('data-indent');
-                } else if (block.dataset.indent) {
-                  delete block.dataset.indent;
-                }
-              });
-            } else {
-              // Tab: indent
-              var sortedLis = lis.slice().sort(function(a, b){
-                var pos = a.compareDocumentPosition(b);
-                if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-                if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-                return 0;
-              });
-              sortedLis.forEach(function(li, i){
-                if (!li.parentNode) return;
-                var parentOl = li.parentNode;
-                var prevLi = li.previousElementSibling;
-                var hasPrevLi = prevLi && prevLi.tagName === 'LI' && sortedLis.indexOf(prevLi) < 0;
-
-                if (hasPrevLi) {
-                  var childOl = window._aiEnsureChildOl(prevLi, window._aiStyleForDepth(window._aiGetListDepth(parentOl, editBox) + 1));
-                  childOl.appendChild(li);
-                  if (!parentOl.querySelector('li')) parentOl.remove();
-                } else {
-                  var siblings = Array.prototype.filter.call(parentOl.children, function(x){ return x.tagName === 'LI'; });
-                  var targetOl = parentOl;
-                  if (siblings.length > 1) {
-                    var isolatedOl = document.createElement('ol');
-                    isolatedOl.className = parentOl.className;
-                    isolatedOl.dataset.start = '1';
-                    isolatedOl.dataset.manualSplit = '1';
-                    parentOl.dataset.manualSplit = '1';
-                    isolatedOl.appendChild(li);
-                    if (parentOl.nextSibling) parentOl.parentNode.insertBefore(isolatedOl, parentOl.nextSibling);
-                    else parentOl.parentNode.appendChild(isolatedOl);
-                    targetOl = isolatedOl;
-                  }
-                  var currentDepth = window._aiGetListDepth(targetOl, editBox);
-                  var override = targetOl.dataset.depthOverride;
-                  var currentEffective = (override != null && override !== '') ? parseInt(override, 10) : currentDepth;
-                  var newDepth = currentEffective + 1;
-                  if (newDepth <= 5) targetOl.dataset.depthOverride = String(newDepth);
-                }
-              });
-              blocks.forEach(function(block){
-                var cur = parseInt(block.dataset.indent || '0', 10) || 0;
-                if (cur < 5) block.setAttribute('data-indent', String(cur + 1));
-              });
-            }
-
-            if (window._aiRefreshAllLists) window._aiRefreshAllLists(editBox);
-            if (savedOffset >= 0 && editBox._origSetCursorOffset) editBox._origSetCursorOffset(savedOffset);
-
-            // body 동기화 + dirty
-            try {
-              var si2 = parseInt(editBox.getAttribute('data-sec-idx'), 10);
-              var bi2 = parseInt(editBox.getAttribute('data-blk-idx'), 10);
-              if (sectionsState[si2] && sectionsState[si2].blocks && sectionsState[si2].blocks[bi2]) {
-                // data-indent 속성을 실제 HTML 속성으로 동기화 (innerHTML에 포함되도록)
-                editBox.querySelectorAll('[data-indent]').forEach(function(el) {
-                  if (el.dataset.indent && el.dataset.indent !== '0') {
-                    el.setAttribute('data-indent', el.dataset.indent);
-                  }
-                });
-                // HTML → items 변환 (구조화된 저장)
-                var items = window._htmlToItems(editBox.innerHTML);
-                sectionsState[si2].blocks[bi2].items = items;  // HTML 대신 items 저장
-                sectionsState[si2].blocks[bi2].body = editBox.innerHTML;  // 기존 호환용
-                _markSectionsDirty();
-              }
-            } catch(e) {}
-          }, true);
-        };
-
-        // 텍스트 블록 인라인 편집: input 이벤트로 body 동기화 (rich text 이므로 innerHTML 저장)
-        sectionsRoot.querySelectorAll('.ov-block-text-body').forEach(function(el){
-          el.addEventListener('input', function(){
-            const si = parseInt(el.getAttribute('data-sec-idx'), 10);
-            const bi = parseInt(el.getAttribute('data-blk-idx'), 10);
-            if (!sectionsState[si] || !sectionsState[si].blocks || !sectionsState[si].blocks[bi]) return;
-            sectionsState[si].blocks[bi].body = el.innerHTML;
-            _markSectionsDirty();
-          });
-        });
-        // Rich text 툴바 바인딩
-        function _getListInEditor(editor){
-          const sel = window.getSelection();
-          let node = sel && sel.anchorNode;
-          while (node && node !== editor) {
-            if (node.nodeType === 1 && (node.tagName === 'UL' || node.tagName === 'OL')) return node;
-            node = node.parentNode;
-          }
-          return null;
-        }
-        function _ensureList(editor, ordered){
-          editor.focus();
-          try { document.execCommand(ordered ? 'insertOrderedList' : 'insertUnorderedList', false, null); } catch(e) {}
-          return _getListInEditor(editor);
-        }
-        function _syncEditorState(editor){
-          const si = parseInt(editor.getAttribute('data-sec-idx'), 10);
-          const bi = parseInt(editor.getAttribute('data-blk-idx'), 10);
-          if (sectionsState[si] && sectionsState[si].blocks && sectionsState[si].blocks[bi]) {
-            sectionsState[si].blocks[bi].body = editor.innerHTML;
-            _markSectionsDirty();
-          }
-        }
-        function _applyListStyle(editor, listType, styleValue){
-          let listEl = _getListInEditor(editor);
-          if (!listEl || (listType === 'ul' && listEl.tagName !== 'UL') || (listType === 'ol' && listEl.tagName !== 'OL')) {
-            listEl = _ensureList(editor, listType === 'ol');
-          }
-          if (!listEl) return;
-          Array.from(listEl.classList).forEach(function(cls){
-            if (cls.indexOf('ov-list-') === 0) listEl.classList.remove(cls);
-          });
-          listEl.removeAttribute('type');
-          listEl.style.listStyleType = '';
-          if (String(styleValue).indexOf('ov-') === 0) {
-            listEl.classList.add('ov-list-' + styleValue.slice(3));
-            listEl.style.listStyleType = 'none';
-          } else {
-            listEl.style.listStyleType = styleValue;
-            if (listType === 'ol') {
-              if (styleValue === 'decimal') listEl.setAttribute('type', '1');
-              else if (styleValue === 'lower-alpha') listEl.setAttribute('type', 'a');
-              else if (styleValue === 'upper-alpha') listEl.setAttribute('type', 'A');
-              else if (styleValue === 'lower-roman') listEl.setAttribute('type', 'i');
-              else if (styleValue === 'upper-roman') listEl.setAttribute('type', 'I');
-            }
-          }
-          _syncEditorState(editor);
-        }
-        function _findPreviousOrderedList(root, currentOl){
-          const all = Array.from(root.querySelectorAll('ol'));
-          const idx = all.indexOf(currentOl);
-          if (idx > 0) return all[idx - 1];
-          return null;
-        }
-        function _orderedCount(ol){
-          return ol.querySelectorAll('li').length || 0;
-        }
-        function _continueOrderedList(editor){
-          let ol = _getListInEditor(editor);
-          if (!ol || ol.tagName !== 'OL') ol = _ensureList(editor, true);
-          if (!ol) return;
-          const prev = _findPreviousOrderedList(editor.closest('.ov-section') || document, ol);
-          let nextStart = 1;
-          if (prev) {
-            const prevStart = parseInt(prev.getAttribute('start') || '1', 10) || 1;
-            const prevCount = _orderedCount(prev);
-            nextStart = prevStart + Math.max(prevCount, 1);
-          } else {
-            const raw = prompt('이어쓰기 시작 번호', ol.getAttribute('start') || '1');
-            if (!raw) return;
-            nextStart = parseInt(raw, 10);
-            if (!Number.isFinite(nextStart) || nextStart < 1) return;
-          }
-          ol.setAttribute('start', String(nextStart));
-          _syncEditorState(editor);
-        }
-        function _restartOrderedList(editor){
-          let ol = _getListInEditor(editor);
-          if (!ol || ol.tagName !== 'OL') ol = _ensureList(editor, true);
-          if (!ol) return;
-          const raw = prompt('번호 시작 값', '1');
-          if (!raw) return;
-          const start = parseInt(raw, 10);
-          if (!Number.isFinite(start) || start < 1) return;
-          ol.setAttribute('start', String(start));
-          _syncEditorState(editor);
-        }
-
-        sectionsRoot.querySelectorAll('.ov-block-text-body').forEach(function(el){
-          el.addEventListener('input', function(){
-            _syncEditorState(el);
-          });
-        });
-
-        sectionsRoot.querySelectorAll('.ov-rt-toolbar').forEach(function(bar){
-
-          const editorId = bar.getAttribute('data-editor');
-          const editor = document.getElementById(editorId);
-          function exec(cmd, val){
-            if (!editor) return;
-            editor.focus();
-            try { document.execCommand(cmd, false, val || null); } catch(e){ console.warn(e); }
-            _syncEditorState(editor);
-          }
-          bar.querySelectorAll('button[data-cmd]').forEach(function(btn){
-            btn.addEventListener('mousedown', function(e){ e.preventDefault(); });
-            btn.addEventListener('click', function(){ exec(btn.getAttribute('data-cmd')); });
-          });
-          const sel = bar.querySelector('select[data-cmd]');
-          if (sel) {
-            sel.addEventListener('change', function(){
-              let v = sel.value;
-              if (v === 'div') v = 'p';
-              exec('formatBlock', v);
-            });
-          }
-
-    /* === WORD_COLOR_POPOVER_BEGIN === */
-    window.__ovSavedRange = window.__ovSavedRange || null;
-    window.__ovColorPopover = window.__ovColorPopover || null;
-    window.__ovColorAnchor = window.__ovColorAnchor || null;
-    window.__ovColorDocBound = window.__ovColorDocBound || false;
-
-    window.getActiveEditor = window.getActiveEditor || function(){
-      return document.querySelector('[contenteditable="true"].is-editing, [contenteditable="true"][data-editor-active="1"], [contenteditable="true"]');
-    };
-
-    window.saveEditorSelection = function(){
-      var sel = window.getSelection();
-      if (!sel || sel.rangeCount === 0) return;
-      var editor = window.getActiveEditor && window.getActiveEditor();
-      var node = sel.anchorNode;
-      if (!editor || !node || !editor.contains(node)) return;
-      window.__ovSavedRange = sel.getRangeAt(0).cloneRange();
-    };
-
-    window.restoreEditorSelection = function(){
-      if (!window.__ovSavedRange) return false;
-      var sel = window.getSelection();
-      if (!sel) return false;
-      sel.removeAllRanges();
-      sel.addRange(window.__ovSavedRange);
-      return true;
-    };
-
-    window.closeWordColorPopover = function(){
-      if (window.__ovColorPopover && window.__ovColorPopover.parentNode) {
-        window.__ovColorPopover.parentNode.removeChild(window.__ovColorPopover);
-      }
-      window.__ovColorPopover = null;
-      window.__ovColorAnchor = null;
-    };
-
-    function _hexToRgb(hex){
-      var h = (hex || '').replace('#', '').trim();
-      if (h.length === 3) h = h.split('').map(function(x){ return x + x; }).join('');
-      var n = parseInt(h, 16);
-      return { r:(n >> 16) & 255, g:(n >> 8) & 255, b:n & 255 };
-    }
-
-    function _rgbToHex(r, g, b){
-      return '#' + [r,g,b].map(function(v){
-        var s = Math.max(0, Math.min(255, Math.round(v))).toString(16);
-        return s.length === 1 ? '0' + s : s;
-      }).join('').toUpperCase();
-    }
-
-    function _mixHex(a, b, ratio){
-      var c1 = _hexToRgb(a), c2 = _hexToRgb(b);
-      return _rgbToHex(
-        c1.r + (c2.r - c1.r) * ratio,
-        c1.g + (c2.g - c1.g) * ratio,
-        c1.b + (c2.b - c1.b) * ratio
-      );
-    }
-
-    function _themeRows(){
-      var base = ['#000000','#FFFFFF','#44546A','#E7E6E6','#5B9BD5','#ED7D31','#A5A5A5','#FFC000','#4472C4','#70AD47'];
-      return [
-        base,
-        base.map(function(c){ return _mixHex(c, '#FFFFFF', 0.80); }),
-        base.map(function(c){ return _mixHex(c, '#FFFFFF', 0.60); }),
-        base.map(function(c){ return _mixHex(c, '#FFFFFF', 0.40); }),
-        base.map(function(c){ return _mixHex(c, '#000000', 0.25); }),
-        base.map(function(c){ return _mixHex(c, '#000000', 0.50); })
-      ];
-    }
-
-    function _standardColors(){
-      return ['#C00000','#FF0000','#FFC000','#FFFF00','#92D050','#00B050','#00B0F0','#0070C0','#002060','#7030A0'];
-    }
-
-    function _makeColorCell(color, onPick){
-      var btn = document.createElement('button');
-      btn.type = 'button';
-      btn.title = color;
-      btn.style.width = '18px';
-      btn.style.height = '18px';
-      btn.style.padding = '0';
-      btn.style.border = '1px solid #D1D5DB';
-      btn.style.borderRadius = '3px';
-      btn.style.background = color;
-      btn.style.cursor = 'pointer';
-      btn.addEventListener('mousedown', function(e){
-        e.preventDefault();
-        e.stopPropagation();
-        onPick(color);
-      });
-      return btn;
-    }
-
-    window.applyEditorColor = function(cmd, color, triggerBtn){
-      var editor = window.getActiveEditor && window.getActiveEditor();
-      if (!editor) return;
-      editor.focus();
-      if (window.restoreEditorSelection) window.restoreEditorSelection();
-      try { document.execCommand('styleWithCSS', false, true); } catch(e) {}
-      try {
-        if (cmd === 'foreColor') document.execCommand('foreColor', false, color || '#000000');
-        else document.execCommand('hiliteColor', false, color || '#FFF3B0');
-      } catch(e) {}
-      if (window.saveEditorSelection) window.saveEditorSelection();
-
-      if (triggerBtn) {
-        var preview = triggerBtn.querySelector('.word-color-preview');
-        if (preview) preview.style.background = color;
-      }
-      if (window.closeWordColorPopover) window.closeWordColorPopover();
-    };
-
-    window.openWordColorPopover = function(anchorBtn, cmd, defaultColor){
-      if (window.__ovColorPopover && window.__ovColorAnchor === anchorBtn) {
-        window.closeWordColorPopover();
-        return;
-      }
-      window.closeWordColorPopover();
-
-      var pop = document.createElement('div');
-      pop.style.position = 'absolute';
-      pop.style.zIndex = '99999';
-      pop.style.width = '232px';
-      pop.style.padding = '10px';
-      pop.style.background = '#FFFFFF';
-      pop.style.border = '1px solid #D1D5DB';
-      pop.style.borderRadius = '10px';
-      pop.style.boxShadow = '0 12px 28px rgba(0,0,0,.14)';
-
-      var rect = anchorBtn.getBoundingClientRect();
-      pop.style.left = (window.scrollX + rect.left) + 'px';
-      pop.style.top = (window.scrollY + rect.bottom + 8) + 'px';
-
-      function sectionTitle(text){
-        var el = document.createElement('div');
-        el.textContent = text;
-        el.style.fontSize = '11px';
-        el.style.fontWeight = '700';
-        el.style.color = '#6B7280';
-        el.style.margin = '6px 0 6px';
-        return el;
-      }
-
-      var autoBtn = document.createElement('button');
-      autoBtn.type = 'button';
-      autoBtn.textContent = (cmd === 'foreColor') ? '자동' : '채우기 없음';
-      autoBtn.style.width = '100%';
-      autoBtn.style.height = '28px';
-      autoBtn.style.marginBottom = '8px';
-      autoBtn.style.border = '1px solid #D1D5DB';
-      autoBtn.style.borderRadius = '6px';
-      autoBtn.style.background = '#fff';
-      autoBtn.style.cursor = 'pointer';
-      autoBtn.addEventListener('mousedown', function(e){
-        e.preventDefault();
-        e.stopPropagation();
-        window.applyEditorColor(cmd, cmd === 'foreColor' ? '#000000' : '#FFFFFF', anchorBtn);
-      });
-      pop.appendChild(autoBtn);
-
-      pop.appendChild(sectionTitle('테마 색'));
-      var themeWrap = document.createElement('div');
-      themeWrap.style.display = 'grid';
-      themeWrap.style.gridTemplateColumns = 'repeat(10, 18px)';
-      themeWrap.style.gap = '4px';
-      _themeRows().forEach(function(row){
-        row.forEach(function(color){
-          themeWrap.appendChild(_makeColorCell(color, function(picked){
-            window.applyEditorColor(cmd, picked, anchorBtn);
-          }));
-        });
-      });
-      pop.appendChild(themeWrap);
-
-      pop.appendChild(sectionTitle('표준 색'));
-      var stdWrap = document.createElement('div');
-      stdWrap.style.display = 'grid';
-      stdWrap.style.gridTemplateColumns = 'repeat(10, 18px)';
-      stdWrap.style.gap = '4px';
-      _standardColors().forEach(function(color){
-        stdWrap.appendChild(_makeColorCell(color, function(picked){
-          window.applyEditorColor(cmd, picked, anchorBtn);
-        }));
-      });
-      pop.appendChild(stdWrap);
-
-      var moreRow = document.createElement('div');
-      moreRow.style.marginTop = '8px';
-
-      var custom = document.createElement('input');
-      custom.type = 'color';
-      custom.value = defaultColor || '#000000';
-      custom.style.width = '100%';
-      custom.style.height = '30px';
-      custom.style.border = '1px solid #D1D5DB';
-      custom.style.borderRadius = '6px';
-      custom.style.background = '#fff';
-      custom.style.cursor = 'pointer';
-      custom.addEventListener('input', function(){
-        window.applyEditorColor(cmd, custom.value, anchorBtn);
-      });
-
-      moreRow.appendChild(custom);
-      pop.appendChild(moreRow);
-
-      if (window.EyeDropper) {
-        var dropRow = document.createElement('div');
-        dropRow.style.marginTop = '6px';
-
-        var dropBtn = document.createElement('button');
-        dropBtn.type = 'button';
-        dropBtn.innerHTML = ''
-          + '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#111827" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:0 0 auto;">'
-          +   '<path d="m2 22 1-1h3l9-9"/>'
-          +   '<path d="M3 21v-3l9-9"/>'
-          +   '<path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z"/>'
-          + '</svg>'
-          + '<span style="margin-left:8px;font-weight:500;">스포이드</span>';
-        dropBtn.style.width = '100%';
-        dropBtn.style.height = '30px';
-        dropBtn.style.border = '1px solid #D1D5DB';
-        dropBtn.style.borderRadius = '6px';
-        dropBtn.style.background = '#fff';
-        dropBtn.style.cursor = 'pointer';
-        dropBtn.style.fontSize = '12px';
-        dropBtn.style.color = '#111827';
-        dropBtn.style.display = 'inline-flex';
-        dropBtn.style.alignItems = 'center';
-        dropBtn.style.justifyContent = 'flex-start';
-        dropBtn.style.padding = '0 10px';
-
-        dropBtn.addEventListener('mousedown', function(e){
-          e.preventDefault();
-          e.stopPropagation();
-          try {
-            var eyeDropper = new window.EyeDropper();
-            eyeDropper.open().then(function(result){
-              if (result && result.sRGBHex) {
-                window.applyEditorColor(cmd, result.sRGBHex, anchorBtn);
-              }
-            }).catch(function(){ /* 사용자 취소 */ });
-          } catch(err) {
-            console.warn('EyeDropper failed', err);
-          }
-        });
-
-        dropRow.appendChild(dropBtn);
-        pop.appendChild(dropRow);
-      }
-
-      document.body.appendChild(pop);
-      window.__ovColorPopover = pop;
-      window.__ovColorAnchor = anchorBtn;
-    };
-
-    if (!window.__ovColorDocBound) {
-      document.addEventListener('mousedown', function(e){
-        var pop = window.__ovColorPopover;
-        var anchor = window.__ovColorAnchor;
-        if (!pop) return;
-        if (pop.contains(e.target)) return;
-        if (anchor && anchor.contains(e.target)) return;
-        window.closeWordColorPopover();
-      }, true);
-
-      document.addEventListener('selectionchange', function(){
-        var editor = window.getActiveEditor && window.getActiveEditor();
-        var sel = window.getSelection();
-        if (!editor || !sel || sel.rangeCount === 0) return;
-        var node = sel.anchorNode;
-        if (node && editor.contains(node)) window.saveEditorSelection();
-      });
-
-      window.__ovColorDocBound = true;
-    }
-    /* === WORD_COLOR_POPOVER_END === */
-          bar.querySelectorAll('.word-color-btn').forEach(function(btn){
-            btn.addEventListener('mousedown', function(e){
-              e.preventDefault();
-              e.stopPropagation();
-              if (window.saveEditorSelection) window.saveEditorSelection();
-              if (window.openWordColorPopover) {
-                window.openWordColorPopover(btn, btn.dataset.colorCmd, btn.dataset.defaultColor || '#000000');
-              }
-            });
-          });
-          bar.querySelectorAll('select[data-list-style="ul"]').forEach(function(sel2){
-            sel2.addEventListener('change', function(){
-              _applyListStyle(editor, 'ul', sel2.value);
-            });
-          });
-          bar.querySelectorAll('select[data-list-style="ol"]').forEach(function(sel3){
-            sel3.addEventListener('change', function(){
-              _applyListStyle(editor, 'ol', sel3.value);
-            });
-          });
-        });
-
-        // 모든 원본 편집박스에 Tab + undo/redo 부착
-        sectionsRoot.querySelectorAll('.ov-block-text-body').forEach(function(editor){
-          if (window._attachOriginalTextBehavior) window._attachOriginalTextBehavior(editor);
-        });
-
-        // OL 안에서 우클릭 시 커스텀 메뉴 (이어/재시작)
-        sectionsRoot.querySelectorAll('.ov-block-text-body').forEach(function(editor){
-          editor.addEventListener('contextmenu', function(e){
-            // AI 편집 박스 내부 우클릭은 전용 메뉴가 처리
-            if (e.target && e.target.closest && e.target.closest('.ov-ai-diff-edit')) return;
-
-            // 커서/클릭 위치가 OL 안에 있는지 확인
-            let node = e.target;
-            let inOl = null;
-            while (node && node !== editor) {
-              if (node.nodeType === 1 && node.tagName === 'OL') { inOl = node; break; }
-              node = node.parentNode;
-            }
-            if (!inOl) return; // 기본 브라우저 메뉴 유지
-            e.preventDefault();
-            // 기존 메뉴 있으면 제거
-            const prev = document.getElementById('ov-ol-ctxmenu');
-            if (prev) prev.remove();
-            const menu = document.createElement('div');
-            menu.id = 'ov-ol-ctxmenu';
-            menu.style.cssText = 'position:fixed;z-index:9999;background:#fff;border:1px solid #D9E3F1;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.12);padding:4px;min-width:160px;font-size:13px;';
-            menu.style.left = e.clientX + 'px';
-            menu.style.top = e.clientY + 'px';
-            menu.innerHTML = ''
-              + '<div class="ov-ctx-item" data-action="continue" style="padding:8px 12px;cursor:pointer;border-radius:4px;">이전 번호에서 이어쓰기</div>'
-              + '<div class="ov-ctx-item" data-action="restart" style="padding:8px 12px;cursor:pointer;border-radius:4px;">번호 다시 시작</div>';
-            document.body.appendChild(menu);
-            menu.querySelectorAll('.ov-ctx-item').forEach(function(item){
-              item.addEventListener('mouseenter', function(){ item.style.background = '#EEF4FB'; });
-              item.addEventListener('mouseleave', function(){ item.style.background = 'transparent'; });
-              item.addEventListener('click', function(){
-                const action = item.getAttribute('data-action');
-                if (action === 'continue') _continueOrderedList(editor);
-                else if (action === 'restart') _restartOrderedList(editor);
-                menu.remove();
-              });
-            });
-            // 바깥 클릭 시 제거
-            setTimeout(function(){
-              document.addEventListener('click', function _closeOnce(){
-                menu.remove();
-                document.removeEventListener('click', _closeOnce);
-              }, { once: true });
-            }, 0);
-          });
-        });
-
-        sectionsRoot.querySelectorAll('.ov-sec-rename-btn').forEach(function(btn){
-          btn.addEventListener('click', function(){
-            const i = parseInt(btn.getAttribute('data-sec-idx'), 10);
-            window._renameSectionFlow(i);
-          });
-        });
-        sectionsRoot.querySelectorAll('.ov-sec-tab-rename-btn').forEach(function(btn){
-          btn.addEventListener('click', function(e){
-            e.preventDefault();
-            e.stopPropagation();
-            const i = parseInt(btn.getAttribute('data-sec-idx'), 10);
-            window._renameSectionFlow(i);
-          });
-        });
-
-        sectionsRoot.querySelectorAll('.ov-sec-del-btn').forEach(function(btn){
-          btn.addEventListener('click', function(){
-            const i = parseInt(btn.getAttribute('data-sec-idx'), 10);
-            window._deleteSectionFlow(i);
-          });
-        });
-      };
-
-      window._addSectionFlow = function(){
-        const raw = prompt('추가할 섹션명을 입력하세요\\n(예: 현황, 주차별 출하실적, 주차별 계획, 주요내용, 이슈/리스크, 요청사항)');
-        if (raw === null) return;
-        const name = String(raw || '').trim();
-        if (!name) { alert('섹션명을 입력해주세요'); return; }
-
-        // 완전 동일한 이름이 이미 있으면 차단
-        for (let i=0;i<sectionsState.length;i++){
-          if (_normSectionName(sectionsState[i].title) === _normSectionName(name)) {
-            alert('이미 같은 이름의 섹션이 있습니다: ' + sectionsState[i].title);
-            return;
-          }
-        }
-
-        // 유사 이름 alias 검사
-        const canonical = _findAliasCanonical(name);
-        if (canonical && _normSectionName(canonical) !== _normSectionName(name)) {
-          // 이미 canonical 섹션이 있는지 확인
-          const existingIdx = sectionsState.findIndex(function(s){
-            return _normSectionName(s.title) === _normSectionName(canonical);
-          });
-          if (existingIdx >= 0) {
-            const ok = confirm('이미 "' + canonical + '" 섹션이 있습니다.\\n이 섹션으로 대체하시겠습니까?\\n\\n[확인] 기존 섹션 사용 (추가 안 함)\\n[취소] 그래도 "' + name + '"으로 추가');
-            if (ok) return;
-          } else {
-            const useCanonical = confirm('"' + name + '" 은(는) 표준명 "' + canonical + '"와 유사합니다.\\n표준명으로 추가할까요?\\n\\n[확인] "' + canonical + '"로 추가\\n[취소] 입력한 그대로 "' + name + '"으로 추가');
-            if (useCanonical) {
-              sectionsState.push({id: _genSecId(), title: canonical, kind: 'mixed', blocks: []});
-              _markSectionsDirty();
-              window._renderManualSections();
-              return;
-            }
-          }
-        }
-
-        sectionsState.push({id: _genSecId(), title: name, kind: 'mixed', blocks: []});
-        _markSectionsDirty();
-        window._renderManualSections();
-      };
-
-      window._renameSectionFlow = function(idx){
-        if (idx < 0 || idx >= sectionsState.length) return;
-        const cur = sectionsState[idx].title || '';
-        const raw = prompt('새 섹션명을 입력하세요', cur);
-        if (raw === null) return;
-        const name = String(raw || '').trim();
-        if (!name) { alert('섹션명을 입력해주세요'); return; }
-        if (_normSectionName(name) === _normSectionName(cur)) return;
-        for (let i=0;i<sectionsState.length;i++){
-          if (i === idx) continue;
-          if (_normSectionName(sectionsState[i].title) === _normSectionName(name)) {
-            alert('이미 같은 이름의 섹션이 있습니다: ' + sectionsState[i].title);
-            return;
-          }
-        }
-        sectionsState[idx].title = name;
-        _markSectionsDirty();
-        window._renderManualSections();
-      };
-
-      window._deleteSectionFlow = function(idx){
-        if (idx < 0 || idx >= sectionsState.length) return;
-        const cur = sectionsState[idx].title || '';
-        if (!confirm('"' + cur + '" 섹션을 삭제하시겠습니까?')) return;
-        sectionsState.splice(idx, 1);
-        _markSectionsDirty();
-        window._renderManualSections();
-      };
-
-      // 엑셀 미리보기 로더
-      // 자동 리스트 동작: "1)" "1." "-" "*" + Space → 리스트 시작, Enter → 다음 번호, 빈줄 Enter → 종료
-
-      window._loadXlsxPreviews = function(){
-        const previews = document.querySelectorAll('.ov-xlsx-preview');
-        previews.forEach(async function(el){
-          if (el.getAttribute('data-loaded') === '1') return;
-          const doc = el.getAttribute('data-doc') || '';
-          const file = el.getAttribute('data-file') || '';
-          if (!doc || !file) {
-            el.innerHTML = '<div style="color:#b42318;font-size:12px;">미리보기 정보 누락</div>';
-            return;
-          }
-          try {
-            const r = await fetch(
-              '/admin/manual-files/' + encodeURIComponent(doc) + '/' + encodeURIComponent(file) + '/xlsx-preview',
-              { credentials: 'same-origin' }
-            );
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            const j = await r.json();
-            const rows = Array.isArray(j.rows) ? j.rows : [];
-            if (!rows.length) {
-              el.innerHTML = '<div style="color:#667085;font-size:12px;">비어 있는 시트입니다</div>';
-              el.setAttribute('data-loaded', '1');
-              return;
-            }
-            const nRows = j.n_rows || rows.length;
-            const nCols = j.n_cols || 0;
-            let html = '';
-            html += '<div style="font-size:12px;font-weight:700;color:#344054;margin-bottom:8px;">📊 ' + (j.sheet || '첫 시트') + ' (' + nRows + '행 × ' + nCols + '열)</div>';
-            html += '<div style="overflow:auto;border:1px solid #D9E3F1;border-radius:8px;background:#fff;">';
-            html += '<table style="border-collapse:separate;border-spacing:0;width:100%;font-size:12px;">';
-            rows.forEach(function(row){
-              html += '<tr>';
-              (row || []).forEach(function(cell){
-                let rawText = String(cell.text == null ? '' : cell.text);
-                let safe = rawText
-                  .replace(/&/g,'&amp;')
-                  .replace(/</g,'&lt;')
-                  .replace(/>/g,'&gt;');
-                safe = safe.split(String.fromCharCode(13,10)).join('<br>');
-                safe = safe.split(String.fromCharCode(13)).join('<br>');
-                safe = safe.split(String.fromCharCode(10)).join('<br>');
-
-                // PO증감/월별 문자열 강제 개행 (정규식 리터럴 금지: 파이썬 템플릿 깨짐 방지)
-                const monthTokens = ['3월:', '4월:', '5월:', '6월:', '7월:', '8월:', '9월:', '10월:', '11월:', '12월:'];
-                let tokens = [];
-                for (let ti = 0; ti < monthTokens.length; ti++) {
-                  tokens.push(monthTokens[ti]);
-                }
-                for (let wi = 1; wi <= 53; wi++) {
-                  tokens.push('W' + wi + ':');
-                }
-                for (let i = 1; i < tokens.length; i++) {
-                  safe = safe.split(' ' + tokens[i]).join('<br>' + tokens[i]);
-                }
-                safe = safe.split('<br> ').join('<br>');
-                const rs = cell.rowspan && cell.rowspan > 1 ? ' rowspan="' + cell.rowspan + '"' : '';
-                const cs = cell.colspan && cell.colspan > 1 ? ' colspan="' + cell.colspan + '"' : '';
-                let style = 'padding:8px 12px;text-align:center;white-space:pre-line;min-width:60px;';
-                // 셀별 border (색상 지정 있으면 그거, 없으면 기본 연회색)
-                const _bd = cell.borders || {};
-                const _bstyle = function(s){
-                  const m = { thin: '1px solid', medium: '2px solid', thick: '3px solid', dashed: '1px dashed', dotted: '1px dotted', double: '3px double' };
-                  return m[s] || '1px solid';
-                };
-                // 색상 border는 box-shadow inset으로 그림 (이웃 셀에 안 가려짐)
-                const _shadows = [];
-                ['top','right','bottom','left'].forEach(function(side){
-                  if (_bd[side]) {
-                    // border-width 픽셀 값
-                    const s = _bd[side].style;
-                    const w = (s === 'medium') ? 2 : (s === 'thick' || s === 'double') ? 3 : 1;
-                    // inset shadow: inset X Y blur color, side 방향에 따라 offset 조정
-                    const off = {top:'0 '+w+'px', right:'-'+w+'px 0', bottom:'0 -'+w+'px', left:w+'px 0'}[side];
-                    _shadows.push('inset ' + off + ' 0 ' + _bd[side].color);
-                    style += 'border-' + side + ':' + w + 'px solid ' + _bd[side].color + ';';
-                  } else {
-                    style += 'border-' + side + ':1px solid #D9E3F1;';
-                  }
-                });
-                if (_shadows.length) {
-                  style += 'box-shadow:' + _shadows.join(',') + ';position:relative;z-index:2;';
-                }
-                // 배경색이 있을 때만 폰트색도 반영 (흰색 폰트 + 흰 배경 방지)
-                if (cell.bg) {
-                  style += 'background:' + cell.bg + ';';
-                  if (cell.fg) style += 'color:' + cell.fg + ';';
-                  else style += 'color:#fff;';
-                } else {
-                  style += 'color:#344054;';
-                }
-                if (cell.bold) style += 'font-weight:700;';
-                html += '<td' + rs + cs + ' style="' + style + '">' + safe + '</td>';
-              });
-              html += '</tr>';
-            });
-            html += '</table></div>';
-            el.innerHTML = html;
-            el.style.padding = '10px';
-            el.style.border = '1px solid #E5E7EB';
-            el.style.background = '#F9FAFB';
-            el.setAttribute('data-loaded', '1');
-          } catch (e) {
-            el.innerHTML = '<div style="color:#b42318;font-size:12px;">엑셀 미리보기 실패: ' + String(e.message || e) + '</div>';
-          }
-        });
-      };
-
-      // 렌더 후 매번 preview 로드
-      const _origRender = window._renderManualSections;
-      window._renderManualSections = function(){
-        _origRender();
-        setTimeout(function(){ window._loadXlsxPreviews(); }, 0);
-      };
-
-      window._renderManualSections();
-    } else {
-      // PPT 프로젝트: 하드코딩 3탭 스크롤 바인딩
-      const pptTabs = document.getElementById('ov-ppt-tabs');
-      if (pptTabs) {
-        pptTabs.querySelectorAll('[data-ppt-jump]').forEach(function(tab){
-          tab.addEventListener('click', function(){
-            const i = parseInt(tab.getAttribute('data-ppt-jump'), 10);
-            const allSecs = c.querySelectorAll('.ov-section');
-            if (allSecs[i]) {
-              allSecs[i].scrollIntoView({behavior: 'smooth', block: 'start'});
-              pptTabs.querySelectorAll('[data-ppt-jump]').forEach(function(t){ t.classList.remove('active'); });
-              tab.classList.add('active');
-            }
-          });
-        });
-      }
-    }
-
-    // 4) 상단 버튼 바인딩
-    const backBtn = document.getElementById('ov-back-btn');
-    if (backBtn) backBtn.addEventListener('click', window.backToReportList);
-
-    // HTML → items 변환 함수 (구조화된 저장)
-    window._htmlToItems = function(html) {
-      var parser = new DOMParser();
-      var doc = parser.parseFromString(html, 'text/html');
-      var items = [];
-      
-      function getDepth(el) {
-        // data-indent 속성 또는 부모 요소로 depth 계산
-        var indent = el.getAttribute('data-indent');
-        if (indent) return parseInt(indent) || 0;
-        return 0;
-      }
-      
-      function processNode(node, depth) {
-        if (node.nodeType === 3) {  // 텍스트 노드
-          var text = node.textContent.trim();
-          if (text) {
-            items.push({
-              type: depth > 0 ? 'sub' : 'bullet',
-              indent: depth,
-              text: text
-            });
-          }
-        } else if (node.nodeType === 1) {  // 요소 노드
-          var tag = node.tagName.toLowerCase();
-          
-          if (tag === 'div' || tag === 'p') {
-            var itemDepth = getDepth(node) || depth;
-            var hasBlockChild = node.querySelector('ul, ol, div, p, blockquote');
-            
-            if (!hasBlockChild) {
-              var text = node.textContent.trim();
-              if (text) {
-                items.push({
-                  type: itemDepth > 0 ? 'sub' : 'bullet',
-                  indent: itemDepth,
-                  text: text
-                });
-              }
-            } else {
-              // 자식 노드 재귀 처리
-              for (var i = 0; i < node.childNodes.length; i++) {
-                processNode(node.childNodes[i], itemDepth);
-              }
-            }
-          } else if (tag === 'ul' || tag === 'ol') {
-            var listDepth = getDepth(node) || depth;
-            var lis = node.querySelectorAll(':scope > li');
-            lis.forEach(function(li, idx) {
-              var text = li.textContent.trim();
-              if (text) {
-                items.push({
-                  type: listDepth > 0 ? 'sub' : 'bullet',
-                  indent: listDepth,
-                  text: text,
-                  marker: tag === 'ul' ? '•' : (idx + 1) + '.'
-                });
-              }
-            });
-          } else if (tag === 'blockquote') {
-            // blockquote 내부는 depth +1
-            for (var i = 0; i < node.childNodes.length; i++) {
-              processNode(node.childNodes[i], depth + 1);
-            }
-          } else if (tag === 'br') {
-            // 줄바꿈은 무시 (텍스트로 처리됨)
-          } else {
-            // 기타 태그는 텍스트만 추출
-            var text = node.textContent.trim();
-            if (text) {
-              items.push({
-                type: depth > 0 ? 'sub' : 'bullet',
-                indent: depth,
-                text: text
-              });
-            }
-          }
-        }
-      }
-      
-      for (var i = 0; i < doc.body.childNodes.length; i++) {
-        processNode(doc.body.childNodes[i], 0);
-      }
-      
-      return items;
-    };
-    
-    // 4-b) 인라인 프로젝트명 편집 + 저장 버튼 활성화
-    const labelEl = document.getElementById('ov-project-label');
-    const saveBtn = document.getElementById('ov-save-btn');
-    const initialLabel = labelEl ? labelEl.textContent.trim() : '';
-    let dirty = false;
-    function markDirty(){
-      dirty = true;
-      if (saveBtn) {
-        saveBtn.disabled = false;
-        saveBtn.style.opacity = '1';
-        saveBtn.style.cursor = 'pointer';
-      }
-    }
-    function markClean(){
-      dirty = false;
-      if (saveBtn) {
-        saveBtn.disabled = true;
-        saveBtn.style.opacity = '0.4';
-        saveBtn.style.cursor = 'not-allowed';
-      }
-    }
-    if (labelEl) {
-      labelEl.addEventListener('focus', function(){ labelEl.style.borderBottom = '2px dashed #4A6FA5'; });
-      labelEl.addEventListener('blur', function(){ labelEl.style.borderBottom = '2px dashed transparent'; });
-      labelEl.addEventListener('input', function(){ if (labelEl.textContent.trim() !== initialLabel) markDirty(); });
-      labelEl.addEventListener('keydown', function(e){
-        if (e.key === 'Enter') { e.preventDefault(); labelEl.blur(); }
-      });
-    }
-    if (saveBtn) {
-      saveBtn.addEventListener('click', async function(){
-        if (!dirty || saveBtn.disabled) return;
-        const newLabel = labelEl ? labelEl.textContent.trim() : '';
-        if (!newLabel) { alert('프로젝트명이 비어있습니다'); return; }
-        // display_title에서 프로젝트명만 추출: " · W## 주간보고" 앞까지
-        let newProjectName = newLabel;
-        let newWeek = null;
-        const m = newLabel.match(/^(.*?)(?:\\s*·\\s*W(\\d+)\\s*주간보고)?\\s*$/);
-        if (m) {
-          newProjectName = (m[1] || '').trim();
-          if (m[2]) newWeek = parseInt(m[2], 10);
-        }
-        // 원본 프로젝트명(파일명 파싱값)을 키로 사용
-        const origProj = (target && target._split_project) || newProjectName;
-        const overrides = {};
-        overrides[origProj] = newProjectName;
-        saveBtn.disabled = true;
-        saveBtn.textContent = '저장 중...';
-        try {
-          const payload = { project_overrides: overrides };
-          if (newWeek) payload.week_override = newWeek;
-          // 수기 프로젝트: sections 도 함께 저장 (항상 최신 상태 전송)
-          if (isManual) {
-            payload.products = [{ sections: sectionsState }];
-          }
-          const res = await fetch('/admin/reports/' + encodeURIComponent(docId), {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-          });
-          if (!res.ok) { alert('저장 실패'); saveBtn.textContent = '저장'; markDirty(); return; }
-          saveBtn.textContent = '저장됨 ✓';
-          markClean();
-          setTimeout(function(){ saveBtn.textContent = '저장'; }, 1200);
-        } catch(e) {
-          alert('저장 오류: ' + e.message);
-          saveBtn.textContent = '저장';
-          markDirty();
-        }
-      });
-    }
-
-    // 5) 현황 (headline) 채우기
-    const cs = document.getElementById('ov-current-status');
-    if (cs) {
-      if (headline) {
-        cs.className = '';
-        cs.innerHTML = ''
-          + '<div style="background:#F8FBFF;border:1px solid #E6EBF2;border-radius:14px;padding:16px 18px;">'
-          + '  <div style="font-size:13px;color:#6E7785;font-weight:700;margin-bottom:6px;">헤드라인</div>'
-          + '  <div style="font-size:15px;color:#111827;font-weight:700;">' + headline + '</div>'
-          + '</div>';
-      }
-    }
-
-    // 6) KPI 카드 렌더 (프로젝트가 KPI 지원하는 경우만)
-    const slot = document.getElementById('ov-kpi-slot');
-    const issuesSlot = document.getElementById('ov-issues-slot');
-    let projectKey = '';
-    if (projects.length) {
-      const first = (projects[0] || '').toLowerCase();
-      if (first.indexOf('메이저') >= 0 || first.indexOf('major') >= 0) projectKey = 'major_module';
-    }
-
-    if (slot) {
-      if (projectKey) {
-        try {
-          const pres = await fetch('/projects/' + projectKey);
-          const pdata = await pres.json();
-          const kpi = pdata.kpi_card;
-          const issues = pdata.issue_lines || [];
-          slot.innerHTML = window.renderKpiCardInline(kpi, issues);
-          window._currentKpiContext = { projectKey: projectKey, card: kpi, issues: issues };
-          // 편집은 엑셀 업로드 방식으로 전환 예정 (Phase 2)
-
-          if (issuesSlot && Array.isArray(issues) && issues.length > 0) {
-            let ih = '<div class="ov-issue-list">';
-            issues.forEach(function(ii, i){
-              const text = ii.text || '';
-              const dueDate = ii.due_date || '';
-              let ddayText = '';
-              if (dueDate && ii.show_dday !== false) {
-                try {
-                  const d = new Date(dueDate);
-                  const today = new Date();
-                  const diff = Math.round((d - today) / (1000*60*60*24));
-                  const mmdd = (d.getMonth()+1) + '/' + d.getDate();
-                  if (diff === 0) ddayText = 'D-day · ' + mmdd;
-                  else if (diff > 0) ddayText = 'D-' + diff + ' · ' + mmdd;
-                  else ddayText = 'D+' + Math.abs(diff) + ' 지남 · ' + mmdd;
-                } catch(_){}
-              }
-              ih += ''
-                + '<div class="ov-issue-row">'
-                + '  <div class="ov-issue-text">' + (i+1) + ') ' + text + '</div>'
-                + (ddayText ? '<div class="ov-issue-dday">' + ddayText + '</div>' : '')
-                + '</div>';
-            });
-            ih += '</div>';
-            issuesSlot.innerHTML = ih;
-          }
-        } catch(e){
-          console.error(e);
-          slot.innerHTML = '<div style="color:#B8302E;font-size:13px;text-align:center;padding:12px;">KPI 데이터 로드 실패</div>';
-        }
-      } else {
-        slot.innerHTML = '<div style="color:#8593A6;font-size:13px;text-align:center;padding:12px;">이 프로젝트는 KPI 데이터가 아직 없습니다.</div>';
-      }
-    }
-  };
-
-    window.backToReportList = function(){
-    const c = document.getElementById('v2-content-inner') || document.getElementById('v2-content');
-    if (!c) return;
-    if (typeof renderModelsPage === 'function') renderModelsPage(); // 사업부 변경 시 모델 관리 렌더
-  };
-
-
-  // ============================================================
-  // Admin v2 · KPI 셀 편집 (모달 팝업)
-  // ============================================================
-  window._currentKpiContext = { projectKey: '', card: null, issues: [] };
-
-  window.bindKpiCellEditors = function(){
-    document.querySelectorAll('.ov-kpi-editable').forEach(function(cell){
-      cell.addEventListener('click', function(){
-        const kind = cell.getAttribute('data-kpi-kind');
-        const key = cell.getAttribute('data-kpi-key');
-        const label = cell.getAttribute('data-kpi-label');
-        const type = cell.getAttribute('data-kpi-type');
-        window.openKpiEditModal(kind, key, label, type);
-      });
-    });
-  };
-
-  window.openKpiEditModal = function(kind, key, label, type){
-    const ctx = window._currentKpiContext || {};
-    const card = ctx.card || {};
-
-    // 현재 값 찾기
-    let cur = null;
-    const list = kind === 'month' ? (card.months || []) : (card.weeks || []);
-    for (let i = 0; i < list.length; i++) {
-      const it = list[i];
-      const itKey = kind === 'month' ? (it.month_key || it.key || it.month) : (it.week_key || it.key || it.week);
-      if (itKey === key || it.month === label || it.week === label) { cur = it; break; }
-    }
-
-    const efemCur = cur && cur.raw_efem != null ? cur.raw_efem : (cur && cur.efem_qty != null ? cur.efem_qty : '');
-    const vtmCur = cur && cur.raw_vtm != null ? cur.raw_vtm : (cur && cur.vtm_qty != null ? cur.vtm_qty : '');
-
-    // 모달 생성
-    const backdrop = document.createElement('div');
-    backdrop.id = 'ov-kpi-modal-backdrop';
-    backdrop.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(15,44,89,0.35);z-index:9999;display:flex;align-items:center;justify-content:center;';
-
-    const modal = document.createElement('div');
-    modal.style.cssText = 'background:#fff;border-radius:22px;padding:26px 28px;min-width:360px;max-width:90vw;box-shadow:0 20px 60px rgba(0,0,0,0.2);';
-    modal.innerHTML = ''
-      + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">'
-      + '  <div style="font-size:18px;font-weight:800;color:#0F2C59;">' + label + ' 편집</div>'
-      + '  <button type="button" id="ov-kpi-modal-close" style="border:0;background:transparent;font-size:20px;cursor:pointer;color:#8593A6;">×</button>'
-      + '</div>'
-      + '<div style="font-size:13px;color:#6E7785;margin-bottom:16px;">' + (kind === 'month' ? '월별' : '주차별') + ' KPI 수량을 입력하세요 (판가 자동 계산)</div>'
-      + '<div style="margin-bottom:14px;">'
-      + '  <label style="display:block;font-size:12px;color:#6E7785;font-weight:700;margin-bottom:6px;">타입</label>'
-      + '  <select id="ov-kpi-type" style="width:100%;padding:10px;border:1px solid #D9E0EA;border-radius:10px;font-size:14px;">'
-      + '    <option value="plan"' + (type === 'plan' ? ' selected' : '') + '>계획 (plan)</option>'
-      + '    <option value="actual"' + (type === 'actual' ? ' selected' : '') + '>실적 (actual)</option>'
-      + '  </select>'
-      + '</div>'
-      + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">'
-      + '  <div>'
-      + '    <label style="display:block;font-size:12px;color:#6E7785;font-weight:700;margin-bottom:6px;">EFEM 수량</label>'
-      + '    <input type="number" id="ov-kpi-efem" value="' + efemCur + '" style="width:100%;padding:10px;border:1px solid #D9E0EA;border-radius:10px;font-size:14px;box-sizing:border-box;" />'
-      + '  </div>'
-      + '  <div>'
-      + '    <label style="display:block;font-size:12px;color:#6E7785;font-weight:700;margin-bottom:6px;">VTM 수량</label>'
-      + '    <input type="number" id="ov-kpi-vtm" value="' + vtmCur + '" style="width:100%;padding:10px;border:1px solid #D9E0EA;border-radius:10px;font-size:14px;box-sizing:border-box;" />'
-      + '  </div>'
-      + '</div>'
-      + '<div id="ov-kpi-modal-status" style="font-size:13px;font-weight:600;margin-bottom:12px;min-height:18px;"></div>'
-      + '<div style="display:flex;gap:8px;justify-content:flex-end;">'
-      + '  <button type="button" id="ov-kpi-modal-cancel" style="border:1px solid #DCE4EF;background:#fff;color:#35527C;border-radius:12px;padding:10px 18px;font-size:14px;font-weight:700;cursor:pointer;">취소</button>'
-      + '  <button type="button" id="ov-kpi-modal-save" style="border:0;background:#0F2C59;color:#fff;border-radius:12px;padding:10px 20px;font-size:14px;font-weight:800;cursor:pointer;">저장</button>'
-      + '</div>';
-
-    backdrop.appendChild(modal);
-    document.body.appendChild(backdrop);
-
-    function closeModal(){ document.body.removeChild(backdrop); }
-
-    document.getElementById('ov-kpi-modal-close').addEventListener('click', closeModal);
-    document.getElementById('ov-kpi-modal-cancel').addEventListener('click', closeModal);
-    backdrop.addEventListener('click', function(e){ if (e.target === backdrop) closeModal(); });
-
-    document.getElementById('ov-kpi-modal-save').addEventListener('click', async function(){
-      const efem = parseFloat(document.getElementById('ov-kpi-efem').value || '0');
-      const vtm = parseFloat(document.getElementById('ov-kpi-vtm').value || '0');
-      const newType = document.getElementById('ov-kpi-type').value || 'plan';
-      const statusEl = document.getElementById('ov-kpi-modal-status');
-      statusEl.style.color = '#2E5B94';
-      statusEl.textContent = '⏳ 저장 중...';
-
-      const endpoint = '/admin/kpi/' + ctx.projectKey + (kind === 'month' ? '/months' : '/weeks');
-      const payload = kind === 'month'
-        ? { month: key, efem: efem, vtm: vtm, type: newType, source: 'admin_v2_edit' }
-        : { week: key, efem: efem, vtm: vtm, type: newType, source: 'admin_v2_edit' };
-
-      try {
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin',
-          body: JSON.stringify(payload)
-        });
-        const data = await res.json().catch(function(){ return {}; });
-        if (res.ok) {
-          statusEl.style.color = '#117A52';
-          statusEl.textContent = '✅ 저장 완료';
-          setTimeout(function(){
-            closeModal();
-            window.reloadKpiSlot();
-          }, 500);
-        } else if (res.status === 401) {
-          statusEl.style.color = '#C1272D';
-          statusEl.textContent = '❌ 인증 필요';
-        } else {
-          statusEl.style.color = '#C1272D';
-          statusEl.textContent = '❌ 저장 실패: ' + (data.detail || res.status);
-        }
-      } catch(e){
-        statusEl.style.color = '#C1272D';
-        statusEl.textContent = '❌ 네트워크 오류';
-      }
-    });
-  };
-
-  window.reloadKpiSlot = async function(){
-    const ctx = window._currentKpiContext || {};
-    if (!ctx.projectKey) return;
-    const slot = document.getElementById('ov-kpi-slot');
-    if (!slot) return;
-    try {
-      const res = await fetch('/projects/' + ctx.projectKey);
-      const data = await res.json();
-      const kpi = data.kpi_card;
-      const issues = data.issue_lines || [];
-      slot.innerHTML = window.renderKpiCardInline(kpi, issues);
-      window._currentKpiContext = { projectKey: ctx.projectKey, card: kpi, issues: issues };
-      window.bindKpiCellEditors();
-    } catch(e){ console.error(e); }
-  };
-
-  // ============================================================
-  // Admin v2 · PPT 업로드 처리
-  // ============================================================
-  // bindAdminV2Upload 제거됨 (보고 UI 삭제)
-
-  // 최초 진입 시 모델 관리 페이지 렌더
-  document.addEventListener('DOMContentLoaded', function(){
-    const root = document.getElementById('ov-report-root');
-    if (root) root.remove();
-    if (typeof window.renderModelsPage === 'function') {
-      window.renderModelsPage();
-    }
-  });
-
-})();
-</script>
-<script>
-</script>
-
-<script>
-// 사업부 드롭다운 자동 채우기 (페이지 로드 시 1회)
-(function() {
-  function fillDivisions() {
-    fetch('/divisions', { credentials: 'same-origin' })
-      .then(function(r) { return r.ok ? r.json() : null; })
-      .then(function(j) {
-        if (!j || !j.divisions) return;
-        var sel = document.getElementById('v2-division-select');
-        if (!sel) return;
-        sel.innerHTML = '';
-        j.divisions.forEach(function(d) {
-          var opt = document.createElement('option');
-          opt.value = d.id;
-          opt.textContent = d.label;
-          sel.appendChild(opt);
-        });
-        var saved = localStorage.getItem('v2_selected_division') || (j.divisions[0] && j.divisions[0].id) || '';
-        if (saved) {
-          sel.value = saved;
-          sel.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-        sel.addEventListener('change', function(){
-      try { localStorage.setItem('v2_division', this.value || ''); } catch(e){}
-      if (typeof window.renderAdminV2ByDivision === 'function') {
-        window.renderAdminV2ByDivision();
-      }
-    });
-        console.log('✅ 사업부 ' + j.divisions.length + '개 로드됨');
-      })
-      .catch(function(e) { console.error('사업부 로드 실패:', e); });
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', fillDivisions);
-  } else {
-    fillDivisions();
-  }
-})();
-
-// ═══════════════════════════════════════════════
-// 모델 관리 페이지
-// ═══════════════════════════════════════════════
-(function() {
-  'use strict';
-
-  // 스타일 주입
-  var style = document.createElement('style');
-  style.textContent = [
-    '.mdl-wrap { max-width: 800px; }',
-    '.mdl-header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }',
-    '.mdl-header h2 { font-size: 20px; font-weight: 800; color: #111827; margin: 0; }',
-    '.mdl-proj-sel { padding: 8px 12px; border: 1px solid #D1D5DB; border-radius: 8px; font-size: 14px; background: #fff; min-width: 200px; }',
-    '.mdl-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden; border: 1px solid #E5E7EB; }',
-    '.mdl-table th { background: #F9FAFB; padding: 10px 14px; font-size: 12px; font-weight: 700; color: #6B7280; text-align: left; border-bottom: 1px solid #E5E7EB; }',
-    '.mdl-table td { padding: 10px 14px; font-size: 13px; border-bottom: 1px solid #F3F4F6; vertical-align: middle; }',
-    '.mdl-table tr:last-child td { border-bottom: none; }',
-    '.mdl-input { padding: 6px 10px; border: 1px solid #D1D5DB; border-radius: 6px; font-size: 13px; width: 100%; box-sizing: border-box; }',
-    '.mdl-input:focus { outline: none; border-color: #3B82F6; }',
-    '.mdl-sel { padding: 6px 8px; border: 1px solid #D1D5DB; border-radius: 6px; font-size: 13px; background: #fff; }',
-    '.mdl-num { width: 70px; text-align: center; }',
-    '.mdl-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 700; }',
-    '.mdl-badge-prod { background: #DBEAFE; color: #1D4ED8; }',
-    '.mdl-badge-dev { background: #FEF3C7; color: #92400E; }',
-    '.mdl-btn { padding: 6px 14px; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }',
-    '.mdl-btn-add { background: #0F2C59; color: #fff; }',
-    '.mdl-btn-add:hover { background: #12356F; }',
-    '.mdl-btn-del { background: #FEE2E2; color: #DC2626; padding: 4px 10px; font-size: 12px; }',
-    '.mdl-btn-del:hover { background: #FECACA; }',
-    '.mdl-btn-save { background: #059669; color: #fff; padding: 10px 24px; font-size: 14px; }',
-    '.mdl-btn-save:hover { background: #047857; }',
-    '.mdl-actions { display: flex; gap: 8px; margin-top: 16px; align-items: center; }',
-    '.mdl-status { font-size: 13px; margin-left: auto; }',
-    '.mdl-status.ok { color: #059669; }',
-    '.mdl-status.err { color: #DC2626; }',
-    '.mdl-empty { text-align: center; padding: 40px; color: #9CA3AF; font-size: 14px; }',
-    '.mdl-group-sep td { background: #F9FAFB; font-weight: 700; font-size: 12px; color: #374151; padding: 8px 14px; }',
-    '.mdl-weekly-section { margin-top: 24px; padding-top: 20px; border-top: 2px solid #E5E7EB; }',
-    '.mdl-weekly-section h3 { font-size: 16px; font-weight: 700; color: #111827; margin: 0 0 12px 0; }',
-    '.mdl-weekly-status { font-size: 13px; color: #6B7280; margin-bottom: 12px; }',
-    '.mdl-weekly-status.ok { color: #059669; }',
-    '.mdl-weekly-status.err { color: #DC2626; }',
-    '.mdl-weekly-actions { display: flex; gap: 8px; margin-bottom: 16px; }',
-    '.mdl-weekly-preview { background: #F9FAFB; border-radius: 8px; padding: 12px; max-height: 300px; overflow: auto; }',
-    '.mdl-weekly-preview table { width: 100%; border-collapse: collapse; font-size: 12px; }',
-    '.mdl-weekly-preview th { background: #E5E7EB; padding: 6px 8px; text-align: left; font-weight: 600; }',
-    '.mdl-weekly-preview td { padding: 6px 8px; border-bottom: 1px solid #E5E7EB; min-width: 40px; }',
-    '.mdl-weekly-preview td:empty { background: #F3F4F6; }',
-    '.mdl-wrap { padding: 4px 0; }',
-    '.mdl-head { margin-bottom: 16px; }',
-    '.mdl-title-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }',
-    '.mdl-mark { color: #0F2C59; font-size: 14px; }',
-    '.mdl-title { font-size: 18px; font-weight: 700; color: #111827; margin: 0; }',
-    '.mdl-select { margin-left: auto; padding: 8px 12px; border: 1px solid #D1D5DB; border-radius: 8px; font-size: 13px; background: #fff; min-width: 160px; }',
-    '.mdl-tabs { display: flex; gap: 4px; border-bottom: 2px solid #E5E7EB; }',
-    '.mdl-tab { padding: 10px 18px; border: none; background: none; font-size: 14px; font-weight: 600; color: #6B7280; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px; }',
-    '.mdl-tab.is-active { color: #0F2C59; border-bottom-color: #0F2C59; }',
-    '.mdl-badge { display: inline-block; min-width: 20px; padding: 1px 6px; background: #EEF2FF; color: #0F2C59; border-radius: 10px; font-size: 11px; font-weight: 700; margin-left: 4px; }',
-    '.mdl-pane { padding-top: 16px; }',
-    '.mdl-actions { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }',
-    '.mdl-save-msg { font-size: 13px; font-weight: 600; }',
-    '.mdl-hint { font-size: 12px; color: #9CA3AF; margin-top: 10px; }',
-    '.mdl-input { width: 110px; padding: 6px 8px; border: 1px solid #D1D5DB; border-radius: 6px; font-size: 13px; text-align: right; }',
-    '.mdl-td-name { font-weight: 600; color: #111827; }',
-    '.mdl-td-ratio { font-weight: 700; color: #0F2C59; }',
-    '.mdl-group-row td { background: #F9FAFB; padding: 8px 14px !important; }',
-    '.mdl-group-badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 12px; font-weight: 700; }',
-    '.mdl-group-mass { background: #DBEAFE; color: #1D4ED8; }',
-    '.mdl-group-dev { background: #FEF3C7; color: #B45309; }',
-    '.mdl-group-cnt { margin-left: 8px; font-size: 12px; color: #6B7280; }',
-    '.mdl-empty { padding: 40px; text-align: center; color: #9CA3AF; background: #F9FAFB; border-radius: 8px; }',
-    '.mdl-loading { padding: 40px; text-align: center; color: #9CA3AF; }',
-    '.mdl-plan-card { background: #fff; border: 1px solid #E5E7EB; border-radius: 12px; padding: 16px; }',
-      /* ═══ 디자인 시안 기준 재정의 (덮어쓰기) ═══ */
-    '.mdl-wrap { background: transparent; }',
-    '.mdl-table { width: 100%; border-collapse: separate; border-spacing: 0 8px; background: transparent; border: none; }',
-    '.mdl-table th { background: transparent; padding: 4px 14px; font-size: 12px; font-weight: 600; color: #64748B; text-align: left; border: none; }',
-    '.mdl-table td { background: #FFFFFF; padding: 12px 14px; font-size: 13px; border-top: 1px solid #E4E7EC; border-bottom: 1px solid #E4E7EC; vertical-align: middle; box-shadow: 0 4px 12px rgba(0,0,0,0.03); }',
-    '.mdl-table td:first-child { border-left: 1px solid #E4E7EC; border-radius: 8px 0 0 8px; }',
-    '.mdl-table td:last-child { border-right: 1px solid #E4E7EC; border-radius: 0 8px 8px 0; }',
-    '.mdl-table tr:last-child td { border-bottom: 1px solid #E4E7EC; }',
-    '.mdl-group-row td { background: transparent !important; border: none !important; box-shadow: none !important; padding: 4px 6px !important; }',
-    '.mdl-group-badge { display: inline-block; padding: 4px 12px; border-radius: 8px; font-size: 12px; font-weight: 700; }',
-    '.mdl-group-mass { background: #EFF6FF; color: #1E40AF; }',
-    '.mdl-group-dev { background: #FEF3C7; color: #92400E; }',
-    '.mdl-group-cnt { margin-left: 8px; font-size: 12px; color: #64748B; font-weight: 600; }',
-    '.mdl-input { width: 110px; padding: 8px 12px; border: 1px solid #E2E8F0; border-radius: 6px; font-size: 13px; text-align: right; background: #FFFFFF; }',
-    '.mdl-input:focus { outline: none; border-color: #2563EB; }',
-    '.mdl-table select[data-field="group"] { padding: 6px 10px; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; background: #EFF6FF; color: #2563EB; cursor: pointer; }',
-    '.mdl-devtype { padding: 6px 12px; border: none; border-radius: 6px; font-size: 12px; font-weight: 700; cursor: pointer; }',
-    '.mdl-dt-hvm { background: #F5F3FF; color: #7C3AED; }',
-    '.mdl-dt-rpm { background: #ECFDF5; color: #059669; }',
-    '.mdl-btn-add { background: #0F172A; color: #FFFFFF; padding: 10px 18px; border-radius: 6px; font-size: 13px; font-weight: 700; }',
-    '.mdl-btn-add:hover { background: #1E293B; }',
-    '.mdl-btn-save { background: #10B981; color: #FFFFFF; padding: 10px 24px; border-radius: 6px; font-size: 14px; font-weight: 700; }',
-    '.mdl-btn-save:hover { background: #059669; }',
-    '.mdl-btn-del { background: #FEF2F2; color: #EF4444; padding: 6px 12px; font-size: 12px; border-radius: 6px; font-weight: 600; }',
-    '.mdl-btn-del:hover { background: #FEE2E2; }',
-    '.mdl-btn-process { background: #F5F3FF; color: #7C3AED; padding: 6px 12px; font-size: 12px; border-radius: 6px; font-weight: 600; margin-right: 6px; }',
-    '.mdl-btn-process:hover { background: #EDE9FE; }',
-    '.mdl-btn-note-save { background: #10B981; color: #FFFFFF; padding: 6px 16px; font-size: 12px; border-radius: 6px; font-weight: 700; }',
-    '.mdl-btn-note-save:hover { background: #059669; }',
-    '.mdl-note-card { background: #FFFFFF; border: 1px solid #E4E7EC; border-radius: 12px; padding: 16px 20px; margin-bottom: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.03); }',
-    '.mdl-note-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }',
-    '.mdl-note-label { font-size: 14px; font-weight: 700; color: #1E293B; }',
-    '.mdl-note-card textarea { width: 100%; border: 1px solid #E2E8F0; border-radius: 8px; padding: 12px; font-size: 13px; resize: vertical; box-sizing: border-box; font-family: inherit; color: #1E293B; }',
-    '.mdl-note-card textarea:focus { outline: none; border-color: #2563EB; }',
-    '.mdl-plan-card { background: #FFFFFF; border: 1px solid #E4E7EC; border-radius: 12px; padding: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.03); }',
-    '.mdl-empty { padding: 40px; text-align: center; color: #94A3B8; background: #FFFFFF; border-radius: 12px; border: 1px solid #E4E7EC; }',
-    '.mdl-loading { padding: 40px; text-align: center; color: #94A3B8; }',
-    /* ── 프로세스 에디터 시안 ── */
-    '.mdl-proc { max-width: 1080px; }',
-    '.mdl-proc-head { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }',
-    '.mdl-proc-title { font-size: 20px; font-weight: 700; color: #1E293B; margin-right: auto; }',
-    '.mdl-btn-back { background: #FFFFFF; color: #475569; border: 1px solid #E2E8F0; padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; }',
-    '.mdl-btn-back:hover { background: #F8FAFC; }',
-    '.mdl-proc-head .mdl-select { padding: 8px 12px; border: none; border-radius: 6px; font-size: 12px; font-weight: 700; background: #F5F3FF; color: #7C3AED; min-width: 90px; }',
-    '.mdl-proc-summary { display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 12px; margin-bottom: 20px; }',
-    '.mdl-proc-card { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px; padding: 18px 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.03); }',
-    '.mdl-proc-card .lbl { font-size: 12px; color: #64748B; margin-bottom: 6px; font-weight: 600; }',
-    '.mdl-proc-card .val { font-size: 18px; font-weight: 800; color: #1E293B; }',
-    '.mdl-proc-card .sub { font-size: 11px; color: #94A3B8; margin-top: 4px; }',
-    '.mdl-proc-bar { height: 8px; background: #F1F5F9; border-radius: 4px; margin-top: 10px; overflow: hidden; }',
-    '.mdl-proc-fill { height: 100%; background: #10B981; border-radius: 4px; transition: width 0.3s; }',
-    '.mdl-proc-group { background: #FFFFFF; border: 1px solid #E4E7EC; border-radius: 12px; margin-bottom: 16px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.03); }',
-    '.mdl-proc-group-head { padding: 0 16px; height: 40px; font-size: 14px; font-weight: 700; display: flex; align-items: center; justify-content: space-between; }',
-    '.mdl-proc-group:nth-of-type(2) .mdl-proc-group-head { background: #EEF2FF !important; color: #312E81 !important; }',
-    '.mdl-proc-cnt { font-size: 11px; font-weight: 700; opacity: 0.85; padding: 2px 10px; border-radius: 10px; background: rgba(255,255,255,0.5); }',
-    '.mdl-proc-row { display: flex; align-items: center; gap: 14px; padding: 0 16px; height: 48px; border-top: 1px solid #F1F5F9; background: #FFFFFF; }',
-    '.mdl-proc-row.current { background: #F0F7FF; }',
-    '.mdl-proc-icon { width: 20px; height: 20px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex-shrink: 0; }',
-    '.mdl-proc-icon.done { background: #22C55E; color: #FFFFFF; }',
-    '.mdl-proc-icon.doing { background: #2563EB; color: #FFFFFF; }',
-    '.mdl-proc-icon.todo { background: #E2E8F0; color: #94A3B8; }',
-    '.mdl-proc-name { font-size: 13px; font-weight: 700; color: #1E293B; min-width: 180px; }',
-    '.mdl-proc-dates { display: flex; gap: 18px; margin-left: auto; align-items: center; }',
-    '.mdl-proc-dates label { font-size: 11px; color: #64748B; display: flex; align-items: center; gap: 6px; }',
-    '.mdl-proc-dates input[type=date] { border: none; background: transparent; font-size: 11px; font-weight: 600; color: #2563EB; padding: 2px 0; cursor: pointer; }',
-    '.mdl-proc-dates input[type=date]:focus { outline: none; }',
-    '.mdl-proc-status { font-size: 11px; font-weight: 700; color: #94A3B8; width: 44px; text-align: right; }',
-    '.mdl-proc-status.done { color: #64748B; }',
-    '.mdl-proc-status.doing { color: #2563EB; }',
-  ].join(' ');
-  document.head.appendChild(style);
-
-  window._modelsData = [];
-  var _projTypes = [];
-  window._projIsEss = false;
-  var _currentProjectKey = '';
-
-  function _esc(s) {
-    var d = document.createElement('div');
-    d.textContent = s || '';
-    return d.innerHTML;
-  }
-
-  function _genId(name) {
-    return (name || '').toLowerCase().replace(/[^a-z0-9가-힣]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'model-' + Date.now();
-  }
-
-  // 프로젝트 목록 로드 (드롭다운용)
-  function loadProjectOptions(sel) {
-    var divSel = document.getElementById('v2-division-select');
-    var divId = divSel ? divSel.value : '';
-    if (!divId) {
-      sel.innerHTML = '<option value="">사업부를 먼저 선택하세요</option>';
-      return;
-    }
-    fetch('/admin/config/projects?division_id=' + encodeURIComponent(divId), { credentials: 'same-origin' })
-      .then(function(r) { return r.json(); })
-      .then(function(d) {
-        var projects = (d && d.projects) || [];
-        sel.innerHTML = '<option value="">프로젝트 선택...</option>';
-        projects.forEach(function(p) {
-          var opt = document.createElement('option');
-          opt.value = p.id || p.label;
-          opt.textContent = p.label || p.id;
-          sel.appendChild(opt);
-        });
-      })
-      .catch(function() {
-        sel.innerHTML = '<option value="">로드 실패</option>';
-      });
-  }
-
-  // 모델 테이블 렌더링
-  function syncDomToData(container) {
-    container.querySelectorAll('tr[data-model-id]').forEach(function(r) {
-      const m = window._modelsData.find(function(x) { return x.id === r.dataset.modelId; });
-      if (!m) return;
-      const g = r.querySelector('[data-field="group"]');
-      if (g) m.group = g.value;
-      const poq = r.querySelector('[data-field="po_qty"]');
-      const shq = r.querySelector('[data-field="shipped_qty"]');
-      const duet = r.querySelector('[data-field="due_text"]');
-      const iss = r.querySelector('[data-field="issues"]');
-      // ESS 필드 값 할당 (누락됐던 부분)
-      if (poq) m.po_qty = parseInt(poq.value || '0', 10) || 0;
-      if (shq) m.shipped_qty = parseInt(shq.value || '0', 10) || 0;
-      if (duet) m.due_text = duet.value || '';
-      if (iss) m.issues = iss.value || '';
-      const dt = r.querySelector('[data-field="dev_type"]');
-      if (dt) m.dev_type = dt.value;
-      const st = r.querySelector('[data-field="status"]');
-      if (st) m.status = st.value;
-      var priceEl = r.querySelector('[data-field="price"]');
-      m.price = priceEl ? parseInt((priceEl.value || '0').replace(/,/g, ''), 10) || 0 : 0;
-      var matEl = r.querySelector('[data-field="material_cost"]');
-      m.material_cost = matEl ? parseInt((matEl.value || '0').replace(/,/g, ''), 10) || 0 : 0;
-      const pg = r.querySelector('[data-field="progress"]');
-      if (pg) m.progress = parseInt(pg.value || '0', 10) || 0;
-    });
-  }
-
-
-  // 유형 색상 (Flutter 앱과 동일 팔레트)
-  function _typeColor(t) {
-    if (t === 'HVM') return { bg: '#EDE9FE', fg: '#7C3AED' };
-    if (t === 'RPM') return { bg: '#E0F2FE', fg: '#0284C7' };
-    var pal = [
-      ['#DBEAFE', '#1D4ED8'], ['#FEF3C7', '#B45309'], ['#D1FAE5', '#059669'],
-      ['#FCE7F3', '#BE185D'], ['#FEE2E2', '#B91C1C'], ['#ECFCCB', '#4D7C0F'],
-      ['#CFFAFE', '#0E7490'], ['#F3E8FF', '#9333EA']
-    ];
-    var h = 0;
-    for (var i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) >>> 0;
-    var c = pal[h % pal.length];
-    return { bg: c[0], fg: c[1] };
-  }
-  function _applyTypeColor(inp) {
-    if (!inp) return;
-    var v = (inp.value || '').trim();
-    if (!v) { inp.style.background = '#FFFFFF'; inp.style.color = '#374151'; inp.style.borderColor = '#D1D5DB'; return; }
-    var c = _typeColor(v);
-    inp.style.background = c.bg;
-    inp.style.color = c.fg;
-    inp.style.borderColor = c.fg;
-  }
-
-  window.renderTable = function renderTable(container) {
-    // 프로세스 편집에서 돌아올 때 툴바·노트·유형바 복원
-    ['mdl-toolbar', 'mdl-note-card', 'mdl-types-bar'].forEach(function(id) {
-      var el = document.getElementById(id);
-      if (el) el.style.display = '';
-    });
-    // 이전 저장 메시지 초기화 (편집 화면에서 남은 것 방지)
-    ['mdl-save-msg', 'mdl-proc-msg', 'mdl-note-msg'].forEach(function(id) {
-      var el = document.getElementById(id);
-      if (el) { el.textContent = ''; el.className = 'mdl-save-msg'; }
-    });
-    // ESS 프로젝트 동기 강제 판별 (fetch 레이스 컨디션 방지)
-    var _pk = (typeof _currentProjectKey !== 'undefined' && _currentProjectKey) || '';
-    if (['sdi','fluence','epc_power'].indexOf(_pk) >= 0) { _projIsEss = true; }
-    else if (_pk) { _projIsEss = false; }
-    // ESS 프로젝트 키 기반으로 강제 설정
-    var currentProj = document.getElementById('mdl-proj-select');
-    if (currentProj && ['sdi', 'fluence', 'epc_power'].includes(currentProj.value)) {
-      _projIsEss = true;
-    } else {
-      _projIsEss = false;
-    }
-    const byGroup = { '양산': [], '개발': [] };
-    (window._modelsData || []).forEach(function(m) {
-      const g = (m.group === '개발') ? '개발' : '양산';
-      byGroup[g].push(m);
-    });
-    const tabCount = document.getElementById('mdl-tab-count');
-    if (tabCount) tabCount.textContent = (window._modelsData || []).length;
-
-    let html = '<table class="mdl-table"><thead><tr>' +
-      '<datalist id="mdl-type-list">' + (_projTypes || []).map(function(t){ return '<option value="' + t + '">'; }).join('') + '</datalist>' +
-      (_projIsEss ? '<th>모델명</th><th>구분</th><th>유형</th><th>PO 수량</th><th>출하 완료</th><th>남은 수량</th><th>납기</th><th>이슈사항</th><th style="width:56px">관리</th>' : '<th>모델명</th><th>구분</th><th>유형</th><th>판가($)</th><th>재료비($)</th><th>재료비율</th><th>이슈사항</th><th>관리</th>') +
-      '</tr></thead><tbody>';
-
-    ['양산', '개발'].forEach(function(g) {
-      const list = byGroup[g];
-      if (!list.length) return;
-      html += '<tr class="mdl-group-row"><td colspan="7">' +
-        '<span class="mdl-group-badge mdl-group-' + (g === '양산' ? 'mass' : 'dev') + '">' + g + '</span>' +
-        '<span class="mdl-group-cnt">' + list.length + '개</span></td></tr>';
-      list.forEach(function(m) {
-        const price = m.price || 0;
-        const mcost = m.material_cost || 0;
-        const ratio = price > 0 ? ((mcost / price) * 100).toFixed(1) + '%' : '-';
-        const isDev = g === '개발';
-        const devType = (m.dev_type || '').toUpperCase();
-        html += '<tr data-model-id="' + m.id + '">' +
-          '<td class="mdl-td-name">' + m.name + '</td>' +
-          '<td><select data-field="group">' +
-            '<option value="양산"' + (m.group === '양산' ? ' selected' : '') + '>양산</option>' +
-            '<option value="개발"' + (isDev ? ' selected' : '') + '>개발</option>' +
-          '</select></td>' +
-          '<td><input data-field="dev_type" value="' + (m.dev_type || '') + '" list="mdl-type-list" placeholder="유형" style="width:80px;padding:4px 6px;border:1px solid #D1D5DB;border-radius:6px;font-size:12px;font-weight:600;" /></td>' +
-          (_projIsEss ?
-  '<td><input data-field="po_qty" type="number" min="0" value="' + (m.po_qty || 0) + '" class="mdl-input mdl-ess-qty" style="width:90px;"></td>' +
-  '<td><input data-field="shipped_qty" type="number" min="0" value="' + (m.shipped_qty || 0) + '" class="mdl-input mdl-ess-qty" style="width:90px;"></td>' +
-  '<td data-field="remaining" class="mdl-td-ratio">' + Math.max(0, (m.po_qty || 0) - (m.shipped_qty || 0)) + '</td>' +
-  '<td><input data-field="due_text" type="text" value="' + (m.due_text || '').replace(/"/g, '&quot;') + '" class="mdl-input" placeholder="예: 8월 24일" style="width:140px;"></td>' +
-  '<td><textarea data-field="issues" class="mdl-input" placeholder="이슈사항" style="width:220px;min-height:34px;font-size:12px;">' + (m.issues || '') + '</textarea></td>'
-:
-  '<td><input data-field="price" type="number" min="0" value="' + price + '" class="mdl-input"></td>' +
-  '<td><input data-field="material_cost" type="number" min="0" value="' + mcost + '" class="mdl-input"></td>' +
-  '<td data-field="ratio" class="mdl-td-ratio">' + ratio + '</td>' +
-  '<td><textarea data-field="issues" class="mdl-input" placeholder="이슈사항" style="width:180px;min-height:34px;font-size:12px;">' + (m.issues || '') + '</textarea></td>'
-) +
-          (!_projIsEss ? '<td class="mdl-td-actions">' +
-            '<input data-field="status" type="hidden" value="' + (m.status || '정상') + '">' +
-            '<input data-field="progress" type="hidden" value="' + (m.progress || 0) + '">' +
-            (isDev ? '<button type="button" class="mdl-btn mdl-btn-process mdl-row-process">Process 입력</button>' : '') +
-            '<button type="button" class="mdl-btn mdl-btn-del mdl-row-del">삭제</button>' +
-          '</td>' : '<td class="mdl-td-actions"><input data-field="status" type="hidden" value="' + (m.status || '정상') + '"><input data-field="progress" type="hidden" value="' + (m.progress || 0) + '"><button type="button" class="mdl-btn mdl-btn-del mdl-row-del">삭제</button></td>') + '</tr>';
-      });
-    });
-
-    html += '</tbody></table>';
-    if (!window._modelsData.length) html = '<div class="mdl-empty">등록된 모델이 없습니다.</div>';
-    container.innerHTML = html;
-    container.querySelectorAll('.mdl-ess-qty').forEach(function(inp){
-      inp.addEventListener('input', function(){
-        var tr = inp.closest('tr');
-        var po = parseInt(tr.querySelector('[data-field="po_qty"]').value) || 0;
-        var sh = parseInt(tr.querySelector('[data-field="shipped_qty"]').value) || 0;
-        var rem = tr.querySelector('[data-field="remaining"]');
-        if (rem) rem.textContent = Math.max(0, po - sh);
-      });
-    });
-    // 모든 입력 변경 시 window._modelsData 실시간 동기화
-    container.querySelectorAll('[data-field]').forEach(function(el){
-      el.addEventListener('input', function(){
-        syncDomToData(container);
-      });
-      el.addEventListener('change', function(){
-        syncDomToData(container);
-      });
-    });
-    container.querySelectorAll('input[data-field="dev_type"]').forEach(function(inp){
-      _applyTypeColor(inp);
-      inp.addEventListener('input', function(){ _applyTypeColor(inp); });
-    });
-
-    container.querySelectorAll('input, select').forEach(function(el) {
-      el.addEventListener('change', function() {
-        const tr = el.closest('tr');
-        if (!tr) return;
-        if (el.dataset.field === 'group') {
-          syncDomToData(container);
-          renderTable(container);
-          return;
-        }
-        if (el.dataset.field === 'dev_type') {
-          el.className = 'mdl-devtype mdl-dt-' + el.value.toLowerCase();
-        }
-        if (el.dataset.field === 'price' || el.dataset.field === 'material_cost') {
-          const pr = parseInt(tr.querySelector('[data-field="price"]').value || '0', 10) || 0;
-          const mc = parseInt(tr.querySelector('[data-field="material_cost"]').value || '0', 10) || 0;
-          const cell = tr.querySelector('[data-field="ratio"]');
-          if (cell) cell.textContent = pr > 0 ? ((mc / pr) * 100).toFixed(1) + '%' : '-';
-        }
-      });
-    });
-
-    container.querySelectorAll('.mdl-row-del').forEach(function(btn) {
-      btn.addEventListener('click', function() {
-        const tr = btn.closest('tr');
-        const mid = tr ? tr.dataset.modelId : null;
-        if (!mid) return;
-        if (confirm('[' + mid + '] 삭제하시겠습니까? (저장 버튼을 눌러야 반영됩니다)')) {
-          window._modelsData = window._modelsData.filter(function(m) { return m.id !== mid; });
-          renderTable(container);
-        }
-      });
-    });
-
-    container.querySelectorAll('.mdl-row-process').forEach(function(btn) {
-      btn.addEventListener('click', function() {
-        const tr = btn.closest('tr');
-        if (tr && tr.dataset.modelId) openProcessEditor(tr.dataset.modelId);
-      });
-    });
-  }
-
-  function openProcessEditor(modelId) {
-    if (!_currentProjectKey) { alert('프로젝트를 먼저 선택하세요'); return; }
-    fetch('/projects/' + encodeURIComponent(_currentProjectKey) + '/models/' + encodeURIComponent(modelId) + '/process', { credentials: 'same-origin' })
-      .then(function(r) { return r.json(); })
-      .then(function(d) {
-        if (d.detail) { alert(d.detail); return; }
-        renderProcessEditor(d);
-      })
-      .catch(function(e) { alert('프로세스 로드 실패: ' + e.message); });
-  }
-
-  function renderProcessEditor(d) {
-    const tableBox = document.getElementById('mdl-table-box');
-    if (!tableBox) return;
-    // 목록용 툴바·노트·유형바 숨기기 (프로세스 편집 중에는 불필요)
-    ['mdl-toolbar', 'mdl-note-card', 'mdl-types-bar'].forEach(function(id) {
-      var el = document.getElementById(id);
-      if (el) el.style.display = 'none';
-    });
-    const groups = [['발주', '#DBEAFE', '#1D4ED8'], ['제작·검사', '#FEF3C7', '#B45309'], ['승인', '#EDE9FE', '#7C3AED']];
-
-    let html = '<div class="mdl-proc">' +
-      '<div class="mdl-proc-head">' +
-        '<button type="button" class="mdl-btn mdl-btn-back" id="mdl-proc-back">← 목록으로</button>' +
-        '<span class="mdl-proc-title">' + d.model_name + ' · 개발 Process 입력</span>' +
-
-        '<button type="button" class="mdl-btn mdl-btn-save" id="mdl-proc-save">저장</button>' +
-        '<span id="mdl-proc-msg" class="mdl-save-msg"></span>' +
-      '</div>' +
-      '<div class="mdl-proc-summary">' +
-        '<div class="mdl-proc-card"><div class="lbl">개발 유형</div><div class="val">' + (d.dev_type || 'HVM') + '</div></div>' +
-        '<div class="mdl-proc-card"><div class="lbl">진행률</div><div class="val">' + d.done + ' / ' + d.total + ' 단계</div>' +
-          '<div class="mdl-proc-bar"><div class="mdl-proc-fill" style="width:' + d.progress + '%"></div></div></div>' +
-        '<div class="mdl-proc-card"><div class="lbl">다음 단계</div><div class="val">' + d.current_stage + '</div>' +
-          '<div class="sub">' + (d.current_expected ? '예상 ' + d.current_expected : '예상일 미정') + '</div></div>' +
-      '</div>';
-
-    let num = 0;
-    groups.forEach(function(g) {
-      const steps = d.steps.filter(function(s) { return s.group === g[0]; });
-      if (!steps.length) return;
-      html += '<div class="mdl-proc-group">' +
-        '<div class="mdl-proc-group-head" style="background:' + g[1] + ';color:' + g[2] + '">' +
-          g[0] + '<span class="mdl-proc-cnt">' + steps.length + '단계</span></div>';
-      steps.forEach(function(s) {
-        num++;
-        const hasActual = (s.actual || '').trim() !== '';
-        const hasStatus = (s.status || '').trim() !== '';
-        // status가 '미승인'이나 '미제출'이면 완료 아님
-        const isDone = (hasActual || s.status === '완료') && s.status !== '미승인' && s.status !== '미제출';
-        const isCurrent = !isDone && !hasStatus && d.current_stage === s.name;
-        html += '<div class="mdl-proc-row' + (isCurrent ? ' current' : '') + '" data-step-key="' + s.key + '">' +
-          '<span class="mdl-proc-icon ' + (isDone ? 'done' : (isCurrent ? 'doing' : 'todo')) + '" ' +
-            'style="' + (s.status === '미승인' ? 'color:#DC2626;' : 
-             (s.status === '미제출' ? 'color:#D97706;' : '')) + '">' +
-            (isDone ? '✓' : (isCurrent ? '●' : (s.status === '미승인' ? '✗' : (s.status === '미제출' ? '!' : '○')))) + '</span>' +
-          '<span class="mdl-proc-name">' + ('0' + num).slice(-2) + ' ' + s.name + '</span>' +
-          '<span class="mdl-proc-dates">' +
-            '<label>예상 <input type="date" data-f="expected" value="' + (s.expected || '') + '"></label>' +
-            '<label>실제 <input type="date" data-f="actual" value="' + (s.actual || '') + '"></label>' +
-          '</span>' +
-          '<span class="mdl-proc-status ' + (isDone ? 'done' : (isCurrent ? 'doing' : '')) + '" ' +
-            'style="' + (s.status === '미승인' ? 'color:#DC2626;font-weight:800;' : 
-             (s.status === '미제출' ? 'color:#D97706;font-weight:800;' : 
-              (s.status === '진행중' ? 'color:#2563EB;font-weight:800;' : ''))) + '">' +
-            (s.status || (isDone ? '완료' : (isCurrent ? '진행중' : '대기'))) + '</span>' +
-          (function() {
-            var st = 'padding:6px 12px;font-size:12px;font-weight:600;border:1px solid #E5E7EB;border-radius:8px;margin-left:8px;cursor:pointer;outline:none;min-width:90px;text-align:center;';
-            if (s.status === '완료' || (!s.status && isDone)) st += 'background:#ECFDF5;color:#059669;border-color:#A7F3D0;';
-            else if (s.status === '미승인') st += 'background:#FEE2E2;color:#DC2626;border-color:#FECACA;';
-            else if (s.status === '미제출') st += 'background:#FEF3C7;color:#D97706;border-color:#FDE68A;';
-            else if (s.status === '진행중' || (!s.status && isCurrent)) st += 'background:#DBEAFE;color:#2563EB;border-color:#93C5FD;';
-            else if (s.status === '대기' || (!s.status && !isDone && !isCurrent)) st += 'background:#F3F4F6;color:#6B7280;border-color:#E5E7EB;';
-            else st += 'background:#ECFDF5;color:#059669;border-color:#A7F3D0;';
-            return '<select class="mdl-proc-status-sel" data-step-key="' + s.key + '" style="' + st + '">';
-          })() +
-            (function(){
-            var eff = s.status || (isDone ? '완료' : (isCurrent ? '진행중' : '대기'));
-            return ['완료','미승인','미제출','대기','진행중'].map(function(v){
-              return '<option value="' + v + '"' + (eff === v ? ' selected' : '') + '>' + v + '</option>';
-            }).join('');
-          })() +
-          '</select>' +
-        '</div>';
-      });
-      html += '</div>';
-    });
-    html += '</div>';
-    tableBox.innerHTML = html;
-
-    document.getElementById('mdl-proc-back').addEventListener('click', function() {
-      // 메시지 초기화 후 목록 복귀
-      ['mdl-save-msg', 'mdl-proc-msg', 'mdl-note-msg'].forEach(function(id) {
-        var el = document.getElementById(id);
-        if (el) { el.textContent = ''; el.className = 'mdl-save-msg'; }
-      });
-      renderTable(tableBox);
-    });
-
-    // 단계 상태 변경 핸들러
-    tableBox.querySelectorAll('.mdl-proc-status-sel').forEach(function(sel) {
-      sel.addEventListener('change', async function() {
-        const stepKey = sel.dataset.stepKey;
-        const status = sel.value;
-        const msgEl = document.getElementById('mdl-proc-msg');
-        if (msgEl) { msgEl.textContent = '처리 중...'; }
-        try {
-          const r = await fetch('/admin/projects/' + encodeURIComponent(_currentProjectKey) +
-            '/models/' + encodeURIComponent(d.model_id) + '/process/step-status',
-            { method: 'POST', headers: { 'Content-Type': 'application/json' },
-              credentials: 'same-origin', body: JSON.stringify({ step_key: stepKey, status: status }) });
-          const d2 = await r.json();
-          if (d2.detail) throw new Error(d2.detail);
-          if (msgEl) { msgEl.textContent = '✅ 상태 변경: ' + (status || '기본'); msgEl.className = 'mdl-save-msg ok'; }
-          // 화면 전체 새로고침 (왼쪽 텍스트도 업데이트)
-          const r2 = await fetch('/projects/' + encodeURIComponent(_currentProjectKey) +
-            '/models/' + encodeURIComponent(d.model_id) + '/process', { credentials: 'same-origin' });
-          const fresh = await r2.json();
-          if (!fresh.detail) renderProcessEditor(fresh);
-        } catch (e) {
-          if (msgEl) { msgEl.textContent = '❌ ' + e.message; msgEl.className = 'mdl-save-msg err'; }
-        }
-      });
-    });
-
-    document.getElementById('mdl-proc-save').addEventListener('click', function() {
-      const steps = [];
-      tableBox.querySelectorAll('.mdl-proc-row').forEach(function(row) {
-        steps.push({
-          key: row.dataset.stepKey,
-          expected: row.querySelector('[data-f="expected"]').value || '',
-          actual: row.querySelector('[data-f="actual"]').value || '',
-          status: row.querySelector('.mdl-proc-status-sel') ? row.querySelector('.mdl-proc-status-sel').value : ''
-        });
-      });
-      const msg = document.getElementById('mdl-proc-msg');
-      fetch('/admin/projects/' + encodeURIComponent(_currentProjectKey) + '/models/' + encodeURIComponent(d.model_id) + '/process', {
-        method: 'PUT', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ dev_type: (d.dev_type || 'HVM'), steps: steps })
-      })
-        .then(function(r) { return r.json(); })
-        .then(function(res) {
-          if (res.ok) {
-            msg.textContent = '✅ 저장 완료 (진행률 ' + res.progress + '%)';
-            msg.style.color = '#059669';
-            const m = window._modelsData.find(function(x) { return x.id === d.model_id; });
-            if (m) { m.dev_type = res.dev_type; m.progress = res.progress; }
-            // 저장 직후 서버 데이터로 화면 즉시 갱신 (체크 상태/진행률/다음 단계 반영)
-            fetch('/projects/' + encodeURIComponent(_currentProjectKey) + '/models/' + encodeURIComponent(d.model_id) + '/process', { credentials: 'same-origin' })
-              .then(function(r2) { return r2.json(); })
-              .then(function(d2) {
-                if (!d2.detail) renderProcessEditor(d2);
-                // 상단 메시지는 리렌더 후에도 유지되도록 다시 표시
-                setTimeout(function() {
-                  const msg2 = document.getElementById('mdl-proc-msg');
-                  if (msg2) { msg2.textContent = '✅ 저장 완료 (진행률 ' + res.progress + '%)'; msg2.style.color = '#059669'; }
-                }, 50);
-              });
-          } else {
-            msg.textContent = '❌ 실패: ' + (res.detail || '');
-            msg.style.color = '#DC2626';
-          }
-        })
-        .catch(function(e) {
-          msg.textContent = '❌ ' + e.message;
-          msg.style.color = '#DC2626';
-        });
-    });
-  }
-
-  // ── 프로젝트별 유형 관리 ──
-  function loadTypes(projectKey) {
-    if (!projectKey) { _projTypes = []; renderTypeChips(); return; }
-    fetch('/projects/' + encodeURIComponent(projectKey) + '/types')
-      .then(function(r) { return r.ok ? r.json() : { types: ['HVM', 'RPM'] }; })
-      .then(function(d) {
-        _projTypes = (d && d.types) ? d.types : [];
-        renderTypeChips();
-      })
-      .catch(function() { _projTypes = []; renderTypeChips(); });
-  }
-
-  function renderTypeChips() {
-    var box = document.getElementById('mdl-type-chips');
-    if (!box) return;
-    box.innerHTML = _projTypes.map(function(t) {
-      var _c = _typeColor(t);
-      return '<span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;background:' + _c.bg + ';color:' + _c.fg + ';border:1px solid ' + _c.fg + ';border-radius:999px;font-size:12px;font-weight:700;">'
-        + t
-        + '<button type="button" class="mdl-type-del" data-type="' + t + '" style="border:0;background:transparent;color:' + _c.fg + ';font-size:13px;cursor:pointer;padding:0 0 0 2px;line-height:1;" title="삭제">×</button>'
-        + '</span>';
-    }).join('');
-    // 삭제 이벤트
-    box.querySelectorAll('.mdl-type-del').forEach(function(btn) {
-      btn.addEventListener('click', function() {
-        var t = btn.getAttribute('data-type');
-        if (!confirm('유형 "' + t + '"을 삭제하시겠습니까? (모델에 입력된 값은 유지됩니다)')) return;
-        _projTypes = _projTypes.filter(function(x) { return x !== t; });
-        saveTypes();
-      });
-    });
-  }
-
-  function saveTypes() {
-    var projKey = (typeof _currentProjectKey !== 'undefined' && _currentProjectKey) || '';
-    if (!projKey) { alert('프로젝트를 먼저 선택하세요'); return; }
-    fetch('/admin/projects/' + encodeURIComponent(projKey) + '/types', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ types: _projTypes })
-    })
-      .then(function(r) { return r.json(); })
-      .then(function() {
-        renderTypeChips();
-        var tableBox = document.getElementById('mdl-table-box');
-        if (tableBox) renderTable(tableBox); // datalist 갱신
-      })
-      .catch(function(e) { alert('유형 저장 실패: ' + e.message); });
-  }
-
-  // 유형 추가 버튼 + 엔터키
-  document.addEventListener('click', function(e) {
-    if (e.target && e.target.id === 'mdl-type-add') {
-      var input = document.getElementById('mdl-type-input');
-      if (!input) return;
-      var v = (input.value || '').trim();
-      if (!v) return;
-      if (_projTypes.indexOf(v) === -1) {
-        _projTypes.push(v);
-        saveTypes();
-      }
-      input.value = '';
-    }
-  });
-  document.addEventListener('keydown', function(e) {
-    if (e.target && e.target.id === 'mdl-type-input' && e.key === 'Enter') {
-      e.preventDefault();
-      var btn = document.getElementById('mdl-type-add');
-      if (btn) btn.click();
-    }
-  });
-
-// ── 엑셀 일괄 등록 ──
-  window.bindModelExcel = function(){
-    var upBtn = document.getElementById('mdl-excel-btn');
-    var tplBtn = document.getElementById('mdl-excel-tpl-btn');
-    var input = document.getElementById('mdl-excel-input');
-    var wrap = document.getElementById('mdl-table-box');
-    if (!upBtn || !input) return;
-    if (tplBtn) tplBtn.onclick = function(){ window.location.href = '/admin/models/template'; };
-    upBtn.onclick = function(){ input.click(); };
-    input.onchange = function(){ if (input.files && input.files[0]) doExcelUpload(input.files[0]); input.value = ''; };
-    if (wrap && !wrap.dataset.excelDrop) {
-      wrap.dataset.excelDrop = '1';
-      wrap.addEventListener('dragover', function(e){ e.preventDefault(); wrap.style.outline = '2px dashed #2563EB'; });
-      wrap.addEventListener('dragleave', function(){ wrap.style.outline = 'none'; });
-      wrap.addEventListener('drop', function(e){
-        e.preventDefault(); wrap.style.outline = 'none';
-        var f = e.dataTransfer.files && e.dataTransfer.files[0];
-        if (f) doExcelUpload(f);
-      });
-    }
-    async function doExcelUpload(file){
-      if (!file.name.toLowerCase().endsWith('.xlsx') && !file.name.toLowerCase().endsWith('.xls')) {
-        alert('❌ .xlsx / .xls 파일만 가능합니다.'); return;
-      }
-      if (!_currentProjectKey) { alert('프로젝트를 먼저 선택하세요.'); return; }
-      var fd = new FormData();
-      fd.append('file', file);
-      try {
-        var r = await fetch('/admin/projects/' + encodeURIComponent(_currentProjectKey) + '/models/import', { method: 'POST', body: fd, credentials: 'same-origin' });
-        var d = await r.json();
-        if (r.ok && d.ok) {
-          alert('✅ 완료: 신규 ' + d.added + '개, 갱신 ' + d.updated + '개 (전체 ' + d.total + '개)');
-          var tb = document.getElementById('mdl-table-box');
-          if (tb) loadModels(_currentProjectKey, tb);
-          loadTypes(_currentProjectKey);
-        } else {
-          alert('❌ 실패: ' + (d.detail || '알 수 없는 오류'));
-        }
-      } catch(e) { alert('❌ ' + e.message); }
-    }
-
-    // 프로세스 엑셀 업로드
-    var procBtn = document.getElementById('mdl-proc-excel-btn');
-    var procInput = document.getElementById('mdl-proc-excel-input');
-    if (procBtn && procInput) {
-      procBtn.onclick = function(){ procInput.click(); };
-      procInput.onchange = async function(){
-        if (!procInput.files || !procInput.files[0]) return;
-        var f = procInput.files[0];
-        procInput.value = '';
-        if (!_currentProjectKey) { alert('프로젝트를 먼저 선택하세요.'); return; }
-        var fd = new FormData();
-        fd.append('file', f);
-        try {
-          var r = await fetch('/admin/projects/' + encodeURIComponent(_currentProjectKey) + '/process/import-xlsx',
-            { method: 'POST', body: fd, credentials: 'same-origin' });
-          var d = await r.json();
-          if (r.ok && d.ok) {
-            alert('✅ ' + d.matched + '개 모델 프로세스 반영' +
-              (d.skipped_count ? '\\n건너뜀: ' + d.skipped.slice(0,5).join(', ') + (d.skipped_count > 5 ? ' 외 ' + (d.skipped_count-5) + '개' : '') : ''));
-            var tb = document.getElementById('mdl-table-box');
-            if (tb) loadModels(_currentProjectKey, tb);
-          } else {
-            alert('❌ 실패: ' + (d.detail || '알 수 없는 오류'));
-          }
-        } catch(e) { alert('❌ ' + e.message); }
-      };
-    }
-    
-    // 프로세스 초기화 버튼
-    var resetBtn = document.getElementById('mdl-proc-reset-btn');
-    if (resetBtn) {
-      resetBtn.onclick = function() {
-        if (!_currentProjectKey) { alert('프로젝트를 먼저 선택하세요.'); return; }
-        if (!confirm('⚠️ 모든 모델의 프로세스를 초기화하시겠습니까?\n\n예상일, 실제일, 상태가 모두 비워집니다.')) return;
-        
-        var msgEl = document.getElementById('mdl-save-msg');
-        if (msgEl) { msgEl.textContent = '초기화 중...'; msgEl.className = 'mdl-save-msg'; }
-        
-        // 한 번의 API 호출로 전체 초기화 (JSON 손상 방지)
-        fetch('/admin/projects/' + encodeURIComponent(_currentProjectKey) + '/process/reset-all',
-          { method: 'POST', credentials: 'same-origin' })
-          .then(function(r) { return r.json(); })
-          .then(function(res) {
-            if (res.ok) {
-              if (msgEl) { msgEl.textContent = '✅ ' + res.reset_count + '개 모델 프로세스 초기화 완료'; msgEl.className = 'mdl-save-msg ok'; }
-              // 목록 새로고침
-              var tb = document.getElementById('mdl-table-box');
-              if (tb) loadModels(_currentProjectKey, tb);
-            } else {
-              if (msgEl) { msgEl.textContent = '❌ 초기화 실패: ' + (res.detail || ''); msgEl.className = 'mdl-save-msg err'; }
-            }
-          })
-          .catch(function(e) {
-            if (msgEl) { msgEl.textContent = '❌ 초기화 실패: ' + e.message; msgEl.className = 'mdl-save-msg err'; }
-          });
-      };
-    }
-  };
-
-  window.loadModels = function loadModels(projectKey, container) {
-    if (!projectKey) {
-      _currentProjectKey = '';
-      if (container) {
-        container.innerHTML = '<div style="padding:80px 20px;text-align:center;color:#94A3B8;font-size:14px;">상단에서 프로젝트를 선택하세요.</div>';
-      }
-      return;
-    }
-    if (!projectKey) { window._modelsData = []; renderTable(container); return; }
-    _currentProjectKey = projectKey;
-    loadTypes(projectKey);
-    
-    // ESS 여부 확인 후 모델 로드 및 테이블 렌더링
-    fetch('/projects').then(function(r){ return r.json(); }).then(function(d){
-      var p = (d.projects || []).find(function(x){ return x.key === projectKey || x.project_id === projectKey; });
-      _projIsEss = !!(p && (p.division_id === 'ess' || ['sdi', 'fluence', 'epc_power'].includes(projectKey)));
-      
-      // ESS 확인 후 모델 데이터 로드
-      return fetch('/admin/projects/' + encodeURIComponent(projectKey) + '/models', { credentials: 'same-origin' });
-    }).then(function(r) { return r.json(); })
-      .then(function(d) {
-        window._modelsData = (d && d.models) || [];
-        renderTable(container);
-      })
-      .catch(function() { 
-        _projIsEss = false;
-        window._modelsData = []; 
-        renderTable(container); 
-      });
-  }
-
-  // 모델 저장
-  function saveModels(statusEl) {
-    if (!_currentProjectKey) {
-      if (statusEl) { statusEl.textContent = '프로젝트를 먼저 선택하세요'; statusEl.className = 'mdl-status err'; }
-      return;
-    }
-    if (statusEl) { statusEl.textContent = '저장 중...'; statusEl.className = 'mdl-status'; }
-    fetch('/admin/projects/' + encodeURIComponent(_currentProjectKey) + '/models', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify({ models: window._modelsData })
-    })
-    .then(function(r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    })
-    .then(function(d) {
-      if (statusEl) { statusEl.textContent = '✅ 저장 완료 (' + (d.count || 0) + '개)'; statusEl.className = 'mdl-status ok'; }
-      // 저장 성공: window._modelsData는 이미 sync된 상태 → renderTable만 호출 (재조회 X, 부드러운 UX)
-      var tableBox = document.getElementById('mdl-table-box');
-      if (tableBox) renderTable(tableBox);
-    })
-    .catch(function(e) {
-      if (statusEl) { statusEl.textContent = '❌ 저장 실패: ' + e.message; statusEl.className = 'mdl-status err'; }
-    });
-  }
-
-  // 사업부 select가 비어있으면 자동 fallback: 첫 번째 사업부 선택
-  function ensureDivisionSelected() {
-    var divSel = document.getElementById('v2-division-select');
-    if (!divSel) return false;
-    if (divSel.value) return true;
-    if (!divSel.options || divSel.options.length <= 1) return false;
-    var first = divSel.options[1];  // 0번은 placeholder
-    if (first && first.value) {
-      divSel.value = first.value;
-      try { localStorage.setItem('v2_division', divSel.value); } catch(e){}
-      divSel.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    }
-    return false;
-  }
-
-  // 사이드바 사업부 변경 시 프로젝트 목록 갱신 (전역)
-  document.addEventListener('DOMContentLoaded', function() {
-    var sidebarSel = document.getElementById('v2-division-select');
-    if (sidebarSel) {
-      sidebarSel.addEventListener('change', function() {
-        // 사업부 변경 시 모델 관리 페이지 다시 렌더링
-        if (typeof renderModelsPage === 'function') {
-          renderModelsPage();
-        }
-        var divId = sidebarSel.value || 'semiconductor';
-        fetch('/projects').then(function(r){ return r.json(); }).then(function(d){
-          var projs = (d.projects || []).filter(function(x){ return x.division_id === divId; });
-          var projSel = document.getElementById('mdl-proj-select');
-          if (projSel) {
-            projSel.innerHTML = '<option value="">프로젝트 선택...</option>' + projs.map(function(p){ return '<option value="' + (p.key || p.project_id || p.id) + '">' + (p.label || p.project_label || p.key) + '</option>'; }).join('');
-            projSel.value = '';
-            _currentProjectKey = '';
-            var tb = document.getElementById('mdl-table-box');
-            if (tb) tb.innerHTML = '<div style="padding:80px 20px;text-align:center;color:#94A3B8;font-size:14px;">상단에서 프로젝트를 선택하세요.</div>';
-          }
-        }).catch(function(){});
-      });
-    }
-  });
-
-  // 페이지 렌더링 (data-page="models" 클릭 시)
-  window.renderModelsPage = function() {
-    const content = document.getElementById('v2-content');
-    if (!content) return;
-
-    content.innerHTML =
-      '<div class="mdl-wrap">' +
-        '<div class="mdl-head">' +
-          '<div class="mdl-title-row">' +
-            '<span class="mdl-mark">◆</span>' +
-            '<h2 class="mdl-title">모델 관리</h2>' +
-            '<select id="mdl-proj-select" class="mdl-select"></select>' +
-          '</div>' +
-          '<div class="mdl-tabs">' +
-            '<button type="button" class="mdl-tab is-active" data-mtab="list">📋 모델 목록 <span id="mdl-tab-count" class="mdl-badge">0</span></button>' +
-            '<button type="button" class="mdl-tab" data-mtab="plan">📅 주차별 계획</button>' +
-          '</div>' +
-        '</div>' +
-
-        '<div class="mdl-pane" data-mpane="list">' +
-          '<div class="mdl-note-card" id="mdl-note-card">' +
-            '<div class="mdl-note-row">' +
-              '<div class="mdl-note-label">프로젝트 현황</div>' +
-              '<button type="button" class="mdl-btn mdl-btn-note-save" id="mdl-note-save">저장</button>' +
-            '</div>' +
-            '<textarea id="mdl-status-note" rows="3" placeholder="프로젝트 현황을 입력하세요 (앱에 표시됩니다)"></textarea>' +
-            '<div id="mdl-note-msg" class="mdl-save-msg"></div>' +
-          '</div>' +
-          '<div class="mdl-actions" id="mdl-toolbar">' +
-            '<button type="button" class="mdl-btn mdl-btn-add" id="mdl-add-btn">＋ 모델 추가</button>' +
-          '<button type="button" class="mdl-btn" id="mdl-excel-btn" style="background:#059669;color:#fff;">📥 엑셀 업로드</button>' +
-          '<button type="button" class="mdl-btn" id="mdl-excel-tpl-btn" style="background:#6B7280;color:#fff;">📄 양식 다운로드</button>' +
-          '<input type="file" id="mdl-excel-input" accept=".xlsx,.xls" style="display:none;">' +
-          '<button type="button" class="mdl-btn" id="mdl-proc-excel-btn" style="background:#7C3AED;color:#fff;">📅 프로세스 엑셀</button>' +
-          '<input type="file" id="mdl-proc-excel-input" accept=".xlsx,.xls" style="display:none;">' +
-          '<button type="button" class="mdl-btn" id="mdl-proc-reset-btn" style="background:#DC2626;color:#fff;">🔄 프로세스 초기화</button>' +
-            '<button type="button" class="mdl-btn mdl-btn-save" id="mdl-save-btn">저장</button>' +
-            '<span id="mdl-save-msg" class="mdl-save-msg"></span>' +
-          '</div>' +
-          '<div id="mdl-types-bar" style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0 4px;padding:10px 14px;background:#F8FAFC;border:1px solid #E5E7EB;border-radius:10px;">' +
-            '<span style="font-size:12px;font-weight:700;color:#374151;">유형:</span>' +
-            '<span id="mdl-type-chips" style="display:inline-flex;flex-wrap:wrap;gap:6px;"></span>' +
-            '<input id="mdl-type-input" type="text" placeholder="새 유형 입력" style="width:110px;padding:4px 8px;border:1px solid #D1D5DB;border-radius:6px;font-size:12px;" />' +
-            '<button type="button" id="mdl-type-add" style="padding:4px 10px;border:0;border-radius:6px;background:#0F2C59;color:#fff;font-size:12px;font-weight:700;cursor:pointer;">+ 추가</button>' +
-          '</div>' +
-          '<div id="mdl-table-box"><div class="mdl-loading">불러오는 중...</div></div>' +
-          '<p class="mdl-hint">판가·재료비는 달러($) 기준이며, 재료비율은 자동 계산됩니다 (재료비 ÷ 판가 × 100).</p>' +
-        '</div>' +
-
-        '<div class="mdl-pane" data-mpane="plan" hidden>' +
-          '<div class="mdl-plan-card">' +
-            '<div id="mdl-weekly-status" class="mdl-weekly-status">로딩 중...</div>' +
-            '<div class="mdl-weekly-actions">' +
-              '<input type="file" id="mdl-weekly-file" accept=".xlsx,.xls,.xlsm" style="display:none">' +
-              '<button type="button" class="mdl-btn mdl-btn-add" id="mdl-weekly-upload">📁 엑셀 업로드</button>' +
-              '<button type="button" class="mdl-btn mdl-btn-del" id="mdl-weekly-delete" style="display:none">🗑️ 삭제</button>' +
-            '</div>' +
-            '<div id="mdl-weekly-preview" class="mdl-weekly-preview"></div>' +
-          '</div>' +
-        '</div>' +
-      '</div>';
-
-    // 탭 전환
-    const tabs = content.querySelectorAll('.mdl-tab');
-    const panes = content.querySelectorAll('.mdl-pane');
-    tabs.forEach(function(t) {
-      t.addEventListener('click', function() {
-        tabs.forEach(function(x) { x.classList.remove('is-active'); });
-        t.classList.add('is-active');
-        panes.forEach(function(pn) { pn.hidden = pn.dataset.mpane !== t.dataset.mtab; });
-      });
-    });
-
-
-    const sel = document.getElementById('mdl-proj-select');
-    const tableBox = document.getElementById('mdl-table-box');
-    const weeklyStatus = document.getElementById('mdl-weekly-status');
-    const weeklyPreview = document.getElementById('mdl-weekly-preview');
-    const weeklyFileInput = document.getElementById('mdl-weekly-file');
-    const weeklyUploadBtn = document.getElementById('mdl-weekly-upload');
-    const weeklyDeleteBtn = document.getElementById('mdl-weekly-delete');
-    const saveBtn = document.getElementById('mdl-save-btn');
-    const saveMsg = document.getElementById('mdl-save-msg');
-    const addBtn = document.getElementById('mdl-add-btn');
-
-    function loadStatusNote(projectKey) {
-      if (!projectKey) return;
-      fetch('/projects/' + encodeURIComponent(projectKey) + '/models/detail', { credentials: 'same-origin' })
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-          const ta = document.getElementById('mdl-status-note');
-          if (ta) ta.value = d.status_note || '';
-        })
-        .catch(function() {});
-    }
-
-    function loadWeeklyPlan(projectKey) {
-      if (!projectKey) {
-        weeklyStatus.textContent = '프로젝트를 선택하세요';
-        weeklyStatus.className = 'mdl-weekly-status';
-        weeklyPreview.innerHTML = '';
-        weeklyDeleteBtn.style.display = 'none';
-        return;
-      }
-      weeklyStatus.textContent = '불러오는 중...';
-      weeklyStatus.className = 'mdl-weekly-status';
-      fetch('/projects/' + encodeURIComponent(projectKey) + '/weekly-plan', { credentials: 'same-origin' })
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-          if (d.has_plan && d.url) {
-            weeklyStatus.textContent = '✅ ' + (d.file_name || '엑셀 파일') + ' (' + (d.uploaded_at || '').substring(0, 10) + ')';
-            weeklyStatus.className = 'mdl-weekly-status ok';
-            weeklyDeleteBtn.style.display = 'inline-block';
-            weeklyPreview.innerHTML = '<img src="' + d.url + '" style="max-width:100%;border:1px solid #E5E7EB;border-radius:8px;background:#fff;cursor:zoom-in;" alt="weekly plan" onerror="this.parentNode.textContent=&#39;이미지 로드 실패&#39;;this.remove();">';
-          } else {
-            weeklyStatus.textContent = '등록된 주차별 계획이 없습니다';
-            weeklyStatus.className = 'mdl-weekly-status';
-            weeklyPreview.innerHTML = '';
-            weeklyDeleteBtn.style.display = 'none';
-          }
-        })
-        .catch(function(e) {
-          weeklyStatus.textContent = '❌ 로드 실패: ' + e.message;
-          weeklyStatus.className = 'mdl-weekly-status err';
-        });
-    }
-
-    weeklyUploadBtn.addEventListener('click', function() {
-      if (!sel.value) { alert('프로젝트를 먼저 선택하세요'); return; }
-      weeklyFileInput.click();
-    });
-
-    weeklyFileInput.addEventListener('change', function() {
-      const file = weeklyFileInput.files[0];
-      if (!file) return;
-      const projectKey = sel.value;
-      if (!projectKey) { alert('프로젝트를 먼저 선택하세요'); weeklyFileInput.value = ''; return; }
-      weeklyStatus.textContent = '⏳ 업로드 중...';
-      weeklyStatus.className = 'mdl-weekly-status';
-      const fd = new FormData();
-      fd.append('file', file);
-      fetch('/admin/projects/' + encodeURIComponent(projectKey) + '/weekly-plan', {
-        method: 'POST', credentials: 'same-origin', body: fd
-      })
-        .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
-        .then(function(res) {
-          if (res.ok && res.d.ok) {
-            weeklyStatus.textContent = '✅ ' + (res.d.file_name || file.name);
-            weeklyStatus.className = 'mdl-weekly-status ok';
-            loadWeeklyPlan(projectKey);
-          } else {
-            weeklyStatus.textContent = '❌ ' + (res.d.detail || '업로드 실패');
-            weeklyStatus.className = 'mdl-weekly-status err';
-          }
-        })
-        .catch(function(e) {
-          weeklyStatus.textContent = '❌ ' + e.message;
-          weeklyStatus.className = 'mdl-weekly-status err';
-        })
-        .finally(function() { weeklyFileInput.value = ''; });
-    });
-
-    weeklyDeleteBtn.addEventListener('click', function() {
-      const projectKey = sel.value;
-      if (!projectKey) return;
-      if (!confirm('주차별 계획을 삭제하시겠습니까?')) return;
-      fetch('/admin/projects/' + encodeURIComponent(projectKey) + '/weekly-plan', {
-        method: 'DELETE', credentials: 'same-origin'
-      })
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-          if (d.ok) loadWeeklyPlan(projectKey);
-          else alert('삭제 실패: ' + (d.detail || ''));
-        })
-        .catch(function(e) { alert('삭제 실패: ' + e.message); });
-    });
-
-    saveBtn.addEventListener('click', function() {
-      syncDomToData(tableBox);
-      saveModels(saveMsg);
-    });
-
-    const noteSaveBtn = document.getElementById('mdl-note-save');
-    if (noteSaveBtn) {
-      noteSaveBtn.addEventListener('click', function() {
-        if (!_currentProjectKey) { alert('프로젝트를 먼저 선택하세요'); return; }
-        const noteEl = document.getElementById('mdl-status-note');
-        const msg = document.getElementById('mdl-note-msg');
-        fetch('/admin/projects/' + encodeURIComponent(_currentProjectKey) + '/status-note', {
-          method: 'PUT', credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ note: noteEl ? noteEl.value : '' })
-        })
-          .then(function(r) { return r.json(); })
-          .then(function(d) {
-            if (d.ok) { msg.textContent = '✅ 현황 저장 완료'; msg.style.color = '#059669'; }
-            else { msg.textContent = '❌ 저장 실패'; msg.style.color = '#DC2626'; }
-          })
-          .catch(function(e) { msg.textContent = '❌ ' + e.message; msg.style.color = '#DC2626'; });
-      });
-    }
-
-    addBtn.addEventListener('click', function() {
-      const name = prompt('모델명 (예: CUP-100)');
-      if (!name || !name.trim()) return;
-      const trimmed = name.trim();
-      if (window._modelsData.some(function(m) { return m.id === trimmed; })) {
-        alert('이미 존재하는 모델명입니다');
-        return;
-      }
-      window._modelsData.push({ id: trimmed, name: trimmed, group: '양산', status: '정상', progress: 0, price: 0, material_cost: 0 });
-      renderTable(tableBox);
-    });
-
-    var sidebarSel = document.getElementById('v2-division-select');
-    var currentDiv = sidebarSel ? sidebarSel.value : 'semiconductor';
-    fetch('/admin/config/projects?division_id=' + encodeURIComponent(currentDiv), { credentials: 'same-origin' })
-      .then(function(r) { return r.json(); })
-      .then(function(data) {
-        var projects = data.projects || [];
-        if (projects.length === 0) {
-          sel.innerHTML = '<option value="">프로젝트가 없습니다</option>';
-          tableBox.innerHTML = '<div class="mdl-empty">프로젝트가 없습니다</div>';
-          return;
-        }
-        sel.innerHTML = '<option value="">프로젝트 선택...</option>' + projects.map(function(p) {
-          return '<option value="' + p.id + '">' + (p.label || p.id) + '</option>';
-        }).join('');
-        bindModelExcel();
-        loadModels(sel.value, tableBox);
-        loadWeeklyPlan(sel.value);
-        loadStatusNote(sel.value);
-      })
-      .catch(function(e) {
-        sel.innerHTML = '<option value="">오류: ' + e.message + '</option>';
-        tableBox.innerHTML = '<div class="mdl-empty">프로젝트 목록 로드 실패</div>';
-      });
-
-    sel.addEventListener('change', function() {
-      window._modelsData = [];
-      window._projIsEss = ['sdi', 'fluence', 'epc_power'].includes(sel.value);
-      if (!sel.value) {
-        tableBox.innerHTML = '<div style="padding:80px 20px;text-align:center;color:#94A3B8;font-size:14px;">상단에서 프로젝트를 선택하세요.</div>';
-        return;
-      }
-      loadModels(sel.value, tableBox);
-      loadWeeklyPlan(sel.value); loadStatusNote(sel.value);
-    });
-  }
-
-  document.addEventListener('click', function(e) {
-    var navItem = e.target.closest('.nav-item[data-page="models"]');
-    if (navItem) {
-      // 기존 active 해제
-      document.querySelectorAll('.nav-item').forEach(function(n) { n.classList.remove('active'); });
-      navItem.classList.add('active');
-      var crumb = document.getElementById('v2-crumb-page');
-      if (crumb) crumb.textContent = '모델 관리';
-      // 사업부 변경 시 프로젝트 목록 갱신 후 첫 프로젝트 자동 선택
-      var sidebarSel = document.getElementById('v2-division-select');
-      var divId = sidebarSel ? sidebarSel.value : 'semiconductor';
-      fetch('/projects').then(function(r){ return r.json(); }).then(function(d){
-        var projs = (d.projects || []).filter(function(x){ return x.division_id === divId; });
-        var sel = document.getElementById('mdl-proj-select');
-        if (sel) {
-          sel.innerHTML = '<option value="">프로젝트 선택...</option>' + projs.map(function(p){ return '<option value="' + (p.key || p.project_id || p.id) + '">' + (p.label || p.project_label || p.key) + '</option>'; }).join('');
-          sel.value = '';
-          _currentProjectKey = '';
-          var tb = document.getElementById('mdl-table-box');
-          if (tb) tb.innerHTML = '<div style="padding:80px 20px;text-align:center;color:#94A3B8;font-size:14px;">상단에서 프로젝트를 선택하세요.</div>';
-        }
-        renderModelsPage();
-      }).catch(function(){ renderModelsPage(); });
-    }
-  });
-})();
-</script>
-</body>
-</html>
-"""
-
+# ============================================================
+#  예전 업로드 화면 · 업로드 이력
+# ============================================================
+# 예전 업로드 화면 주소 — admin v2 로 보낸다 (옛 화면은 지웠다. 즐겨찾기 · 옛 링크용)
 @app.get("/admin/upload", response_class=HTMLResponse)
 def admin_upload_page(admin_auth: Optional[str] = Cookie(default=None)):
-    if not _verify_session(admin_auth):
-        return RedirectResponse(url="/admin/login?next=/admin/upload", status_code=302)
-    return HTMLResponse(content=_ADMIN_UPLOAD_HTML)
+    return RedirectResponse(url="/admin/v2", status_code=302)
 
 
+# 업로드된 PPT 목록 (삭제 UI용)
 @app.get("/admin/uploads/history")
 def admin_uploads_history(_admin: int = Depends(get_admin_session)):
-    """업로드된 PPT 목록 (삭제 UI용)"""
     items = _read_json(LATEST_FILE, [])
     history = []
     for item in items:
@@ -13357,7 +6903,10 @@ def admin_uploads_history(_admin: int = Depends(get_admin_session)):
     history.sort(key=lambda x: x.get("upload_timestamp", ""), reverse=True)
     return {"items": history}
 
-
+# ============================================================
+#  손으로 만드는 보고서
+# ============================================================
+# 숨긴 것까지 포함한 보고서 전체 목록 ← admin v2 loadAdminV2Reports() · openReportEdit()
 @app.get("/admin/reports/all")
 def admin_list_reports_all(_admin: int = Depends(get_admin_session)):
     # Admin 전용: hidden 항목까지 모두 반환
@@ -13401,11 +6950,12 @@ def admin_list_reports_all(_admin: int = Depends(get_admin_session)):
     return {"reports": split_cards}
 
 
+# 보고서를 손으로 만든다 (잠김) ← admin v2 getISOWeek()
 @app.post("/admin/reports")
 def admin_create_manual_report(payload: dict, _admin: int = Depends(get_admin_session)):
     # 수기 프로젝트 생성. PPT 없이 리포트 카드만 추가.
     project_name = (payload.get("project_name") or "").strip()
-    division_id = (payload.get("division_id") or "semiconductor").strip() or "semiconductor" 
+    division_id = (payload.get("division_id") or "semiconductor").strip() or "semiconductor"
 
     # 중복 프로젝트명 검사 (정규화 후 비교)
     _norm_new = _normalize_project_name(project_name)
@@ -13462,8 +7012,6 @@ def admin_create_manual_report(payload: dict, _admin: int = Depends(get_admin_se
         "is_manual": True,
         "division_id": division_id,
         "report_meta": {"date": report_date},
-        "manual_projects": [project_name],
-        "manual_projects": [project_name],
         "products": [{
             "name": project_name,
             "category": "",
@@ -13487,6 +7035,7 @@ def admin_create_manual_report(payload: dict, _admin: int = Depends(get_admin_se
     return {"ok": True, "doc_id": doc_id, "display_title": display_title}
 
 
+# 손으로 만든 보고서 지우기 (잠김) ← admin v2 executeDelete() · __moreBtn.onclick() · _loadSalesForSection() 외
 @app.delete("/admin/reports/{doc_id}")
 def admin_delete_manual_report(doc_id: str, _admin: int = Depends(get_admin_session)):
     # 수기 리포트 삭제. 안전을 위해 is_manual=True 인 것만 허용.
@@ -13511,15 +7060,10 @@ def admin_delete_manual_report(doc_id: str, _admin: int = Depends(get_admin_sess
 
 # ─── reports → notes.json 자동 동기화 (수기 doc용) ───
 
-
+# ============================================================
+#  보고서 → 노트 옮기기
+# ============================================================
 def _extract_due_date(text: str) -> tuple:
-    """(clean_text, due_iso or None) 반환.
-    
-    ★ 원문 그대로 유지 정책 (2026-07-27~):
-      - 사용자가 적은 문장을 그대로 앱에 표시하기 위해 텍스트는 건드리지 않음.
-      - due_date 만 추출 (화살표 인식형 파서 사용).
-      - 명시적 대괄호 [YYYY-MM-DD] / [YY-MM-DD] 는 우선순위로 처리.
-    """
     import re as _re
     from datetime import date as _date
     if not text or not isinstance(text, str):
@@ -13549,11 +7093,8 @@ def _extract_due_date(text: str) -> tuple:
     # ★ text 는 정리하지 않고 원문 그대로 반환
     return (text, due_iso)
 
+# BeautifulSoup 노드를 재귀 순회하며 [(text, style_dict), ...] 반환.
 def _collect_inline_runs(node, inherited_style: dict) -> list:
-    """BeautifulSoup 노드를 재귀 순회하며 [(text, style_dict), ...] 반환.
-    style_dict keys: color, bold, italic, underline, size_scale.
-    부모의 스타일은 자식에게 상속됨.
-    """
     from bs4 import NavigableString
     if isinstance(node, NavigableString):
         return [(str(node), dict(inherited_style))]
@@ -13628,10 +7169,8 @@ def _collect_inline_runs(node, inherited_style: dict) -> list:
     return runs
 
 
+# runs [(text, style), ...] → (plain_text, text_runs 또는 None).
 def _runs_to_output(runs: list) -> tuple:
-    """runs [(text, style), ...] → (plain_text, text_runs 또는 None).
-    연속된 동일 style은 병합. 스타일이 하나도 없으면 text_runs=None 반환.
-    """
     if not runs:
         return ('', None)
     # 앞뒤 공백을 유지하되 완전히 빈 run은 제외
@@ -13670,12 +7209,8 @@ def _runs_to_output(runs: list) -> tuple:
     return (plain, text_runs)
 
 
+# HTML(관리자 편집기 결과)을 모바일 앱이 이해하는 items 배열로 변환.
 def _html_body_to_items(html: str) -> list:
-    """HTML(관리자 편집기 결과)을 모바일 앱이 이해하는 items 배열로 변환.
-    
-    우선 items가 이미 있으면 그대로 반환 (구조화된 저장 포맷).
-    없으면 HTML 파싱 (기존 방식, 호환용).
-    """
     # items가 이미 있으면 그대로 반환
     if isinstance(html, list):
         return html
@@ -13709,23 +7244,23 @@ def _html_body_to_items(html: str) -> list:
     - <ins>text</ins> → 텍스트만 유지
     """
     from bs4 import BeautifulSoup, NavigableString
-    
+
     if not html or not isinstance(html, str):
         return []
-    
+
     # <del> 제거, <ins>는 텍스트만 남김
     soup = BeautifulSoup(html, 'html.parser')
     for del_tag in soup.find_all('del'):
         del_tag.decompose()
     for ins_tag in soup.find_all('ins'):
         ins_tag.unwrap()
-    
+
     # depth별 마커 함수
     CIRCLED = ['①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩',
                '⑪','⑫','⑬','⑭','⑮','⑯','⑰','⑱','⑲','⑳']
-    
+
+    # depth+index+is_ul로 실제 표시 문자 생성.
     def marker_for_depth(depth: int, idx: int, is_ul: bool = False) -> str:
-        """depth+index+is_ul로 실제 표시 문자 생성."""
         if is_ul:
             # ul(불릿): depth 0=•, 1=-, 2=*, 3+=·
             if depth == 0:
@@ -13745,9 +7280,9 @@ def _html_body_to_items(html: str) -> list:
                 return f"{idx + 1})"
             else:  # circled
                 return CIRCLED[idx] if idx < len(CIRCLED) else f"{idx + 1}."
-    
+
+    # ol의 effective depth 계산 (data-depth-override 우선).
     def get_ol_depth(ol) -> int:
-        """ol의 effective depth 계산 (data-depth-override 우선)."""
         override = ol.get('data-depth-override')
         if override:
             try:
@@ -13768,11 +7303,11 @@ def _html_body_to_items(html: str) -> list:
                 depth += 1
             cur = getattr(cur, 'parent', None)
         return depth
-    
+
     items = []
-    
+
+    # ol의 li들을 순회하며 items에 추가 (nested ol도 재귀).
     def process_ol(ol, extra_prefix=""):
-        """ol의 li들을 순회하며 items에 추가 (nested ol도 재귀). data-depth-override 우선."""
         print(f"[DEBUG process_ol] called, tag={ol.name}, children={len(list(ol.children))}, is_ul={ol.name == 'ul'}")
         # data-depth-override 속성이 있으면 우선 사용 (에디터 Tab 들여쓰기)
         _override = ol.get('data-depth-override')
@@ -13788,7 +7323,7 @@ def _html_body_to_items(html: str) -> list:
             start = int(ol.get('data-start') or ol.get('start') or 1)
         except (ValueError, TypeError):
             start = 1
-        
+
         lis = [c for c in ol.children if getattr(c, 'name', None) == 'li']
         for i, li in enumerate(lis):
             # li 안의 인라인 runs 수집 (색상/굵기 등 스타일 보존)
@@ -13799,7 +7334,7 @@ def _html_body_to_items(html: str) -> list:
                     nested_ols.append(child)
                 else:
                     li_runs.extend(_collect_inline_runs(child, {}))
-            
+
             li_plain, li_text_runs = _runs_to_output(li_runs)
             li_plain = li_plain.rstrip()
             print(f"[DEBUG process_ol] li[{i}] tag_name={repr(ol.name)}, plain='{li_plain[:50]}...'")
@@ -13823,14 +7358,13 @@ def _html_body_to_items(html: str) -> list:
                     prefixed_runs = [{'text': f"{marker} "}] + li_text_runs
                     _item['text_runs'] = prefixed_runs
                 items.append(_item)
-            
+
             # nested ol 재귀 처리
             for nested in nested_ols:
                 process_ol(nested)
-    
+
+    # [(text, style), ...] 리스트 → bullet 아이템으로 emit.
     def emit_runs(runs: list):
-        """[(text, style), ...] 리스트 → bullet 아이템으로 emit.
-        text_runs가 있으면 함께 저장. '*'/'★'/'※' 특별 취급 없음."""
         plain, text_runs = _runs_to_output(runs)
         plain = plain.rstrip()
         if not plain:
@@ -13861,9 +7395,8 @@ def _html_body_to_items(html: str) -> list:
             _bul['text_runs'] = text_runs
         items.append(_bul)
 
+    # editor 직속 자식 처리 (div, ol, ul 등).
     def process_element(el):
-        """editor 직속 자식 처리 (div, ol, ul 등). 인라인 태그는 상위 flush에서 처리됨.
-        '*' / '★' / '※' 특별 취급 없이 원문 그대로 유지."""
         name = getattr(el, 'name', None)
         if name in ('ol', 'ul'):
             process_ol(el)
@@ -13881,7 +7414,7 @@ def _html_body_to_items(html: str) -> list:
                 _el_runs.extend(_collect_inline_runs(_c, {}))
             _el_plain, _el_text_runs = _runs_to_output(_el_runs)
             text = (_el_plain or '').rstrip()
-            
+
             # block 자식(ul/ol)은 1단계(find_all)에서 이미 처리됨 → 여기선 중첩 div/p만 재귀
             if _has_block_child:
                 # 자기 텍스트 먼저 flush (block 자식보다 위에 위치해야 함)
@@ -13909,7 +7442,7 @@ def _html_body_to_items(html: str) -> list:
                 indent = int(_indent_attr) if _indent_attr else 0
             except (ValueError, TypeError):
                 indent = 0
-            
+
             # data-indent가 없으면 앞 공백 개수로 depth 계산 (2칸=1depth)
             if indent == 0:
                 _leading = _el_plain or ''
@@ -13921,7 +7454,7 @@ def _html_body_to_items(html: str) -> list:
                     print(f"[DEBUG indent] text='{text[:30]}...', space_count={_space_count}, depth={indent}")
             else:
                 print(f"[DEBUG indent] text='{text[:30]}...', data-indent={_indent_attr}, depth={indent}")
-            
+
             print(f"[DEBUG FINAL] text='{text[:40]}', indent={indent}, _has_block_child={_has_block_child}")
             if indent >= 1:
                 clean, due_iso = _extract_due_date(text)
@@ -13939,7 +7472,7 @@ def _html_body_to_items(html: str) -> list:
                 if due_iso:
                     _bul['due_date'] = due_iso
                 items.append(_bul)
-    
+
     # 최상위 자식들 순회.
     # 연속된 NavigableString + 인라인 태그(font/span/b/i/u/em/strong/sub/sup 등)는 하나의 텍스트로 병합.
     # <br> 만나면 flush(하나의 아이템으로 emit).
@@ -13951,9 +7484,7 @@ def _html_body_to_items(html: str) -> list:
             emit_runs(list(runs_buf))
             runs_buf.clear()
 
-    # 처리된 리스트 추적 (중복 방지)
-    _processed_lists = set()
-    
+
     for child in soup.children:
         name = getattr(child, 'name', None)
         if isinstance(child, NavigableString):
@@ -13971,15 +7502,15 @@ def _html_body_to_items(html: str) -> list:
             flush_buf()
             process_element(child)
     flush_buf()
-    
+
     return items
 
 
+# products[] → notes.json 형식의 cards[] 로 변환.
 def _products_to_note_cards(products: list, week_override=None) -> list:
-    """products[] → notes.json 형식의 cards[] 로 변환."""
     if not isinstance(products, list):
         return []
-    
+
     cards = []
     for prod in products:
         if not isinstance(prod, dict):
@@ -13987,14 +7518,14 @@ def _products_to_note_cards(products: list, week_override=None) -> list:
         title = (prod.get('name') or '').strip()
         if not title:
             continue
-        
+
         card_sections = []
         for sec in (prod.get('sections') or []):
             if not isinstance(sec, dict):
                 continue
             sec_title = (sec.get('title') or '').strip()
             blocks = sec.get('blocks') or []
-            
+
             items = []
             for blk in blocks:
                 if not isinstance(blk, dict):
@@ -14034,7 +7565,7 @@ def _products_to_note_cards(products: list, week_override=None) -> list:
                             'text': fname or url,
                             'photo_ref': _photo_ref,
                         })
-            
+
             if items:
                 new_sec = {
                     'title': sec_title,
@@ -14044,7 +7575,7 @@ def _products_to_note_cards(products: list, week_override=None) -> list:
                 if isinstance(sec.get('sales_visible'), bool):
                     new_sec['sales_visible'] = sec['sales_visible']
                 card_sections.append(new_sec)
-        
+
         if card_sections:
             card = {
                 'title': title,
@@ -14056,28 +7587,23 @@ def _products_to_note_cards(products: list, week_override=None) -> list:
             if prod.get('status'):
                 card['status'] = prod.get('status')
             cards.append(card)
-    
+
     return cards
 
 
+# 수기 doc 하나를 notes.json에 upsert.
 def _sync_report_to_notes(it: dict) -> None:
-    """수기 doc 하나를 notes.json에 upsert.
-    
-    - division_id 유추: it['division_id'] > product.name derive > semiconductor 폴백
-    - cards는 title 기준 merge
-    - _normalize_note_cards로 후처리
-    """
     try:
         if not isinstance(it, dict):
             return
         if not it.get('is_manual'):
             return
-        
+
         products = it.get('products') or []
         cards = _products_to_note_cards(products, week_override=it.get('week_override'))
         if not cards:
             return
-        
+
         # division_id 결정
         division_id = (it.get('division_id') or '').strip()
         if not division_id:
@@ -14092,12 +7618,12 @@ def _sync_report_to_notes(it: dict) -> None:
                         break
         if not division_id:
             division_id = 'semiconductor'  # 폴백
-        
+
         # 정규화
         parsed = {'cards': cards}
         _normalize_note_cards(parsed)
         cards = parsed['cards']
-        
+
         # sales_input 자동 계산 (주차별 계획 섹션)
         try:
             products = it.get('products') or []
@@ -14115,14 +7641,14 @@ def _sync_report_to_notes(it: dict) -> None:
                                 sd = psec.get('sales_data')
                                 si = psec.get('sales_input') or ''
                                 prices = psec.get('sales_prices') or {}
-
-                                # 1) xlsx 파싱 (섹션 내 첨부 파일 자동 인식)
+                                # -----------------------------------------------------------
+                                # xlsx 파싱 (섹션 내 첨부 파일 자동 인식)
+                                # -----------------------------------------------------------
                                 #    reports_latest.json 은 blocks[] 를 씀 → blocks 우선 탐색
                                 xlsx_ref = None
                                 for _blk in (psec.get('blocks') or []):
                                     if not isinstance(_blk, dict):
                                         continue
-                                    _kind = (_blk.get('kind') or '').lower()
                                     _url = _blk.get('url') or _blk.get('file_url') or ''
                                     _fname = _blk.get('file_name') or ''
                                     _all = (_url + ' ' + _fname).lower()
@@ -14145,7 +7671,7 @@ def _sync_report_to_notes(it: dict) -> None:
                                             sec['sales_source'] = {
                                                 'file_name': local_path.name,
                                                 'file_url': str(xlsx_ref),
-                                                'parsed_at': __import__('datetime').datetime.now().isoformat(timespec='seconds'),
+                                                'parsed_at': datetime.now().isoformat(timespec='seconds'),
                                                 'parsed': parsed,
                                             }
                                             sec['sales_prices'] = prices
@@ -14157,16 +7683,18 @@ def _sync_report_to_notes(it: dict) -> None:
                                             parsed_ok = True
                                         except Exception as _pe:
                                             print(f'[sales_xlsx parse ERROR] {xlsx_ref} :: {_pe}')
-
-                                # 2) fallback: sales_data (JSON)
+                                # -----------------------------------------------------------
+                                # fallback: sales_data (JSON)
+                                # -----------------------------------------------------------
                                 if not parsed_ok and isinstance(sd, dict) and (sd.get('prices') or sd.get('weeks')):
                                     sec['sales_data'] = sd
                                     r = compute_sales_from_data(sd)
                                     sec['sales_summary'] = r['sales_summary']
                                     sec['sales_computed_at'] = r['sales_computed_at']
                                     parsed_ok = True
-
-                                # 3) fallback: sales_input (구식 텍스트)
+                                # -----------------------------------------------------------
+                                # fallback: sales_input (구식 텍스트)
+                                # -----------------------------------------------------------
                                 if not parsed_ok and si:
                                     sec['sales_input'] = si
                                     r = compute_sales_from_input(si)
@@ -14175,17 +7703,17 @@ def _sync_report_to_notes(it: dict) -> None:
                                 break
         except Exception as _e:
             print(f'[sales_compute in sync ERROR] {_e}')
-        
+
         # notes.json upsert
         from datetime import datetime
         data = _load_notes()
         notes_map = data.setdefault('notes', {})
         existing = notes_map.get(division_id) or {}
         existing_cards = existing.get('cards') or []
-        
+
         def _norm_title(t):
             return re.sub(r'\s+', '', (t or '').strip()).lower()
-        
+
         by_title = {}
         order = []
         for c in existing_cards:
@@ -14196,7 +7724,7 @@ def _sync_report_to_notes(it: dict) -> None:
                 continue
             by_title[tkey] = c
             order.append(tkey)
-        
+
         def _merge_card_preserve_manual_state(old_card, new_card):
             try:
                 def _norm_text(x):
@@ -14314,14 +7842,14 @@ def _sync_report_to_notes(it: dict) -> None:
             else:
                 by_title[tkey] = c
                 order.append(tkey)
-        
+
         merged_cards = [by_title[k] for k in order]
-        
+
         report_date = ''
         meta = it.get('report_meta') or {}
         if isinstance(meta, dict):
             report_date = meta.get('date', '') or ''
-        
+
         existing_out = notes_map.get(division_id) or {}
         existing_cards_out = list(existing_out.get('cards') or [])
 
@@ -14359,15 +7887,80 @@ def _sync_report_to_notes(it: dict) -> None:
         print(f'[sync_report_to_notes ERROR] {e}')
         traceback.print_exc()
 
+# ============================================================
+#  사업부 열 구성 · 화면 스위치 · 앱 숨기기 · 용어
+# ============================================================
+# 사업부별 양식 열 구성 (division_columns) ← admin v2 _mdlColSpecLoad()
+@app.get("/admin/division-columns")
+def admin_division_columns(_admin: int = Depends(get_admin_session)):
+    return {d: _dcol.columns_for(d) for d in _dcol.SHAPES}
 
+
+# ============================================================
+#  사업부마다 무엇을 보이고 무엇을 숨길까
+# ============================================================
+# 사업부마다 앱에 보이나. admin 화면의 체크박스가 이걸 그린다 ← admin v2 saveAppVis()
+@app.get("/admin/divisions/app-visibility")
+def admin_division_app_visibility(_admin: int = Depends(get_admin_session)):
+    hidden = _dvis.hidden_set()
+    return {
+        "divisions": [
+            {
+                "id": d.get("id"),
+                "label": d.get("label"),
+                "order": d.get("order", 999),
+                "app_visible": str(d.get("id") or "").lower() not in hidden,
+            }
+            for d in _cl.get_divisions(visible_only=True)
+        ],
+        "hidden": sorted(hidden),
+    }
+
+
+# 숨김 목록을 통째로 갈아 끼운다 ← admin v2 saveAppVis()
+@app.post("/admin/divisions/app-visibility")
+async def admin_set_division_app_visibility(
+    payload: dict = Body(...),
+    _admin: int = Depends(get_admin_session),
+):
+    ids = payload.get("hidden")
+    if not isinstance(ids, list):
+        raise HTTPException(status_code=400,
+                            detail="hidden 목록을 보내 주세요")
+    known = {str(d.get("id") or "").lower()
+             for d in _cl.get_divisions(visible_only=False)}
+    unknown = [x for x in ids if str(x).strip().lower() not in known]
+    if unknown:
+        raise HTTPException(status_code=400,
+                            detail="모르는 사업부입니다: %s" % ", ".join(map(str, unknown)))
+    got = _dvis.replace(ids)
+    return {"ok": True, "hidden": sorted(got)}
+
+
+# 그 사업부의 용어 사전. 양식 '용어' 시트에서 온다
+@app.get("/divisions/{division_id}/terms")
+def division_terms(division_id: str):
+    return JSONResponse(
+        {"division_id": division_id, "terms": _dterm.get(division_id)},
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+# 어느 사업부에서 무엇을 보일까. 앱과 admin 이 같은 답을 본다 ← admin v2 _divUiLoad()
+@app.get("/divisions/ui")
+def divisions_ui():
+    return JSONResponse(
+        _dcol.all_ui(),
+        # 스위치를 올리고 앱을 다시 켰는데 옛 값이 오면 안 고쳐진 줄 안다.
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+# ============================================================
+#  admin 모델 표 (보기 · 예전 고치기 길)
+# ============================================================
+# admin용 모델 목록 조회 ← admin v2 mdlRefresh() · loadModels() · saveModels()
 @app.get("/admin/projects/{project_key}/models")
 def admin_get_project_models(project_key: str, _admin: int = Depends(get_admin_session)):
-    """admin용 모델 목록 조회.
-
-    지연 여부는 모델 안에 넣지 않고 따로 내려준다. 이 화면이 고친 모델을
-    그대로 PUT 으로 돌려보내기 때문에, 계산해서 얹은 값이 models.json 에
-    눌러앉는다. 한 번 저장되면 날짜가 지나도 안 바뀌는 가짜 지연이 된다.
-    """
     models = _get_project_models(project_key)
     return {
         "project_key": project_key,
@@ -14376,8 +7969,8 @@ def admin_get_project_models(project_key: str, _admin: int = Depends(get_admin_s
     }
 
 
+# 모델 id → {kind, why}.
 def _admin_model_alerts(models) -> dict:
-    """모델 id → {kind, why}. 앱과 같은 규칙(_model_alert)을 쓴다."""
     out = {}
     for m in (models or []):
         mid = str((m or {}).get("id") or "")
@@ -14398,8 +7991,8 @@ def _admin_model_alerts(models) -> dict:
     return out
 
 
+# 왜 그렇게 봤는지 한 줄. 빈칸으로 두면 화면에서 따질 근거가 없다
 def _alert_why(m: dict, disp: str, expected: str, kind: str) -> str:
-    """왜 그렇게 봤는지 한 줄. 빈칸으로 두면 화면에서 따질 근거가 없다."""
     manual = str((m or {}).get("status") or "").strip()
     if manual in ("지연", "주의"):
         return "상태를 %s 으로 지정" % manual
@@ -14424,11 +8017,9 @@ def _alert_why(m: dict, disp: str, expected: str, kind: str) -> str:
         else ("%s완료예정 %s · %d일 남음" % (head, expected, left))
 
 
+# 모델 단건 추가. 같은 id가 이미 있으면 409 반환 ← admin v2 mdlRefresh() · loadModels() · saveModels()
 @app.post("/admin/projects/{project_key}/models")
 def admin_add_model(project_key: str, payload: dict, _admin: int = Depends(get_admin_session)):
-    """모델 단건 추가. 같은 id가 이미 있으면 409 반환.
-    payload: {"id": "cup-100", "name": "CUP-100", "group": "양산", "progress": 35, "status": "지연"}
-    """
     _alias = {
         "havaplate": "hrva_plate",
         "hrvaplate": "hrva_plate",
@@ -14442,16 +8033,16 @@ def admin_add_model(project_key: str, payload: dict, _admin: int = Depends(get_a
     if norm is None:
         raise HTTPException(status_code=400, detail="모델명이 필요하거나 ID가 중복됩니다.")
     proj.setdefault("models", []).append(norm)
+    # 양산을 앞에, 개발을 뒤에 (같은 구분 안에서는 원래 순서 그대로)
     proj["models"].sort(key=lambda m: 0 if m.get("group") == "양산" else 1)
     _save_models(data)
     print(f"[models] POST {_key}: +{norm['id']} ({len(proj['models'])} models)")
     return {"ok": True, "project_key": _key, "model": norm, "total": len(proj["models"])}
 
 
+# 모델 단건 수정 (부분 업데이트) payload: 변경할 필드만 {"name": "...", "progress": 50, ...}
 @app.patch("/admin/projects/{project_key}/models/{model_id}")
 def admin_update_model(project_key: str, model_id: str, payload: dict, _admin: int = Depends(get_admin_session)):
-    """모델 단건 수정 (부분 업데이트)
-    payload: 변경할 필드만 {"name": "...", "progress": 50, ...}"""
     from urllib.parse import unquote
     model_id = unquote(model_id)
     _alias = {
@@ -14501,9 +8092,9 @@ def admin_update_model(project_key: str, model_id: str, payload: dict, _admin: i
     return {"ok": True, "project_key": _key, "model": target}
 
 
+# 모델 단건 삭제
 @app.delete("/admin/projects/{project_key}/models/{model_id}")
 def admin_delete_model(project_key: str, model_id: str, _admin: int = Depends(get_admin_session)):
-    """모델 단건 삭제"""
     from urllib.parse import unquote
     model_id = unquote(model_id)
     _alias = {
@@ -14527,14 +8118,10 @@ def admin_delete_model(project_key: str, model_id: str, _admin: int = Depends(ge
 #: 화면에서도 고치고 엑셀로도 들어오는 칸. 둘이 부딪히는 자리다.
 _SAVE_GUARDED = ("price", "material_cost", "po_qty", "shipped_qty")
 
-
+# ============================================================
+#  화면에서 고치는 길을 닫는다 — 기준은 엑셀 하나
+# ============================================================
 def _save_untouched(f, sent, base) -> bool:
-    """보낸 값이 '열 때 받은 값' 과 같은가 = 사람이 안 건드린 칸인가.
-
-    화면은 숫자를 '1,117' 처럼 쉼표를 넣어 보여주고 보낼 때 떼는데, 떼는
-    자리가 한 군데가 아니라서 글자로 올 수도 숫자로 올 수도 있다. 숫자로
-    읽히면 숫자끼리, 아니면 글자끼리 본다.
-    """
     def num(v):
         try:
             return float(str(v if v is not None else "").replace(",", "").strip() or 0)
@@ -14547,16 +8134,7 @@ def _save_untouched(f, sent, base) -> bool:
     return str(sent or "").strip() == str(base or "").strip()
 
 
-# ══════════════════════════════════════════════════════════════════
-#  화면에서 고치는 길을 닫는다 — 기준은 엑셀 하나다 (2026-10-22)
-# ══════════════════════════════════════════════════════════════════
-#
-# 화면 쪽(admin_v2.html)만 잠그면 반쪽이다. 브라우저 콘솔 한 줄, 열어 둔
-# 옛 탭, 북마크해 둔 주소로 여전히 같은 요청이 나간다. 그렇게 들어온
-# 저장은 엑셀이 들고 온 값을 조용히 덮어쓴다 — 아무도 못 본다.
-# 들어오는 자리에서 막는다.
-#
-# 되돌리려면 이 한 줄을 False 로 둔다. 화면 쪽 MODELS_READONLY 와 짝이다.
+# 화면 쪽(admin_v2.html)만 잠그면 반쪽이다
 ADMIN_WRITE_OFF = True
 
 #: 막는 자리와, 사람에게 대신 알려줄 길
@@ -14567,8 +8145,155 @@ _WRITE_OFF_WHERE = {
 }
 
 
+# ==== admin 은 보기 전용 — 손으로 바꾸는 길을 전부 닫는다
+_ADMIN_LOCKED = [
+    # 모델 · 공정 · 주차 계획 직접 입력
+    ("POST", "/admin/projects/{project_key}/models"),
+    ("PATCH", "/admin/projects/{project_key}/models/{model_id}"),
+    ("DELETE", "/admin/projects/{project_key}/models/{model_id}"),
+    ("PUT", "/admin/projects/{project_key}/models"),
+    ("PUT", "/admin/projects/{project_key}/types"),
+    ("PUT", "/admin/projects/{project_key}/status-note"),
+    ("DELETE", "/admin/projects/{project_key}/weekly-plan"),
+    ("POST", "/admin/projects/{project_key}/models/alias"),
+    ("PUT", "/admin/projects/{project_key}/model-weekly-plan"),
+    ("PUT", "/admin/projects/{project_key}/model-process"),
+    ("POST", "/admin/projects/{project_key}/model-process/step-status"),
+    ("PUT", "/admin/projects/{project_key}/group-weekly-plan"),
+    ("PUT", "/admin/projects/{project_key}/group-summary"),
+    ("PUT", "/admin/projects/{project_key}/week-reason"),
+    ("PUT", "/admin/projects/{project_key}/board-rows"),
+    ("PUT", "/admin/projects/{project_key}/models/{model_id}/weekly-plan"),
+    ("PUT", "/admin/projects/{project_key}/process-lead"),
+    ("POST", "/admin/projects/{project_key}/models/{model_id}/process/step-status"),
+    ("PUT", "/admin/projects/{project_key}/models/{model_id}/process"),
+    # 이름 맞추기를 손으로 고치는 길
+    ("POST", "/admin/projects/resolve"),
+    ("POST", "/admin/projects/alias"),
+    # KPI 직접 입력
+    ("POST", "/admin/kpi/{project_key}/months"),
+    ("POST", "/admin/kpi/{project_key}/weeks"),
+    ("POST", "/admin/kpi/{project_key}/issue_lines"),
+    # 목표 · 예상 · 매입 · 잔특근 · 수주 직접 입력
+    ("POST", "/admin/home/division-target"),
+    ("PUT", "/admin/home/orders"),
+    ("POST", "/admin/revenue/estimate"),
+    ("POST", "/admin/revenue/target"),
+    ("PUT", "/admin/division/purchase"),
+    ("PUT", "/admin/overtime"),
+    # 사업부 노트 편집 · 삭제
+    ("POST", "/admin/notes/from_pptx"),
+    ("POST", "/admin/notes/ai_parse"),
+    ("POST", "/admin/notes"),
+    ("POST", "/admin/notes/item/due_override"),
+    ("DELETE", "/admin/notes/item/due_override"),
+    ("POST", "/admin/notes/item/hide_auto_due"),
+    ("DELETE", "/admin/notes/item/hide_auto_due"),
+    ("DELETE", "/admin/notes/{division_id}"),
+    ("POST", "/admin/notes/table"),
+    ("DELETE", "/admin/notes/table/{division_id}/{asset_id}"),
+    ("POST", "/admin/notes/photo"),
+    ("POST", "/admin/notes/excel"),
+    ("DELETE", "/admin/notes/photo/{division_id}/{filename}"),
+    ("POST", "/admin/notes/section/sales_input"),
+    ("POST", "/admin/notes/section/sales_recompute"),
+    # 보고 카드 만들기 · 고치기 · 지우기 · 통째로 비우기
+    ("POST", "/admin/reports"),
+    ("PUT", "/admin/reports/{doc_id}"),
+    ("DELETE", "/admin/reports/{doc_id}"),
+    ("POST", "/admin/reports/{doc_id}/edit_done"),
+    ("POST", "/admin/reports/{doc_id}/section-file"),
+    ("POST", "/admin/reports/{doc_id}/section-parse-xlsx"),
+    ("POST", "/admin/reports/{doc_id}/polish-text"),
+    ("POST", "/admin/reports/{doc_id}/hide"),
+    ("DELETE", "/admin/doc/{doc_id}"),
+    ("POST", "/admin/docs/delete-batch"),
+    ("DELETE", "/admin/card"),
+    ("POST", "/admin/reset"),
+]
+
+_ADMIN_OPEN = [
+    # 로그인
+    ("POST", "/admin/login"), ("POST", "/admin/logout"), ("POST", "/admin/extend"),
+    # 파일로 들어오는 길 — 자료는 이 길로만 바뀐다
+    ("POST", "/admin/divisions/{division_id}/form/preview"),
+    ("POST", "/admin/divisions/{division_id}/form/apply"),
+    ("POST", "/admin/divisions/{division_id}/dev-schedule/preview"),
+    ("POST", "/admin/divisions/{division_id}/dev-schedule/apply"),
+    ("POST", "/admin/divisions/{division_id}/daily/preview"),
+    ("POST", "/admin/divisions/{division_id}/daily/apply"),
+    ("POST", "/admin/projects/{project_key}/bloom-daily/preview"),
+    ("POST", "/admin/projects/{project_key}/bloom-daily"),
+    ("POST", "/admin/divisions/{division_id}/revenue-file/preview"),
+    ("POST", "/admin/divisions/{division_id}/revenue-file/apply"),
+    ("POST", "/admin/revenue/import"),
+    ("POST", "/admin/revenue/estimate/import"),
+    ("POST", "/admin/overtime/import-xlsx"),
+    ("POST", "/admin/division/purchase/import-xlsx"),
+    ("POST", "/admin/kpi/{project_key}/upload_excel"),
+    ("POST", "/admin/projects/{project_key}/weekly-plan"),
+    ("POST", "/admin/projects/{project_key}/price-import-xlsx"),
+    ("POST", "/admin/projects/{project_key}/import-xlsx"),
+    ("POST", "/admin/projects/{project_key}/process/import-xlsx"),
+    ("POST", "/admin/projects/{project_key}/weekly-summary-import"),
+    ("POST", "/admin/projects/{project_key}/report-import"),
+    # 사업부 양식이 대신해서 _form_only 가 따로 닫아 둔 길 (여기서는 열어 둔다)
+    ("POST", "/admin/projects/{project_key}/models/import"),
+    ("POST", "/admin/projects/{project_key}/plan-file/preview"),
+    ("POST", "/admin/projects/{project_key}/plan-file/apply"),
+    ("POST", "/admin/projects/{project_key}/status-excel"),
+    ("POST", "/admin/automotive/product-import/preview"),
+    ("POST", "/admin/automotive/product-import/apply"),
+    # 앱 배포 (release.sh) · 백업 · 복구 · 운영
+    ("POST", "/admin/app/release"),
+    ("POST", "/admin/backups/run"), ("POST", "/admin/backups/prune"),
+    ("POST", "/admin/backups/restore"),
+    ("POST", "/admin/models/restore"), ("POST", "/admin/models/restore-missing"),
+    ("POST", "/admin/projects/{project_key}/process-restore"),
+    ("POST", "/admin/rag/rebuild"), ("POST", "/admin/fcm-test"),
+    # 앱에서 어느 사업부를 숨길지 — 자료가 아니라 보이기 설정이다
+    ("POST", "/admin/divisions/app-visibility"),
+]
+
+# ============================================================
+#  admin 잠금 — 고치기 · 지우기 막기
+# ============================================================
+def _route_re(template: str):
+    import re as _re
+    return _re.compile("^" + _re.sub(r"\\\{[^}]+\\\}", "[^/]+", _re.escape(template)) + "/?$")
+
+
+_ADMIN_LOCKED_RE = [(m, _route_re(t)) for m, t in _ADMIN_LOCKED]
+
+
+# 이 주소가 admin 잠금 목록에 있나 (고치기·지우기 막기).
+def _admin_locked(method: str, path: str) -> bool:
+    m = str(method or "").upper()
+    return any(m == lm and rx.match(path or "") for lm, rx in _ADMIN_LOCKED_RE)
+
+
+# 모든 요청이 지나가는 문 (미들웨어)
+@app.middleware("http")
+async def _admin_write_lock(request: Request, call_next):
+    if ADMIN_WRITE_OFF and request.url.path.startswith("/admin/") \
+            and _admin_locked(request.method, request.url.path):
+        # 423 Locked — 막혔다는 걸 화면이 알아보고 안내를 띄운다
+        return JSONResponse(status_code=423, content={
+            "detail": ("admin 에서는 자료를 고치거나 지울 수 없습니다. "
+                       "사업부 양식(또는 해당 엑셀)으로 올려 주세요."),
+            "locked": True})
+    return await call_next(request)
+
+
+# 화면이 받아 가는 잠금 목록. 화면에 따로 적어 두면 서버와 갈린다 ← admin v2 fetch()
+@app.get("/admin/write-lock")
+def admin_write_lock_info(_admin: int = Depends(get_admin_session)):
+    return {"on": bool(ADMIN_WRITE_OFF),
+            "locked": [[m, t] for m, t in _ADMIN_LOCKED]}
+
+
+# 막혀 있으면 403 으로 돌려보낸다
 def _write_off(what: str):
-    """막혀 있으면 403 으로 돌려보낸다. 안 막혀 있으면 아무 일도 안 한다."""
     if not ADMIN_WRITE_OFF:
         return
     raise HTTPException(
@@ -14577,14 +8302,12 @@ def _write_off(what: str):
                 + " — 화면에서 고치지 않습니다. "
                   "'주차별 계획' 탭에서 양식을 받아 고친 뒤 올려 주세요."))
 
-
+# ============================================================
+#  모델 목록 통째로 저장
+# ============================================================
+# admin용 모델 목록 저장 (전체 교체) ← admin v2 mdlRefresh() · loadModels() · saveModels()
 @app.put("/admin/projects/{project_key}/models")
 def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depends(get_admin_session)):
-    """admin용 모델 목록 저장 (전체 교체) - dev_type/process/weekly_plan/status_note 보존
-
-    2026-10-22 — 막혀 있다. 모델 정보는 엑셀로만 바꾼다. 함수는 지우지
-    않는다 — 지우면 되살릴 자리를 잊는다.
-    """
     _write_off("models")
     _alias = {
         "havaplate": "hrva_plate",
@@ -14623,12 +8346,7 @@ def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depe
             continue
         mid = str(m.get("id") or "").strip()
         name = str(m.get("name") or "").strip()
-        # 이름이 비어 있어도 버리지 않는다.
-        #
-        # 품번만 있고 따로 부르는 이름이 없는 것들(아리스타 PCB)은 빈 칸이
-        # 맞다. 예전에는 여기서 버려서, 화면이 그 줄을 돌려보내는 순간
-        # 조용히 사라졌다 — 81종 중 13종이 그랬고, '지웁니다' 경고(409)로만
-        # 겨우 드러났다. 열쇠는 id 다. id 가 없는 줄만 버린다.
+        # 이름이 비어 있어도 버리지 않는다
         if not mid:
             continue
         if mid in seen_ids:
@@ -14652,11 +8370,7 @@ def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depe
         except (ValueError, TypeError):
             material_cost = 0
         old = old_map.get(mid) or {}
-        # 서버에 있던 것을 바탕으로 깔고, 이 화면에서 고치는 칸만 덮는다.
-        #
-        # 예전에는 빈 도시락에 아는 칸만 담았다. 그래서 이 화면이 모르는 칸
-        # (엑셀이 넣어 둔 소재 · 월 실적 같은 것)은 저장할 때마다 조용히
-        # 사라졌다 — "고치기만 했는데 엑셀에서 끌어온 게 다 날아간다".
+        # 서버에 있던 것을 바탕으로 깔고, 이 화면에서 고치는 칸만 덮는다
         entry = dict(old)
         entry.update({
             "id": mid,
@@ -14675,15 +8389,7 @@ def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depe
             # 이슈와 별개로 자유롭게 적는 비고(메모)
             "note": str(m.get("note") or ""),
         })
-        # 화면을 연 뒤 다른 곳(엑셀 업로드·주차 입력)에서 들어간 값을 지킨다.
-        #
-        # 저장은 화면이 들고 있던 목록을 통째로 보낸다. 그 사본은 화면을 열
-        # 때 받은 것이라, 그 사이에 엑셀로 들어온 PO·판가를 모른다. 사람이
-        # 안 건드린 칸까지 보낸 값으로 쓰면 그게 옛 값으로 되돌아간다.
-        #
-        # 판가는 여기서 되돌려야 한다 — 아래 _apply_price_change 가
-        # entry 와 old 를 비교하므로, 되돌려 두면 '안 바뀐 것' 이 되어
-        # 쓸데없는 판가 구간이 안 생긴다.
+        # 화면을 연 뒤 다른 곳(엑셀 업로드·주차 입력)에서 들어간 값을 지킨다
         _b = base_map.get(mid)
         if isinstance(_b, dict):
             for _f in _SAVE_GUARDED:
@@ -14692,16 +8398,7 @@ def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depe
                 if _save_untouched(_f, m.get(_f), _b.get(_f)):
                     entry[_f] = old[_f]
 
-        # 이 화면에서 편집하지 않는 묶음은 서버에 있는 것을 그대로 둔다.
-        #
-        # 예전에는 보낸 값을 먼저 봤다. 목록 화면은 열 때 받아 둔 사본을
-        # 저장할 때 그대로 돌려보내므로, 그 사이에 다른 곳(주차 계획 입력,
-        # 엑셀 업로드, Process 입력)에서 들어간 내용이 옛날 값으로 덮여
-        # 되돌아갔다. 파워박스 9월 주차 계획이 그렇게 사라졌다.
-        #
-        #   weekly_plan/progress/summary : 주차별 계획·실적 (별도 화면·엑셀)
-        #   current_expected/stage       : 프로세스에서 계산해 넣는 값
-        #   auto                         : 자동차사업부 원가·계약 묶음
+        # 이 화면에서 편집하지 않는 묶음은 서버에 있는 것을 그대로 둔다
         for _keep in ("weekly_plan", "weekly_progress", "weekly_summary",
                       "current_expected", "current_stage", "auto"):
             if old.get(_keep) is not None:
@@ -14729,11 +8426,7 @@ def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depe
             sent=m)
         if _chg:
             _price_changes.append(_chg)
-        # 프로세스는 이 화면에서 편집하지 않는다. 그런데 목록을 열 때 받아 둔
-        # 사본을 저장할 때 같이 돌려보내서, 그 사이에 'Process 입력' 에서
-        # 고친 내용이 옛날 값으로 덮여 되돌아갔다.
-        # 보낸 값을 무시하고 서버에 있는 것을 그대로 둔다 — 프로세스를 바꾸는
-        # 문은 PUT .../models/{id}/process 하나뿐이어야 한다.
+        # 프로세스는 이 화면에서 편집하지 않는다
         _proc = old.get("process")
         # 유형을 '—' 로 비우고 저장하면 지워져야 한다. 빈 값을 '안 보냈다' 로
         # 보고 옛 값을 되살리면, 화면에서는 비웠는데 저장하면 DEP챔버 가
@@ -14762,12 +8455,11 @@ def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depe
                 entry["process"] = _proc
         normalized.append(entry)
 
+    # 양산을 앞에, 개발을 뒤에 (같은 구분 안에서는 원래 순서 그대로)
+
     normalized.sort(key=lambda m: 0 if m.get("group") == "양산" else 1)
 
-    # 이 저장으로 사라지는 모델. '전체 교체' 라 화면이 목록을 덜 들고
-    # 저장하면 나머지가 통째로 지워진다 — 실제로 챔버 19종·SpaceX 16종이
-    # 그렇게 날아갔다. 사람이 정말 지운 것이면 화면이 allow_delete 를 같이
-    # 보낸다. 안 보내고 많이 지우려 하면 저장을 거부한다.
+    # 이 저장으로 사라지는 모델. '전체 교체' 라 화면이 목록을 덜 들고 저장하면 나머지가 통째로 지워진다 — 실제로 챔버 19종·SpaceX 16종이 그렇게 날아갔다
     _gone = [mid for mid in old_map if mid not in seen_ids]
     _allow = bool(payload.get("allow_delete"))
     if (_price_mode != "preview" and _gone and not _allow
@@ -14798,50 +8490,44 @@ def admin_put_project_models(project_key: str, payload: dict, _admin: int = Depe
 
 # ─── 프로젝트별 유형(types) 관리 ───
 
+# ============================================================
+#  모델 유형 · 현황 메모
+# ============================================================
 def _get_project_types(project_key: str) -> list:
-    """프로젝트의 유형 목록.
-
-    엑셀로 올라온 모델은 유형(dev_type)이 붙어 있는데 이 목록에는 없을 수
-    있다. 챔버가 그랬다 — 모델 14개가 'DEP챔버' 인데 목록이 비어 있어서
-    admin 표에서 유형 칸이 '—' 로 보였고(있는 값을 못 그림), 그 줄을 저장하면
-    빈 값으로 덮여 주차별 현황의 'Dep 챔버' 줄이 통째로 비었다.
-    그래서 실제로 쓰이는 유형을 목록에 합쳐서 돌려준다.
-    """
     data = _read_json(MODELS_FILE, {})
     proj = data.get("projects", {}).get(project_key, {})
     types = proj.get("types")
     out = [t for t in types if isinstance(t, str) and t.strip()] if isinstance(types, list) else []
+    gone = {t for t in (proj.get("types_removed") or [])
+            if isinstance(t, str) and t.strip()}
     seen = {t for t in out}
     extra = []
     for m in proj.get("models") or []:
         if not isinstance(m, dict):
             continue
         t = str(m.get("dev_type") or "").strip()
-        if t and t not in seen:
+        if t and t not in seen and t not in gone:
             seen.add(t)
             extra.append(t)
     return out + sorted(extra)
 
 
+# 프로젝트의 모델 유형 목록 (앱) ← admin v2 loadProjectTypes() · loadTypes() · saveTypes()
 @app.get("/projects/{project_key}/types")
 def get_project_types(project_key: str):
     return {"project_key": project_key, "types": _get_project_types(project_key)}
 
 
+# 프로젝트의 모델 유형 목록 (admin) ← admin v2 loadProjectTypes() · loadTypes() · saveTypes()
 @app.get("/admin/projects/{project_key}/types")
 def get_admin_project_types(project_key: str, _admin: int = Depends(get_admin_session)):
     return {"project_key": project_key, "types": _get_project_types(project_key)}
 
 
+# 프로젝트별 유형 목록 저장 ← admin v2 loadProjectTypes() · loadTypes() · saveTypes()
 @app.put("/admin/projects/{project_key}/types")
 def save_project_types(project_key: str, payload: dict,
                        _admin: int = Depends(get_admin_session)):
-    """프로젝트별 유형 목록 저장.
-
-    유형은 보드에서 줄을 묶는 기준이라, 통째로 갈아끼우면 그 유형으로 묶이던
-    줄이 사라진다. 바로 위 GET 에는 관리자 확인이 걸려 있는데 이 PUT 만
-    빠져 있었다.
-    """
     types = payload.get("types")
     if not isinstance(types, list):
         raise HTTPException(status_code=400, detail="types는 배열이어야 합니다")
@@ -14850,12 +8536,23 @@ def save_project_types(project_key: str, payload: dict,
     data = _read_json(MODELS_FILE, {})
     proj = data.setdefault("projects", {}).setdefault(project_key, {"models": []})
     proj["types"] = types
+    # 모델이 쓰고 있는데 목록에서 빠진 것 = 사람이 지운 것.
+    # 적어 두지 않으면 다음에 읽을 때 모델을 보고 도로 끼워 넣는다.
+    used = set()
+    for m in proj.get("models") or []:
+        if isinstance(m, dict):
+            t = str(m.get("dev_type") or "").strip()
+            if t:
+                used.add(t)
+    proj["types_removed"] = sorted(used - set(types))
     _save_models(data)
-    return {"ok": True, "project_key": project_key, "types": types}
+    return {"ok": True, "project_key": project_key, "types": types,
+            "removed": proj["types_removed"]}
 
 
 # ─── 프로젝트 현황 메모 ───
 
+# 프로젝트 현황 메모 (앱 상세) ← admin v2 back.onclick()
 @app.get("/projects/{project_key}/status-note")
 def get_project_status_note(project_key: str):
     _key = _model_key_alias(project_key)
@@ -14864,24 +8561,17 @@ def get_project_status_note(project_key: str):
             "hold": _project_hold(proj), "hold_reason": _project_hold_reason(proj)}
 
 
+# 프로젝트 현황 메모 저장 (앱 프로젝트 화면에 표시) ← admin v2 back.onclick()
 @app.put("/admin/projects/{project_key}/status-note")
 def put_project_status_note(project_key: str, payload: dict,
                             _admin: int = Depends(get_admin_session)):
-    """프로젝트 현황 메모 저장 (앱 프로젝트 화면에 표시).
-
-    2026-10-22 — 막혀 있다. 현황 글은 프로젝트 전체를 보류 · 드롭으로
-    돌리는 근거라서(_project_hold), 모델 정보와 같은 기준을 따라야 한다.
-    """
     _write_off("status-note")
     note = str((payload or {}).get("note") or "").strip()
     _key = _model_key_alias(project_key)
     data = _load_models()
     proj = data.setdefault("projects", {}).setdefault(_key, {"models": []})
     proj["status_note"] = note
-    # admin 에서 직접 고른 값이 문구보다 우선한다. 다만 빈 문자열은
-    # '진행을 골랐다' 가 아니라 '그 칸이 화면에 없었다' 는 뜻이다. 그걸
-    # 수동 해제로 읽으면, 현황 메모만 고쳐도 보류가 영구히 풀리고
-    # hold_source='manual' 때문에 문구에서 다시 살아나지도 못한다.
+    # admin 에서 직접 고른 값이 문구보다 우선한다
     _h = str((payload or {}).get("hold") or "").strip()
     if _h:
         if _h in ("진행", "해제", "없음"):
@@ -14904,9 +8594,12 @@ def put_project_status_note(project_key: str, payload: dict,
 
 # ─── 주차별 계획 (프로젝트당 1개) ───
 
+# ============================================================
+#  주차별 계획표 (이미지)
+# ============================================================
+# 프로젝트 주차별 계획 조회 (앱용) ← admin v2 loadWeekMarks() · 앱 project_overview_screen.dart _loadBloom() 외
 @app.get("/projects/{project_key}/weekly-plan")
 def get_weekly_plan(project_key: str):
-    """프로젝트 주차별 계획 조회 (앱용)"""
     _alias = {
         "havaplate": "hrva_plate",
         "hrvaplate": "hrva_plate",
@@ -14928,13 +8621,13 @@ def get_weekly_plan(project_key: str):
     }
 
 
+# 주차별 계획 엑셀 업로드 → 첫 시트를 PNG로 변환 → 저장 (보고서 엑셀과 동일 방식)
 @app.post("/admin/projects/{project_key}/weekly-plan")
 async def admin_upload_weekly_plan(
     project_key: str,
     file: UploadFile = File(...),
     _admin: int = Depends(get_admin_session),
 ):
-    """주차별 계획 엑셀 업로드 → 첫 시트를 PNG로 변환 → 저장 (보고서 엑셀과 동일 방식)"""
     _alias = {
         "havaplate": "hrva_plate",
         "hrvaplate": "hrva_plate",
@@ -14954,7 +8647,7 @@ async def admin_upload_weekly_plan(
         import openpyxl
         from io import BytesIO
         import base64
-        wb = openpyxl.load_workbook(BytesIO(raw), data_only=True)
+        wb = openpyxl.load_workbook(BytesIO(raw), data_only=True, keep_links=False)
         ws = wb.worksheets[0]
         data_url = _excel_sheet_to_preview_data_url(ws)
         b64 = data_url.split(",", 1)[1]
@@ -14981,12 +8674,13 @@ async def admin_upload_weekly_plan(
     except Exception as _e_mw:
         _marked = []
         print(f"[weekly_plan] 표시 주차 감지 실패: {_e_mw}")
-
-    # ── '구분 x 주차' 표면 모델별 주차 계획까지 자동 반영 ──
+    # -----------------------------------------------------------
+    # '구분 x 주차' 표면 모델별 주차 계획까지 자동 반영
+    # -----------------------------------------------------------
     _applied = None
     try:
         import plan_matrix_import as _pmi
-        _wb_fresh = openpyxl.load_workbook(BytesIO(raw), data_only=True)
+        _wb_fresh = openpyxl.load_workbook(BytesIO(raw), data_only=True, keep_links=False)
         _parsed = _pmi.parse_plan_matrix(_wb_fresh)
         if _parsed.get("rows"):
             _applied = _apply_plan_matrix(data, _key, _parsed)
@@ -14996,7 +8690,7 @@ async def admin_upload_weekly_plan(
         print(f"[weekly_plan] 주차 데이터 자동 반영 실패(무시): {_e_pm}")
     proj["weekly_plan"] = {
         "file_name": orig_name,
-        "uploaded_at": __import__("datetime").datetime.now().isoformat(),
+        "uploaded_at": datetime.now().isoformat(),
         "photo_ref": photo_ref,
         "marked_weeks": _marked,
     }
@@ -15015,14 +8709,10 @@ async def admin_upload_weekly_plan(
     }
 
 
-# ── 파워박스 'Plan and Actual' 출하계획 파일 ─────────────────────────
-#
-# 파워박스팀은 매주 'PBX 9월 출하계획' 파일을 쓴다. 새 양식을 따로 만들어
-# 채우게 하는 대신, 쓰던 파일을 그대로 올려서 주차 계획/실적만 가져온다.
-#
-# PO·판가·재료비는 건드리지 않는다. 그 값들은 누적이라 여기서 잘못 덮으면
-# 되살릴 방법이 없다 (예전에 PO 3,427 이 240 으로 깎인 적이 있다).
-# 그리고 저장하기 전에 무엇이 무엇으로 바뀌는지 먼저 보여준다.
+# ============================================================
+#  파워박스 'Plan and Actual' 출하계획 파일
+# ============================================================
+# 파워박스팀은 매주 'PBX 9월 출하계획' 파일을 쓴다
 
 
 #: 주차 양식 왼쪽 칸 머리글 → 모델 필드
@@ -15035,7 +8725,7 @@ _PLAN_MODEL_COLS = {
     "재료비": "material_cost", "재료비($)": "material_cost",
     "po수량": "po_qty", "po": "po_qty",
     "실적수량": "shipped_qty",
-    # 2026-10-21 — 모델 등록 양식과 합치면서 들어온 두 칸
+    # 모델 등록 양식과 합치면서 들어온 두 칸
     "전환주차": "switch_week", "양산전환": "switch_week",
     "개발→양산전환주차": "switch_week", "개발->양산전환주차": "switch_week",
     "개발→양산": "switch_week", "개발->양산": "switch_week",
@@ -15044,15 +8734,10 @@ _PLAN_MODEL_COLS = {
 #: 목록이 여기서 끝난다
 _PLAN_STOP = ("합계", "미달사유", "총합계", "소계")
 
-
+# ============================================================
+#  계획표 엑셀 읽기 · 반영
+# ============================================================
 def _plan_sheet_models(ws) -> list:
-    """주차 양식의 왼쪽 칸에서 모델 정보를 읽는다.
-
-    우리 양식은 한 줄이 한 모델이다 — 누구인지(파트넘버·모델명·유형·구분)
-    와 그 모델 값(판가·재료비·PO·실적)이 주차 칸 왼쪽에 같이 있다.
-    남이 만든 파일에는 이 머리글이 없으니 빈 목록이 나오고, 그러면
-    예전처럼 주차 숫자만 들어간다.
-    """
     def _s2(v):
         return "" if v is None else str(v).strip()
 
@@ -15060,7 +8745,7 @@ def _plan_sheet_models(ws) -> list:
     for r in range(1, min(ws.max_row, 10) + 1):
         got = {}
         for c in range(1, min(ws.max_column, 16) + 1):
-            # 2026-10-22 — 양식이 머리글 앞에 '✎' · '=' 표를 붙여 내보낸다
+            # 양식이 머리글 앞에 '✎' · '=' 표를 붙여 내보낸다
             # (적는 칸인지 자동 계산인지 글자로 보이게). 떼고 본다.
             k = _s2(ws.cell(r, c).value).strip("✎=＝*※·•-–— \t")
             k = k.replace(" ", "").lower()
@@ -15075,12 +8760,7 @@ def _plan_sheet_models(ws) -> list:
     if not hdr or len(col) < 2:
         return []
 
-    # 2026-10-22 — 그 줄이 누구인가는 **파트넘버가 먼저**다.
-    #
-    # 양식이 바뀌었다. 품번은 늘 파트넘버 칸에 들어가고, 모델명 칸은 품번과
-    # 다른 이름이 따로 있을 때만 찬다 (챔버·CUP·하바플레이트는 품번이 곧
-    # 이름이라 모델명 칸이 비어 있다). 전처럼 모델명 칸만 보면 그런 줄은
-    # 이름이 없다고 통째로 건너뛰어, 판가·재료비·PO·실적이 하나도 안 들어간다.
+    # 그 줄이 누구인가는 **파트넘버가 먼저**다
     out = []
     _idc = col.get("part_number") or col.get("name") or 1
     for r in range(hdr + 1, ws.max_row + 1):
@@ -15094,7 +8774,7 @@ def _plan_sheet_models(ws) -> list:
             name = _s2(ws.cell(r, col["name"]).value)
         if not name:
             continue
-        # 빈 양식에 얹어 둔 예시 줄은 모델로 만들지 않는다 (2026-10-22)
+        # 빈 양식에 얹어 둔 예시 줄은 모델로 만들지 않는다
         try:
             import pbx_plan_import as _pbxe
             if _pbxe._is_example(name):
@@ -15123,12 +8803,8 @@ def _plan_sheet_models(ws) -> list:
     return out
 
 
+# 어느 시트든 모델 줄이 있는 곳 → (시트이름, [줄]).
 def _plan_models_anywhere(wb) -> tuple:
-    """어느 시트든 모델 줄이 있는 곳 → (시트이름, [줄]).
-
-    주차 머리글이 없는 파일(옛 모델 등록 양식)도 올리는 곳 하나로 받으려고
-    쓴다. 모델 줄이 가장 많은 시트를 고른다.
-    """
     best = ("", [])
     for ws in wb.worksheets:
         try:
@@ -15140,12 +8816,8 @@ def _plan_models_anywhere(wb) -> tuple:
     return best
 
 
+# 개발 프로세스 일정표인가 → {'sheet','rows','steps'} 또는 None.
 def _plan_process_peek(wb):
-    """개발 프로세스 일정표인가 → {'sheet','rows','steps'} 또는 None.
-
-    단계 머리글('01 FA PO' 처럼 숫자로 시작)이 둘 이상이면 일정표로 본다.
-    주차 양식에는 그런 머리글이 없어서 서로 헷갈리지 않는다.
-    """
     import process_import as _pi
 
     best = None
@@ -15171,17 +8843,13 @@ _PLAN_FIELDS = ("dev_type", "group", "price", "material_cost",
                 "po_qty", "shipped_qty", "switch_week", "note")
 
 
+# '덮어쓰기' 체크를 눌렀는가. 안 보내면 False (= 빈 칸만 채움).
 def _plan_over(v) -> bool:
-    """'덮어쓰기' 체크를 눌렀는가. 안 보내면 False (= 빈 칸만 채움)."""
     return str(v or "").strip().lower() in ("1", "true", "on", "yes")
 
 
+# 그 칸이 '비어 있는가'.
 def _plan_field_empty(old, f) -> bool:
-    """그 칸이 '비어 있는가'.
-
-    숫자 칸은 0 도 비어 있는 것으로 본다. PO 0 은 'PO 가 없다' 지
-    '0 대를 받았다' 가 아니고, 화면에서도 빈 칸처럼 보인다.
-    """
     if f in ("price", "material_cost", "po_qty", "shipped_qty"):
         try:
             return not float(old or 0)
@@ -15190,12 +8858,8 @@ def _plan_field_empty(old, f) -> bool:
     return not str(old or "").strip()
 
 
+# 등록된 모델과 대조 → (바뀌는 줄, 새로 생길 줄).
 def _plan_model_changes(proj, mrows):
-    """등록된 모델과 대조 → (바뀌는 줄, 새로 생길 줄).
-
-    빈 칸은 '그대로 둬라' 다. 매주 여는 파일에 원가가 같이 있으니,
-    실수로 비운 칸이 값을 지우면 안 된다.
-    """
     import pbx_plan_import as _pbx
 
     models = proj.get("models") or []
@@ -15236,13 +8900,8 @@ def _plan_model_changes(proj, mrows):
     return changed, created
 
 
+# 모델 값을 넣는다. 없는 모델은 만든다 → {'updated','created','filled','over'}
 def _plan_apply_models(proj, mrows, overwrite=False):
-    """모델 값을 넣는다. 없는 모델은 만든다 → {'updated','created','filled','over'}
-
-    overwrite=False (기본) 면 **비어 있던 칸만** 채운다. 값이 있는 칸은
-    건드리지 않는다 — 옛 파일을 다시 올려도 손으로 고친 값이 안 돌아간다.
-    덮어쓰려면 미리보기에서 골라야 한다.
-    """
     import pbx_plan_import as _pbx
 
     models = proj.setdefault("models", [])
@@ -15288,18 +8947,8 @@ def _plan_apply_models(proj, mrows, overwrite=False):
 _NOTE_FYI_HEADS = ("참고:", "참고 :", "[참고]", "참고)", "fyi:")
 
 
+# '미달 사유' 줄 → 화면의 주차 미달 사유와 같은 자리에 넣는다
 def _plan_apply_week_notes(proj, month, notes):
-    """'미달 사유' 줄 → 화면의 주차 미달 사유와 같은 자리에 넣는다.
-
-    2026-10-22 — 화면에서 하던 두 가지를 글자 규칙으로 옮겼다. 사유를
-    적는 자리가 화면과 엑셀 두 군데라 서로 덮어쓰고 있었는데, 화면 쪽을
-    닫으려면 화면에서만 되던 일이 엑셀에서도 돼야 한다.
-      · 종류 — '참고:' 로 시작하면 참고, 아니면 문제.
-               ('참고' 는 일부러 덜 출하한 주라 지연으로 안 센다)
-      · 지우기 — '-' 한 글자면 그 주 사유를 지운다.
-                 빈 칸은 '그대로 둬라' 이므로 지우는 뜻이 될 수 없다.
-                 (전환주차 칸이 쓰는 규칙과 같다)
-    """
     if not notes:
         return 0
     import datetime as _dtn
@@ -15337,9 +8986,10 @@ def _plan_apply_week_notes(proj, month, notes):
         store.pop(str(month), None)
     return n_set
 
-
+# ============================================================
+#  파워박스 계획 엑셀
+# ============================================================
 def _pbx_diff(proj, parsed):
-    """엑셀 행 ↔ 등록 모델 대조표를 만든다. 저장은 하지 않는다."""
     import pbx_plan_import as _pbx
 
     models = proj.get("models") or []
@@ -15377,28 +9027,30 @@ def _pbx_diff(proj, parsed):
         seen[mid] = entry
         rows.append(entry)
 
+    # 합계는 시트의 TOTAL 열을 믿지 않고 주차 값을 더해서 만든다.
+    # 실제 파일에서 그 열 수식이 깨져 계획이 400 대신 333 으로 나왔다.
+    total_plan = 0
+    total_actual = 0
+    for _row in rows:                 # 모델 한 줄씩
+        for _cell in _row["cells"]:   # 그 줄의 주차 칸
+            total_plan += _cell["new"]["plan"]
+            total_actual += _cell["new"]["actual"]
+
     return {
         "month": month,
         "weeks": weeks,
         "sheet": parsed.get("sheet"),
         "rows": rows,
         "unmatched": missing,
-        # 합계는 시트의 TOTAL 열을 믿지 않고 주차 값을 더해서 만든다.
-        # 실제 파일에서 그 열 수식이 깨져 계획이 400 대신 333 으로 나왔다.
         "totals": {
-            "plan": sum(c["new"]["plan"] for e in rows for c in e["cells"]),
-            "actual": sum(c["new"]["actual"] for e in rows for c in e["cells"]),
+            "plan": total_plan,
+            "actual": total_actual,
         },
     }
 
 
+# 읽어온 주차 행을 모델에 넣는다 → {'month','applied','unmatched'}.
 def _pbx_apply_rows(proj: dict, parsed: dict) -> dict:
-    """읽어온 주차 행을 모델에 넣는다 → {'month','applied','unmatched'}.
-
-    /plan-file/apply 가 하는 일과 같다. 하바 현황 엑셀처럼 '주차표가 딸려
-    오는 다른 파일' 에서도 같은 계산을 쓰려고 떼어 놨다 — 두 벌로 두면
-    언젠가 한쪽만 고쳐진다.
-    """
     diff = _pbx_diff(proj, parsed)
     by_id = {}
     for m in proj.get("models") or []:
@@ -15426,13 +9078,8 @@ def _pbx_apply_rows(proj: dict, parsed: dict) -> dict:
             "unmatched": [u["label"] for u in diff["unmatched"]]}
 
 
+# 시트 하나에 딸린 주차표를 달별로 반영한다
 def _pbx_apply_sheet_months(proj: dict, ws) -> list:
-    """시트 하나에 딸린 주차표를 달별로 반영한다. 없으면 빈 목록.
-
-    시트 **하나**만 본다. 하바 현황 파일에는 W6~W40 스냅샷이 서른 몇 장
-    들어 있고 장마다 그 시점의 주차표가 붙어 있다. 전부 반영하면 지난
-    스냅샷이 최신 값을 덮는다. 올린 사람이 말하는 '지금' 은 마지막 장이다.
-    """
     import pbx_plan_import as _pbx
 
     out = []
@@ -15451,12 +9098,9 @@ def _pbx_apply_sheet_months(proj: dict, ws) -> list:
     return out
 
 
+# 업로드된 엑셀을 연다 → (원본 파일명, 워크북)
 async def _pbx_open_upload(file, where: str = "주차별 계획 엑셀",
                            project: str = ""):
-    """업로드된 엑셀을 연다 → (원본 파일명, 워크북)
-
-    여는 길에 원본을 보관함에 한 벌 남긴다(upload_store).
-    """
     orig = file.filename or "plan.xlsx"
     if not orig.lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(status_code=400, detail="xlsx/xlsm 파일만 올릴 수 있습니다")
@@ -15466,17 +9110,16 @@ async def _pbx_open_upload(file, where: str = "주차별 계획 엑셀",
 
     from io import BytesIO
     import openpyxl
-    import pbx_plan_import as _pbx
 
     try:
-        wb = openpyxl.load_workbook(BytesIO(raw), data_only=True)
+        wb = openpyxl.load_workbook(BytesIO(raw), data_only=True, keep_links=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"엑셀을 열 수 없습니다: {e}")
     return orig, wb
 
 
+# 주차표가 있는 시트를 고른다. 못 고르면 이유를 말하고 멈춘다
 def _pbx_pick_sheet(wb, month):
-    """주차표가 있는 시트를 고른다. 못 고르면 이유를 말하고 멈춘다."""
     import pbx_plan_import as _pbx
 
     available = _pbx.sheet_months(wb)
@@ -15494,16 +9137,8 @@ def _pbx_pick_sheet(wb, month):
     return parsed
 
 
+# 파일에 든 달을 전부 읽는다 → [parsed, ...].
 def _pbx_pick_months(wb, month):
-    """파일에 든 달을 전부 읽는다 → [parsed, ...]. 고른 달이 있으면 맨 앞.
-
-    한 파일에 여러 달이 오는 건 드문 일이 아니다 — 양식 받기가 몇 달치를
-    한 파일로 내려주고, 1년치 계획을 한 번에 올리기도 한다. 그때 화면이
-    보고 있는 달 하나만 넣으면 나머지 열두 달이 조용히 버려진다.
-
-    달을 하나도 못 찾으면 _pbx_pick_sheet 와 똑같은 말로 멈춘다 — 그 말을
-    위에서 받아 '주차표 없는 파일' 로 넘긴다.
-    """
     import pbx_plan_import as _pbx
 
     available = _pbx.sheet_months(wb)
@@ -15534,30 +9169,17 @@ def _pbx_pick_months(wb, month):
     return out
 
 
+# 열기 + 시트 고르기를 한 번에 (반영 단계에서 쓴다)
 async def _pbx_read_upload(file, month):
-    """열기 + 시트 고르기를 한 번에 (반영 단계에서 쓴다)"""
     orig, wb = await _pbx_open_upload(file)
     return orig, _pbx_pick_sheet(wb, month)
 
-
+# ============================================================
+#  자동차 — 계약 · 제품 가져오기
+# ============================================================
+# 자동차사업부 제품 요약 — 앱 화면이 그리는 값 ← 앱 automotive_service.dart project()
 @app.get("/projects/{project_key}/automotive-summary")
 def get_automotive_summary(project_key: str):
-    """자동차사업부 제품 요약 — 앱 화면이 그리는 값.
-
-    수량·금액을 앱에서 다시 계산하지 않게 여기서 낸다.
-    Admin 과 앱이 같은 숫자를 보게 하려면 계산이 한 군데 있어야 한다.
-
-        판가   = 재료비 + 공정비 + 관리이윤 + 감가상각 + 물류
-        원가   = 판가 − 관리이윤 (관리이윤은 원가가 아니다)
-        원가율 = 원가 ÷ 판가
-        견적   = 엑셀 '판가' 열 — 외화 단가 × 환율로 적어 둔 참고값.
-                 판가와 다를 수 있고, 개발품은 비어 있다.
-
-    묶음 원가율은 제품별 원가율의 평균이 아니라 물량으로 가중한다.
-    한 대 팔리는 제품과 백만 대 팔리는 제품을 같은 무게로 두면 안 된다.
-
-        묶음 원가율 = Σ(원가 × 물량) ÷ Σ(판가 × 물량)
-    """
     key = _model_key_alias(project_key.strip())
     proj = (_load_models().get("projects") or {}).get(key) or {}
 
@@ -15607,7 +9229,10 @@ def get_automotive_summary(project_key: str):
     wc = sum(p["cost"] * p["qty_total"] for p in products)
     wp = sum(p["price"] * p["qty_total"] for p in products)
 
-    products.sort(key=lambda p: (-p["revenue_total"], p["name"]))
+    # 매출 큰 제품부터, 같으면 이름순
+    def _by_revenue_then_name(p):
+        return (-p["revenue_total"], p["name"])
+    products.sort(key=_by_revenue_then_name)
     ylist = sorted(years)
     by_year = {y: {"qty": sum(p["contract"].get(y, {}).get("qty", 0) for p in products),
                    "revenue": round(sum(p["contract"].get(y, {}).get("revenue", 0)
@@ -15633,14 +9258,9 @@ def get_automotive_summary(project_key: str):
     }
 
 
+# 자동차사업부 전체 요약 — 앱 '고객사 목록' 화면이 그리는 값 ← admin v2 back.onclick() · 앱 automotive_service.dart division()
 @app.get("/divisions/automotive/summary")
 def get_automotive_division_summary(year: int = 0):
-    """자동차사업부 전체 요약 — 앱 '고객사 목록' 화면이 그리는 값.
-
-    고객사별 합계를 앱에서 다시 더하지 않게 여기서 낸다.
-    제품 단위 계산은 /projects/{key}/automotive-summary 한 곳에만 두고
-    여기서는 그 결과를 고객사별로 모으기만 한다. 두 화면이 갈리지 않게.
-    """
     import datetime as _dt
 
     cur = int(year) if year else _dt.date.today().year
@@ -15675,7 +9295,9 @@ def get_automotive_division_summary(year: int = 0):
         r["share"] = round(r["revenue"] / total_rev, 4) if total_rev > 0 else 0.0
 
     # 계약이 잡힌 고객사가 위로. 같으면 이름순 — 순서가 매번 바뀌면 못 읽는다.
-    rows.sort(key=lambda r: (-r["revenue"], r["label"]))
+    def _by_revenue_then_label(r):
+        return (-r["revenue"], r["label"])
+    rows.sort(key=_by_revenue_then_label)
 
     ylist = sorted(years)
     by_year = {
@@ -15710,17 +9332,14 @@ def get_automotive_division_summary(year: int = 0):
     }
 
 
-# ── 자동차사업부 제품 엑셀 ────────────────────────────────────────────
-#
-# 한 파일에 여러 고객사가 섞여 있다. 고객사가 곧 프로젝트이므로 행마다
-# 어느 프로젝트로 갈지 갈라서 넣는다. 저장 전에 무엇이 어디로 가는지 먼저 보여준다.
-#
-# 제품명이 열쇠다. 같은 이름이 다른 고객사에 있어도(케피코 DCDC / 발레오 DCDC)
-# 프로젝트가 다르니 섞이지 않는다.
+# ============================================================
+#  자동차사업부 제품 엑셀
+# ============================================================
+# 한 파일에 여러 고객사가 섞여 있다
 
 
+# 자동차사업부 프로젝트 (라벨·별칭까지) — 고객사 이름을 여기에 맞춘다
 def _auto_projects():
-    """자동차사업부 프로젝트 (라벨·별칭까지) — 고객사 이름을 여기에 맞춘다."""
     out = []
     try:
         for p in _cl.get_projects(division_id="automotive", visible_only=True):
@@ -15731,11 +9350,8 @@ def _auto_projects():
     return out
 
 
+# 업로드된 엑셀을 열어 제품표를 읽는다 → (파일명, parsed, 시트목록)
 async def _auto_read_upload(file, sheet):
-    """업로드된 엑셀을 열어 제품표를 읽는다 → (파일명, parsed, 시트목록)
-
-    여는 길에 원본을 보관함에 한 벌 남긴다(upload_store).
-    """
     orig = file.filename or "products.xlsx"
     if not orig.lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(status_code=400, detail="xlsx/xlsm 파일만 올릴 수 있습니다")
@@ -15748,8 +9364,8 @@ async def _auto_read_upload(file, sheet):
     import auto_import as _ai
 
     try:
-        wbv = openpyxl.load_workbook(BytesIO(raw), data_only=True)
-        wbf = openpyxl.load_workbook(BytesIO(raw))
+        wbv = openpyxl.load_workbook(BytesIO(raw), data_only=True, keep_links=False)
+        wbf = openpyxl.load_workbook(BytesIO(raw), keep_links=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"엑셀을 열 수 없습니다: {e}")
 
@@ -15764,8 +9380,8 @@ async def _auto_read_upload(file, sheet):
     return orig, parsed, avail
 
 
+# 엑셀 행 ↔ 등록된 제품 대조표.
 def _auto_diff(parsed):
-    """엑셀 행 ↔ 등록된 제품 대조표. 저장은 하지 않는다."""
     import auto_import as _ai
 
     projects = _auto_projects()
@@ -15817,13 +9433,14 @@ def _auto_diff(parsed):
             "projects": sorted({r["project_label"] for r in rows})}
 
 
+# 올린 파일이 무엇을 어디로 넣는지 먼저 보여준다 ← admin v2 aiFile.onchange()
 @app.post("/admin/automotive/product-import/preview")
 async def admin_auto_import_preview(
     file: UploadFile = File(...),
     sheet: str = Form(""),
     _admin: int = Depends(get_admin_session),
 ):
-    """올린 파일이 무엇을 어디로 넣는지 먼저 보여준다. 저장하지 않는다."""
+    _form_only("auto-product")
     orig, parsed, avail = await _auto_read_upload(file, sheet)
     out = _auto_diff(parsed)
     out.update({"ok": True, "file_name": orig,
@@ -15831,6 +9448,7 @@ async def admin_auto_import_preview(
     return out
 
 
+# 미리보기에서 확인한 내용을 저장한다 ← admin v2 onclick()
 @app.post("/admin/automotive/product-import/apply")
 async def admin_auto_import_apply(
     file: UploadFile = File(...),
@@ -15838,7 +9456,7 @@ async def admin_auto_import_apply(
     skip: str = Form(""),
     _admin: int = Depends(get_admin_session),
 ):
-    """미리보기에서 확인한 내용을 저장한다."""
+    _form_only("auto-product")
     import auto_import as _ai
 
     orig, parsed, _avail = await _auto_read_upload(file, sheet)
@@ -15884,10 +9502,11 @@ async def admin_auto_import_apply(
 
     for pid in touched:
         proj = data["projects"][pid]
+        # 양산을 앞에, 개발을 뒤에 (같은 구분 안에서는 원래 순서 그대로)
         proj["models"].sort(key=lambda m: 0 if m.get("group") == "양산" else 1)
         proj["product_file"] = {
             "file_name": orig, "sheet": parsed["sheet"],
-            "uploaded_at": __import__("datetime").datetime.now().isoformat(),
+            "uploaded_at": datetime.now().isoformat(),
         }
     _save_models(data)
     print(f"[auto-import] '{orig}' {parsed['sheet']}: 신규 {added}, 갱신 {updated}, "
@@ -15896,17 +9515,15 @@ async def admin_auto_import_apply(
             "added": added, "updated": updated,
             "projects": sorted(touched), "skipped": len(drop)}
 
-
+# ============================================================
+#  모델 별칭
+# ============================================================
+# '이 품번도 그 모델이다' 를 적어 둔다 ← admin v2 back.onclick()
 @app.post("/admin/projects/{project_key}/models/alias")
 def admin_add_model_alias(project_key: str,
                           model_id: str = Form(...),
                           alias: str = Form(...),
                           _admin: int = Depends(get_admin_session)):
-    """'이 품번도 그 모델이다' 를 적어 둔다.
-
-    엑셀에 적힌 품번이 우리 쪽 등록 품번과 다를 때 쓴다. 안 적어 두면
-    올릴 때마다 같은 물건이 새 모델로 하나씩 더 생긴다.
-    """
     key = _model_key_alias((project_key or "").strip())
     want = str(alias or "").strip()
     mid = str(model_id or "").strip()
@@ -15945,6 +9562,1143 @@ def admin_add_model_alias(project_key: str,
     return {"ok": True, "model_id": mid, "aliases": alts}
 
 
+# 엑셀을 올리는 자리가 스무 곳 넘게 흩어져 있었다
+DIVISION_FORM_ONLY = True
+
+#: 닫은 주소 → 사람이 읽을 이름. 사업부 양식이 대신하는 길들이다.
+_FORM_REPLACED = {
+    "models-import": "모델 등록 양식",
+    "plan-file": "주차별 계획 파일",
+    "status-excel": "주간 현황 엑셀",
+    "auto-product": "자동차 제품 엑셀",
+}
+
+# ============================================================
+#  올리는 길을 하나로 — 사업부 양식만 받는다
+# ============================================================
+def _form_only(which: str):
+    if not DIVISION_FORM_ONLY:
+        return
+    what = _FORM_REPLACED.get(which, which)
+    raise HTTPException(
+        status_code=403,
+        detail=("%s 는 이제 따로 올리지 않습니다. "
+                "사업부 양식(품목정보·이슈사항) 한 장으로 올려 주세요. "
+                "관리자 화면의 '양식 올리기' 에서 올릴 수 있습니다." % what),
+    )
+
+
+# 사업부마다 쓰는 한 벌짜리 양식을 올리면, 그 안의 두 장을 읽어 프로젝트(고객사)별 모델과 이슈로 반영한다
+
+# ============================================================
+#  양식의 고객사 · 품번 → 우리 프로젝트 · 모델
+# ============================================================
+def _df_norm(t) -> str:
+    import re as _re
+    import unicodedata as _ud
+    t = _ud.normalize("NFC", str(t or "")).lower()
+    t = _re.sub(r"[\s\-_()\[\].,/]+", "", t)
+    return t
+
+
+# 이름 하나 → 맞춰 볼 열쇠들.
+def _df_keys(name) -> list:
+    import re as _re
+    raw = str(name or "").strip()
+    out = []
+    for cand in ([raw] + _re.split(r"[()\[\]]+", raw)):
+        k = _df_norm(cand)
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
+# 사업부 안에서 '엑셀에 적힌 이름 → 프로젝트 키' 색인.
+def _df_owner_index(division_id: str) -> dict:
+    import config_loader as _cl
+    idx = {}
+    for p in _cl.get_projects(division_id=division_id, visible_only=False):
+        pid = p.get("id")
+        if not pid:
+            continue
+        # 열쇠로 쓸 이름들 — 키 자체 · 화면 이름 · 별칭 전부
+        names = [pid, p.get("label")]
+        names.extend(p.get("aliases") or [])
+        # 이름 하나가 열쇠 여럿이다 ('TC (Telemaetry Cabinet)' → tc · telemaetrycabinet).
+        # setdefault 라 먼저 들어온 쪽이 이긴다 — 프로젝트 키·화면 이름이
+        # 별칭 조각보다 앞이다.
+        for n in names:
+            for key in _df_keys(n):
+                idx.setdefault(key, pid)
+    # -----------------------------------------------------------
+    # 이미 등록된 모델 이름도 열쇠로 쓴다
+    # -----------------------------------------------------------
+    # 모델 목록에 'TC (Telemaetry Cabinet)' 이라고 적혀 있으면, 시스템은 이미 TC 가 무엇인지 알고 있는 셈이다
+    try:
+        data = _load_models()
+        projects = data.get("projects") or {}
+        owners = {}                      # 열쇠 → {프로젝트 키}
+        for p in _cl.get_projects(division_id=division_id, visible_only=False):
+            pid = p.get("id")
+            for m in ((projects.get(pid) or {}).get("models") or []):
+                if not isinstance(m, dict):
+                    continue
+                for key in _df_keys(m.get("name")):
+                    owners.setdefault(key, set()).add(pid)
+        for key, pids in owners.items():
+            if len(pids) == 1 and key not in idx:
+                idx[key] = next(iter(pids))
+    except Exception as _e:
+        # 색인이 조금 모자란 것보다 반영이 통째로 막히는 게 나쁘다
+        print("[양식] 모델 이름 색인 실패(무시) — %s" % _e)
+
+    return idx
+
+
+# 엑셀에 적힌 이름 → 프로젝트 키로 쓸 영문 토막.
+def _df_slug(owner: str) -> str:
+    import re as _re
+    import unicodedata as _ud
+    t = _ud.normalize("NFKD", str(owner or "")).encode("ascii", "ignore").decode()
+    t = _re.sub(r"[^A-Za-z0-9]+", "_", t).strip("_").lower()
+    t = _re.sub(r"_+", "_", t)[:40]
+    if not t:
+        import hashlib as _hl
+        t = "p" + _hl.md5(str(owner or "").encode("utf-8")).hexdigest()[:6]
+    return t
+
+
+# 못 찾은 줄을 이름으로 묶어 '이런 프로젝트를 만들겠다' 목록을 낸다
+def _df_new_project_rows(division_id: str, unmatched: list) -> list:
+    by = {}
+    for x in (unmatched or []):
+        name = str((x or {}).get("owner") or "").strip()
+        if not name:
+            continue                     # 이름이 비면 만들 수가 없다
+        by.setdefault(name, 0)
+        by[name] += 1
+
+    taken = {p.get("id") for p in _cl.get_projects(visible_only=False)}
+    out = []
+    for name in sorted(by, key=lambda n: -by[n]):
+        base = "%s_%s" % (_df_slug(division_id), _df_slug(name))
+        key, n = base, 2
+        while key in taken:              # 같은 키가 이미 있으면 뒤에 번호
+            key, n = "%s_%d" % (base, n), n + 1
+        taken.add(key)
+        out.append({"owner": name, "key": key, "rows": by[name]})
+    return out
+
+
+# ============================================================
+#  엑셀에 적힌 이름 → 화면에 띄울 이름
+# ============================================================
+# 엑셀마다 같은 곳을 다르게 적는다 — 양식은 'FLUENCE', 일 보고는 '플루언스'.
+_DISPLAY_NAMES = None
+
+
+# 그 이름을 화면에 어떻게 띄울까.
+def _display_name(raw: str) -> str:
+    global _DISPLAY_NAMES
+    if _DISPLAY_NAMES is None:
+        try:
+            p = Path(__file__).parent / "config" / "display_names.json"
+            _DISPLAY_NAMES = (json.loads(p.read_text(encoding="utf-8"))
+                              .get("names") or {})
+        except Exception as e:
+            print("[names] 표시 이름 표를 못 읽었습니다: %s" % e)
+            _DISPLAY_NAMES = {}
+    key = "".join(str(raw or "").lower().split())
+    return str(_DISPLAY_NAMES.get(key) or "")
+
+
+# _df_new_project_rows 가 낸 목록을 실제로 만든다 → 만든 것만 돌려준다
+def _df_create_projects(division_id: str, rows: list) -> list:
+    made = []
+    orders = [int(p.get("order") or 0)
+              for p in _cl.get_projects(division_id=division_id, visible_only=False)]
+    nxt = (max(orders) if orders else 0) + 1
+    for r in (rows or []):
+        # 화면 이름만 바꾼다. 엑셀 원문은 별칭으로 남는다 —
+        # 다음 달에 영문으로 와도 같은 프로젝트를 찾아야 한다.
+        _disp = _display_name(r["owner"]) or r["owner"]
+        _names = [r["owner"]] + ([_disp] if _disp != r["owner"] else [])
+        row = {
+            "id": r["key"],
+            "division_id": division_id,
+            "label": _disp,
+            "badge_label": _disp,
+            # 다음에 같은 이름이 와도 이 프로젝트로 붙게 별칭을 달아 둔다
+            "aliases": _names,
+            "keywords": _names,
+            "visible": True,
+            "order": nxt,
+            # 손으로 만든 것과 가르는 표시. 나중에 정리할 때 이것만 보면 된다.
+            "created_by": "division_form",
+            "created_at": date.today().isoformat(),
+        }
+        # -----------------------------------------------------------
+        # 일 보고 사업부면 '품목 이름' 도 적어 둔다
+        # -----------------------------------------------------------
+        # 블룸은 일 보고 엑셀 한 장이 품목을 다 싣고 와서 bloom_main 에 담긴다
+        if _daily_store_key(division_id) and \
+                _dcol.shape_of(division_id) == "프로젝트형":
+            row["bloom_item"] = r["owner"]
+        nxt += 1
+        try:
+            _cl.add_project(row)
+            made.append(row)
+        except Exception as e:
+            print("[form] 프로젝트 만들기 실패 %s: %s" % (r["key"], e))
+    return made
+
+
+# 양식에 없는 프로젝트는 끈다. 다시 적히면 켠다
+def _df_project_sync(division_id: str, items: list, idx: dict,
+                     dry: bool = False) -> dict:
+    out = {"hidden": [], "shown": []}
+    if not items:
+        return out
+    # 반도체형은 한 장이 프로젝트 하나다 — 여기서 돌리면 남은 것이 다 꺼진다
+    if _dcol.shape_of(division_id) == "반도체형":
+        return out
+
+    alive = set()
+    for it in items:
+        pid = _df_find_project(it.get("owner"), idx)
+        if pid:
+            alive.add(pid)
+    if not alive:
+        return out
+
+    store = _daily_store_key(division_id) or ""
+    for p in _cl.get_projects(division_id=division_id, visible_only=False):
+        pid = p.get("id")
+        if not pid or pid == store:
+            continue
+        if not _cl.is_runtime_project(pid):
+            continue
+        want = pid in alive
+        if bool(p.get("visible", True)) == want:
+            continue
+        if dry:
+            (out["shown"] if want else out["hidden"]).append(
+                {"key": pid, "label": p.get("label") or pid})
+            continue
+        try:
+            if _cl.set_project_visible(pid, want, "division_form"):
+                (out["shown"] if want else out["hidden"]).append(
+                    {"key": pid, "label": p.get("label") or pid})
+        except Exception as _e:
+            print("[양식] 프로젝트 켜고 끄기 실패 %s — %s" % (pid, _e))
+    return out
+
+# ============================================================
+#  판가 바뀜 · 주차 꼬리표
+# ============================================================
+def _df_price_preview(items, idx, tag: str) -> list:
+    def _money(v):
+        try:
+            return max(0, _as_money(v))
+        except Exception:
+            return 0
+
+    data = _load_models()
+    out = []
+    for it in (items or []):
+        if it.get("price") is None and it.get("material_cost") is None:
+            continue
+        pid = _df_find_project(it.get("owner"), idx)
+        if not pid:
+            continue
+        proj = (data.get("projects") or {}).get(pid) or {}
+        m = _df_pick_model(proj.get("models") or [],
+                           it.get("part_number"), it.get("name"))
+        if m is None:                 # 새 모델은 '바뀐' 것이 아니다
+            continue
+        old_p, old_c = _money(m.get("price")), _money(m.get("material_cost"))
+        new_p = _money(it.get("price")) if it.get("price") is not None else old_p
+        new_c = (_money(it.get("material_cost"))
+                 if it.get("material_cost") is not None else old_c)
+        if abs(new_p - old_p) < 0.005 and abs(new_c - old_c) < 0.005:
+            continue
+        out.append({"project_key": pid, "id": m.get("id"),
+                    "name": m.get("name") or m.get("id"),
+                    "from": tag, "price": [old_p, new_p],
+                    "material_cost": [old_c, new_c]})
+    return out
+
+
+# 양식의 기준 주차 → 판가 구간 시작점 ('2026-W43').
+def _df_week_tag(month: str, week) -> str:
+    o = _week_ord(month, week)
+    # 주차가 빈 칸이면 _week_ord 가 '0주차'(202600)를 돌려준다
+    if not o or not (1 <= o % 100 <= 53):
+        return ""
+    return "%04d-W%02d" % (o // 100, o % 100)
+
+
+# 양식으로 판가·재료비가 바뀌면 **그 주차부터** 새 값.
+def _df_apply_price(m: dict, it: dict, tag: str) -> dict:
+    def _money(v):
+        try:
+            return max(0, _as_money(v))
+        except Exception:
+            return 0
+
+    has_p = it.get("price") is not None
+    has_c = it.get("material_cost") is not None
+    if not (has_p or has_c):
+        return {}
+
+    old_p, old_c = _money(m.get("price")), _money(m.get("material_cost"))
+    new_p = _money(it.get("price")) if has_p else old_p
+    new_c = _money(it.get("material_cost")) if has_c else old_c
+
+    # 값만 갈아 끼우고 끝 — 바뀐 게 없으면 구간을 늘리지 않는다
+    if abs(new_p - old_p) < 0.005 and abs(new_c - old_c) < 0.005:
+        if has_p:
+            m["price"] = it["price"]
+        if has_c:
+            m["material_cost"] = it["material_cost"]
+        return {}
+
+    ph = _norm_phases(m.get("phases"))
+    if not ph:
+        # 구간이 없던 모델: 옛 값을 '처음부터' 구간으로 박아 과거를 고정한다.
+        # 구분은 **저장된 group** 을 쓴다 — 개발이던 시절은 개발로 남아야
+        # 지난달 개발 실적이 양산 판가로 다시 계산되지 않는다.
+        ph = [{"from": _PHASE_EPOCH,
+               "group": "개발" if m.get("group") == "개발" else "양산",
+               "price": old_p, "material_cost": old_c}]
+    _prev = ph[-1]
+    grp = _prev.get("group") or ("개발" if m.get("group") == "개발" else "양산")
+
+    same = next((e for e in ph if e["from"] == tag), None)
+    if same is not None:
+        # 같은 주차 양식을 두 번 올려도 구간이 늘지 않는다
+        same["price"] = new_p
+        same["material_cost"] = new_c
+    else:
+        ph.append({"from": tag, "group": grp,
+                   "price": new_p, "material_cost": new_c})
+    m["phases"] = _norm_phases(ph)
+
+    if has_p:
+        m["price"] = it["price"]
+    if has_c:
+        m["material_cost"] = it["material_cost"]
+    return {"id": m.get("id"), "name": m.get("name") or m.get("id"),
+            "from": tag, "price": [old_p, new_p],
+            "material_cost": [old_c, new_c]}
+
+
+# ==== 고객사 이름의 오타를 가장 가까운 한 곳에 붙인다
+_DF_TYPO_MIN_LEN = 6
+
+# ============================================================
+#  고객사 이름 오타 맞추기
+# ============================================================
+def _df_digits(t: str) -> list:
+    import re as _re
+    return _re.findall(r"\d+", str(t or ""))
+
+
+# 글자 차이가 1 이내인가 (자리바꿈 포함).
+def _df_dam1(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        diff = [i for i in range(len(a)) if a[i] != b[i]]
+        if len(diff) == 1:
+            return True                      # 한 글자만 다르다
+        if len(diff) == 2 and diff[1] == diff[0] + 1 \
+                and a[diff[0]] == b[diff[1]] and a[diff[1]] == b[diff[0]]:
+            return True                      # 붙어 있는 두 글자가 뒤바뀌었다
+        return False
+    lo, hi = (a, b) if len(a) < len(b) else (b, a)
+    for i in range(len(hi)):                 # 한 글자를 빼면 같아지는가
+        if hi[:i] + hi[i + 1:] == lo:
+            return True
+    return False
+
+
+# 오타로 보이는 이름 → 프로젝트 키.
+def _df_typo_project(owner: str, idx: dict) -> str:
+    hits = set()
+    for cand in _df_keys(owner):
+        if len(cand) < _DF_TYPO_MIN_LEN:
+            continue
+        cd = _df_digits(cand)
+        for key, pid in idx.items():
+            if len(key) < _DF_TYPO_MIN_LEN or key == cand:
+                continue
+            if _df_digits(key) != cd:
+                continue
+            if _df_dam1(cand, key):
+                hits.add(pid)
+                if len(hits) > 1:
+                    return ""            # 둘 이상이면 안 붙인다
+    return next(iter(hits)) if len(hits) == 1 else ""
+
+
+# 엑셀에 적힌 이름이 어느 프로젝트인가.
+def _df_find_project(owner: str, idx: dict, notes: dict | None = None) -> str:
+    cands = _df_keys(owner)
+    if not cands:
+        return ""
+    # -----------------------------------------------------------
+    # 1. 똑같은 이름 (괄호 앞·안 조각까지)
+    # -----------------------------------------------------------
+    #    'TC' 도 'TC (Telemaetry Cabinet)' 도 여기서 걸린다.
+    for key in cands:
+        if key in idx:
+            return idx[key]
+    # -----------------------------------------------------------
+    # 2. 한쪽이 다른 쪽을 품고 있는가
+    # -----------------------------------------------------------
+    #    'SDI(인디애나)' 처럼 뒤에 뭐가 붙어 와도 찾히게 한다.
+    #    너무 짧은 글자는 아무 데나 걸리므로 세 자 이상일 때만 본다.
+    for key in cands:
+        if len(key) < 3:
+            continue
+        for k, pid in idx.items():
+            if len(k) >= 3 and (key.startswith(k) or k.startswith(key)):
+                return pid
+    # -----------------------------------------------------------
+    # 3. 오타로 보이는가 (_df_typo_project 주석 참고)
+    # -----------------------------------------------------------
+    pid = _df_typo_project(owner, idx)
+    if pid:
+        if notes is not None:
+            notes[str(owner or "").strip()] = pid
+        return pid
+    return ""
+
+
+# 모델을 가리키는 열쇠 — (품번, 이름) 둘 다 다듬어서.
+def _df_model_key(m) -> tuple:
+    return (_df_norm(m.get("part_number") or m.get("id")),
+            _df_norm(m.get("name")))
+
+
+# 이미 등록된 모델 중에서 이 줄에 해당하는 것을 찾는다
+def _df_pick_model(models: list, pn: str, name: str):
+    want_pn = _df_norm(pn)
+    want_name = _df_norm(name)
+
+    if want_pn:
+        for m in models:
+            if _df_norm(m.get("part_number")) == want_pn:
+                return m
+            if _df_norm(m.get("id")) == want_pn:
+                return m
+
+    if want_name:
+        for m in models:
+            if _df_norm(m.get("name")) == want_name:
+                return m
+    return None
+
+
+# 오타로 붙인 이름을 사람이 읽을 줄로.
+def _df_typo_warnings(notes: dict) -> list:
+    out = []
+    for owner, pid in sorted((notes or {}).items()):
+        try:
+            lbl = (_cl.get_project(pid) or {}).get("label") or pid
+        except Exception:
+            lbl = pid
+        out.append("'%s' 는 '%s' 의 오타로 보여 그 프로젝트에 붙였습니다 "
+                   "— 다른 곳이면 알려 주세요 (%s)" % (owner, lbl, pid))
+    return out
+
+# ============================================================
+#  무엇이 새로 들어오고 무엇이 바뀌나
+# ============================================================
+def _df_plan(items, idx, notes: dict | None = None) -> dict:
+    data = _load_models()
+    plan = {}          # {프로젝트키: {"new": [...], "update": [...]}}
+    unmatched = []     # 어느 프로젝트인지 못 찾은 줄
+    seen = {}          # {프로젝트키: {양식이 건드린 모델의 자리}}
+
+    for it in items:
+        pid = _df_find_project(it.get("owner"), idx, notes)
+        if not pid:
+            unmatched.append(it)
+            continue
+
+        proj = (data.get("projects") or {}).get(pid) or {}
+        models = proj.get("models") or []
+        found = _df_pick_model(models, it.get("part_number"), it.get("name"))
+
+        bucket = plan.setdefault(pid, {"new": [], "update": []})
+        if found is None:
+            bucket["new"].append(it)
+        else:
+            bucket["update"].append(it)
+            # 양식이 건드린 기존 모델. 여기 없는 모델이 '양식에서 지운 줄'
+            # 이다. 이름이 아니라 그 자리(파이썬 id)로 센다 — 같은 이름이
+            # 둘일 때 이름으로 맞추면 엉뚱한 것이 남는다.
+            seen.setdefault(pid, set()).add(id(found))
+
+    return {"plan": plan, "unmatched": unmatched,
+            "stale": _df_stale_models(data, seen)}
+
+# ============================================================
+#  이슈 진행 / 해결
+# ============================================================
+def _df_issue_apply(data: dict, pid: str, ix: dict, file: str = "",
+                    dry: bool = False) -> str:
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+    projects = data.get("projects") or {}
+    proj = projects.get(pid)
+    if proj is None:
+        if dry:
+            proj = {"models": []}
+        else:
+            proj = data.setdefault("projects", {}).setdefault(pid, {"models": []})
+    pn = (ix.get("part_number") or "").strip()
+    m = _df_pick_model(proj.get("models") or [], pn, "") if pn else None
+    if m is not None:
+        return _iss.apply_to_model(m, ix, today, file, dry=dry)
+    return _iss.apply_to_project(proj, ix, today, file, dry=dry)
+
+
+# 사업부 양식의 주차 계획이 보드에 안 뜨는 사업부면 한 줄 알려 준다
+def _form_weekly_note(division_id: str, weeks) -> str:
+    if str(division_id or "").strip().lower() not in _DAILY_BOARD_ROWS:
+        return ""
+    if not weeks:
+        return ""
+    return ("이 사업부의 주차 현황 보드는 일 보고 자료로 그립니다. "
+            "양식에 적은 주차별 계획(%s)은 저장은 되지만 보드에는 "
+            "안 뜹니다 — 주차 숫자는 일 보고 엑셀로 올려 주세요."
+            % " · ".join(str(w) for w in weeks))
+
+
+# 양식에 한 번도 안 나온 기존 모델 → [{project_key, id, name}]
+def _df_stale_models(data: dict, seen: dict) -> list:
+    out = []
+    for pid, touched in seen.items():
+        proj = (data.get("projects") or {}).get(pid) or {}
+        for m in (proj.get("models") or []):
+            if not isinstance(m, dict) or id(m) in touched:
+                continue
+            out.append({"project_key": pid,
+                        "id": str(m.get("id") or ""),
+                        "name": str(m.get("name") or m.get("id") or "")})
+    return out
+
+# ============================================================
+#  양식 내려받기 · 미리보기 · 반영
+# ============================================================
+# 그 사업부 양식을, **지금 등록된 내용을 채워서** 내려준다 ← admin v2 fd.onclick()
+@app.get("/admin/divisions/{division_id}/form/download")
+def admin_division_form_download(
+    division_id: str,
+    month: str = "",
+    months: int = 2,
+    _admin: int = Depends(get_admin_session),
+):
+    import datetime as _dt
+    from urllib.parse import quote
+    import division_form_export as _dfe
+
+    base = (month or "").strip() or _dt.date.today().strftime("%Y-%m")
+    if not _MONTH_RE.match(base):
+        raise HTTPException(status_code=400, detail="달을 YYYY-MM 으로 적어 주세요.")
+    n = max(1, min(int(months or 2), 6))
+    # -----------------------------------------------------------
+    # 그 사업부의 모든 프로젝트에서 모델을 모은다
+    # -----------------------------------------------------------
+    #    양식 한 장이 사업부 하나다 — 올릴 때도 그렇게 받는다.
+    data = _load_models()
+    projects = (data.get("projects") or {})
+    rows = []
+    open_issues = []        # 지금 열린 이슈 — 양식 [이슈사항] 에 '진행' 으로 채운다
+    for p in _cl.get_projects(division_id=division_id, visible_only=False):
+        pid = p.get("id")
+        owner = p.get("label") or pid
+        # 양식에는 국내 / 해외 둘 중 하나만 (해외의 Lam · 아리스타 · 기타는 서버가 가른다)
+        # 자동차는 '고객 묶음' 이름 그대로 (_dcol.group_cell)
+        _rg = _dcol.group_cell(division_id, _dcol.customer_group(
+            division_id, pid, (projects.get(pid) or {}).get("customer_group"), owner))
+        for m in ((projects.get(pid) or {}).get("models") or []):
+            if not isinstance(m, dict):
+                continue
+            r = dict(m)
+            r["owner"] = owner
+            r.setdefault("part_number", m.get("id") or "")
+            r["region"] = _rg            # 국내/해외 칸 (묶는 사업부만 그려진다)
+            rows.append(r)
+        try:
+            open_issues.extend(_iss.open_rows(owner, projects.get(pid) or {}))
+        except Exception as _e:
+            print("[양식 내려받기] 이슈 채우기 건너뜀 — %s" % _e)
+
+    try:
+        # 용어는 등록된 것을 채워 준다 — 이 시트는 올릴 때마다 통째로 바뀐다
+        try:
+            _terms = _dterm.get(division_id)
+        except Exception:
+            _terms = []
+        blob = _dfe.build(division_id, rows, base, n, terms=_terms,
+                          issues=open_issues)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="양식을 만들지 못했습니다: %s" % e)
+
+    label = division_id
+    try:
+        d = _cl.get_division(division_id) or {}
+        label = d.get("label") or division_id
+    except Exception:
+        pass
+    fname = "%s 양식_%s.xlsx" % (label, base)
+    print("[양식 내려받기] %s · 품목 %d · %s 부터 %d달"
+          % (division_id, len(rows), base, n))
+    return Response(
+        content=blob,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 "attachment; filename=division_form.xlsx; "
+                 "filename*=UTF-8''%s" % quote(fname)})
+
+
+# 개발 일정 양식을, **적혀 있던 날짜를 채워서** 내려준다 ← admin v2 fv.onclick()
+@app.get("/admin/divisions/{division_id}/dev-schedule/download")
+def admin_dev_schedule_download(
+    division_id: str,
+    _admin: int = Depends(get_admin_session),
+):
+    from urllib.parse import quote
+    import dev_schedule_export as _dse
+
+    data = _load_models()
+    projects = (data.get("projects") or {})
+    rows = []
+    for p in _cl.get_projects(division_id=division_id, visible_only=False):
+        pid = p.get("id")
+        owner = p.get("label") or pid
+        for m in ((projects.get(pid) or {}).get("models") or []):
+            if not isinstance(m, dict):
+                continue
+            if _display_group(m) != "개발":
+                continue
+            rows.append({
+                "owner": owner,
+                "name": m.get("name") or m.get("id") or "",
+                "part_number": m.get("part_number") or m.get("id") or "",
+                "dev_owner": m.get("dev_owner") or "",
+                "process": m.get("process") or [],
+            })
+    if not rows:
+        raise HTTPException(status_code=404,
+                            detail="이 사업부에는 구분이 '개발'인 품목이 없습니다.")
+
+    label = division_id
+    try:
+        label = (_cl.get_division(division_id) or {}).get("label") or division_id
+    except Exception:
+        pass
+    try:
+        blob = _dse.build(label, rows, [n for _k, n, _g in DEV_PROCESS_STEPS])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="양식을 만들지 못했습니다: %s" % e)
+
+    fname = "%s 품목별 개발 일정.xlsx" % label
+    print("[개발일정 양식] %s · 개발 품목 %d" % (division_id, len(rows)))
+    return Response(
+        content=blob,
+        media_type="application/vnd.openxmlformats-officedocument."
+                   "spreadsheetml.sheet",
+        headers={"Content-Disposition":
+                 "attachment; filename=dev_schedule.xlsx; "
+                 "filename*=UTF-8''%s" % quote(fname)})
+
+
+# 올린 양식이 무엇을 바꾸는지 먼저 보여준다 ← admin v2 fd.onclick() · _divFormSend()
+@app.post("/admin/divisions/{division_id}/form/preview")
+async def admin_division_form_preview(
+    division_id: str,
+    file: UploadFile = File(...),
+    _admin: int = Depends(get_admin_session),
+):
+    import io as _io
+    import openpyxl as _ox
+    import division_form_import as _dfi
+
+    raw = await _keep_upload(file, "/admin/divisions/{division_id}/form/preview",
+                             division_id)
+    try:
+        wb = _ox.load_workbook(_io.BytesIO(raw), data_only=True, keep_links=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="엑셀을 열지 못했습니다: %s" % e)
+
+    try:
+        got = _dfi.parse_workbook(wb, division_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    idx = _df_owner_index(division_id)
+    # 오타로 붙인 이름을 모아 둔다 — 화면 경고로 그대로 내보낸다
+    typo = {}
+    planned = _df_plan(got["items"], idx, typo)
+    # 처음 보는 이름은 반영할 때 프로젝트를 만든다. 무엇이 생길지는
+    # 여기서 미리 보여 준다 — 오타로 생긴 이름도 반영 전에 걸러진다.
+    new_projects = _df_new_project_rows(division_id, planned["unmatched"])
+    # -----------------------------------------------------------
+    # 프로젝트별로 몇 건이 새로 생기고 몇 건이 바뀌는지
+    # -----------------------------------------------------------
+    by_project = []
+    for pid, b in planned["plan"].items():
+        by_project.append({
+            "project_key": pid,
+            "new": [x.get("part_number") or x.get("name") for x in b["new"]],
+            "update": [x.get("part_number") or x.get("name") for x in b["update"]],
+        })
+    by_project.sort(key=lambda x: x["project_key"])
+    # -----------------------------------------------------------
+    # 이슈는 어느 프로젝트로 가는지만 세어 둔다
+    # -----------------------------------------------------------
+    #    상태(진행/해결)와, 올리면 어떻게 되는지까지
+    issue_rows = []
+    _idata = _load_models()
+    for ix in got["issues"]:
+        pid = _df_find_project(ix.get("owner"), idx, typo)
+        outcome = ""
+        if pid:
+            try:
+                outcome = _df_issue_apply(_idata, pid, ix, dry=True)
+            except Exception:
+                outcome = ""
+        issue_rows.append({
+            "project_key": pid,
+            "owner": ix.get("owner"),
+            "part_number": ix.get("part_number"),
+            "date": ix.get("date"),
+            "text": ix.get("text"),
+            "status": _iss.status_of(ix.get("status")),
+            "outcome": outcome,
+            "matched": bool(pid),
+        })
+
+    return {
+        "ok": True,
+        "division_id": division_id,
+        "file_name": file.filename or "",
+        "sheet": got["sheet"],
+        "kind": got["kind"],
+        "month": got["month"],
+        "weeks": got["weeks"],
+        "weekly_note": _form_weekly_note(division_id, got["weeks"]),
+        # 이 양식이 몇 주차 자료인가 — 실적이 적힌 마지막 주차.
+        # PO 변동을 어느 주차에 적을지가 여기서 갈린다.
+        "as_of_week": got.get("as_of_week") or "",
+        # -----------------------------------------------------------
+        # 양식의 나머지 시트
+        # -----------------------------------------------------------
+        #    전에는 읽고도 안 보여줬다. 올린 사람이 '용어도 적었는데 들어갔나'
+        #    를 알 길이 없으면, 다음부터는 안 적는다.
+        "terms": got.get("terms") or [],
+        "daily_rows": len(got.get("daily") or []),
+        "daily_dates": got.get("daily_dates") or [],
+        # 예시 줄은 반영하지 않는다. 몇 줄이 예시인지는 보여 준다.
+        "daily_example_rows": sum(1 for r in (got.get("daily") or [])
+                                  if r.get("example")),
+        # 양식에 없어서 '지우기' 를 켜면 사라질 기존 모델
+        "stale": planned.get("stale") or [],
+        "item_count": len(got["items"]),
+        # '예시)' 표시가 붙은 채로 올라온 줄 — 안 지운 본보기일 수 있다
+        "example_rows": got.get("example_rows") or [],
+        "projects": by_project,
+        "new_projects": new_projects,
+        # 판가가 바뀌는 품목 — 누르기 전에 '언제부터 얼마로' 를 본다
+        "price_changes": _df_price_preview(
+            got["items"], idx,
+            _df_week_tag(got["month"], got.get("as_of_week")) or _this_week_tag()),
+        "price_from": (_df_week_tag(got["month"], got.get("as_of_week"))
+                       or _this_week_tag()),
+        # 양식에 이름이 없어서 화면에서 내려갈 프로젝트 (지우지는 않는다)
+        "hidden_projects": _df_project_sync(
+            division_id, got["items"], idx, dry=True)["hidden"],
+        "unmatched": [
+            {"row": x.get("row"), "owner": x.get("owner"),
+             "part_number": x.get("part_number"), "name": x.get("name")}
+            for x in planned["unmatched"]
+        ],
+        "issues": issue_rows,
+        "issue_summary": _iss.summary([x["outcome"] for x in issue_rows
+                                       if x.get("outcome")]),
+        "warnings": got["warnings"] + _df_typo_warnings(typo),
+    }
+
+
+# 미리보기에서 확인한 내용을 저장한다 ← admin v2 fd.onclick() · _divFormSend()
+@app.post("/admin/divisions/{division_id}/form/apply")
+async def admin_division_form_apply(
+    division_id: str,
+    file: UploadFile = File(...),
+    remove_missing: bool = Form(False),
+    create_projects: bool = Form(True),
+    _admin: int = Depends(get_admin_session),
+):
+    import datetime as _dt
+    import io as _io
+    import openpyxl as _ox
+    import division_form_import as _dfi
+
+    raw = await _keep_upload(file, "/admin/divisions/{division_id}/form/apply",
+                             division_id)
+    try:
+        wb = _ox.load_workbook(_io.BytesIO(raw), data_only=True, keep_links=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="엑셀을 열지 못했습니다: %s" % e)
+
+    try:
+        got = _dfi.parse_workbook(wb, division_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 주차 칸이 없는 양식도 받는다
+    month = got["month"]
+
+    idx = _df_owner_index(division_id)
+    # 오타로 붙인 이름 — 미리보기와 같은 문구로 알린다
+    typo = {}
+    # -----------------------------------------------------------
+    # 처음 보는 프로젝트를 먼저 만든다. 만들고 나서 색인을 다시
+    # -----------------------------------------------------------
+    #    세워야 아래 반영 고리가 그 프로젝트를 찾는다.
+    made_projects = []
+    if create_projects:
+        _miss = [{"owner": it.get("owner")} for it in got["items"]
+                 if not _df_find_project(it.get("owner"), idx)]
+        made_projects = _df_create_projects(
+            division_id, _df_new_project_rows(division_id, _miss))
+        if made_projects:
+            idx = _df_owner_index(division_id)
+
+    data = _load_models()
+    created = []
+    updated = []
+    unmatched = []
+    # 판가가 바뀐 품목 — 화면에 '언제부터 얼마로' 를 보여 준다
+    price_changes = []
+    # 판가 구간을 **양식의 기준 주차**부터 연다.
+    # 실적이 적힌 마지막 주차가 그 양식이 말하는 '지금' 이다.
+    # 주차 칸이 없는 양식(CUP · 챔버)만 올린 날의 주차로 떨어진다.
+    _price_tag = _df_week_tag(month, got.get("as_of_week")) or _this_week_tag()
+    # 양식이 건드린 모델. 여기 없는 모델이 '양식에서 지운 줄' 이다.
+    seen = {}
+    # -----------------------------------------------------------
+    # 1. 품목정보 반영
+    # -----------------------------------------------------------
+    for it in got["items"]:
+        pid = _df_find_project(it.get("owner"), idx, typo)
+        if not pid:
+            unmatched.append({"row": it.get("row"), "owner": it.get("owner"),
+                              "part_number": it.get("part_number"),
+                              "name": it.get("name")})
+            continue
+
+        proj = data.setdefault("projects", {}).setdefault(pid, {"models": []})
+        models = proj.setdefault("models", [])
+        m = _df_pick_model(models, it.get("part_number"), it.get("name"))
+
+        if m is None:
+            # -----------------------------------------------------------
+            # 새 모델. id 는 품번을 쓰고, 품번이 없으면 이름을 쓴다.
+            # -----------------------------------------------------------
+            mid = it.get("part_number") or it.get("name")
+            m = {"id": mid,
+                 "name": it.get("name") or it.get("part_number"),
+                 "part_number": it.get("part_number") or "",
+                 "group": it.get("group") or "양산",
+                 "status": "정상",
+                 "progress": 0}
+            models.append(m)
+            created.append({"project_key": pid, "model": mid})
+        else:
+            updated.append({"project_key": pid,
+                            "model": m.get("name") or m.get("id")})
+
+        seen.setdefault(pid, set()).add(id(m))
+        # -----------------------------------------------------------
+        # 이번 양식에 나왔다
+        # -----------------------------------------------------------
+        # 개발품은 끝나면 다음 양식에서 그냥 빠진다
+        m["last_form"] = {"month": month or "",
+                          "week": got.get("as_of_week") or "",
+                          "at": _dt.date.today().strftime("%Y-%m-%d")}
+        m.pop("missing_since", None)
+        # -----------------------------------------------------------
+        # 이 모델이 '언제 양식에 있었나' 를 적어 둔다
+        # -----------------------------------------------------------
+        # 양식에서 빠진 모델은 지우지 않는다 (remove_missing 기본 꺼짐).
+        m["last_form"] = {"week": got.get("as_of_week") or "",
+                          "month": month or "",
+                          "at": _dt.date.today().strftime("%Y-%m-%d"),
+                          "file": file.filename or ""}
+        # -----------------------------------------------------------
+        # 칸마다 '적혀 있을 때만' 덮어쓴다
+        # -----------------------------------------------------------
+        #    빈 칸을 0 으로 읽어 덮으면, 한 칸만 고쳐 올린 엑셀이
+        #    나머지를 전부 0 으로 만든다.
+        if it.get("group"):
+            m["group"] = it["group"]
+        if it.get("name"):
+            m["name"] = it["name"]
+        if it.get("part_number"):
+            m["part_number"] = it["part_number"]
+        # -----------------------------------------------------------
+        # 0 도 적힌 값이다
+        # -----------------------------------------------------------
+        # Min: "가끔 불량 생기면 PO 취소 될 경우가 생기기도 해"
+        #
+        # 전에는 `if it.get("po_qty"):` 였다. 0 이 거짓이라 **PO 전량 취소가
+        # 통째로 건너뛰어졌다** — 558 이 그대로 남았다. 이제 파서가 빈 칸을
+        # None 으로 돌려주니(_int_or_none) 둘을 가릴 수 있다.
+        #   적힌 0  → 덮어쓴다 (취소)
+        #   빈 칸   → 그냥 둔다 (한 칸만 고쳐 올린 엑셀이 나머지를 안 날린다)
+        if it.get("po_qty") is not None:
+            # -----------------------------------------------------------
+            # PO 수량이 바뀌면 기록을 남긴다
+            # -----------------------------------------------------------
+            #    "PO 가 왜 늘었지" 를 물으면 지금은 답할 자료가 없다.
+            #    양식을 올릴 때마다 전/후를 적어 두면 화면에서 ▲12 로
+            #    보여 줄 수 있고, 나중에 "언제 바뀌었나" 도 답이 된다.
+            _before = m.get("po_qty")
+            if _before is not None and int(_before) != int(it["po_qty"]):
+                _log = m.setdefault("po_log", [])
+                # -----------------------------------------------------------
+                # 어느 주차 것인가
+                # -----------------------------------------------------------
+                # 양식이 스스로 말해 준다 — 실적이 적힌 마지막 주차가 그 양식의 기준 주차다 (parse_items 의 as_of_week).
+                _log.append({"date": _dt.date.today().strftime("%Y-%m-%d"),
+                             "week": got.get("as_of_week") or "",
+                             "month": month or "",
+                             "from": int(_before), "to": int(it["po_qty"]),
+                             "delta": int(it["po_qty"]) - int(_before),
+                             "file": file.filename or ""})
+                # -----------------------------------------------------------
+                # 몇 번까지 들고 있나
+                # -----------------------------------------------------------
+                # 12번이었다. 양식이 **주에 한 번** 올라오니 12번은 석 달도 못 채운다
+                if len(_log) > 60:
+                    del _log[:-60]
+            m["po_qty"] = it["po_qty"]
+        if it.get("shipped_qty") is not None:
+            m["shipped_qty"] = it["shipped_qty"]
+        # -----------------------------------------------------------
+        # 판가·재료비는 '그 주차부터' 다
+        # -----------------------------------------------------------
+        # Min: "W43주차에 변경된 금액으로 올렸어 그러면 W42까지는 기존에
+        #      있던 금액 그대로 지표가 되어야 하고 43주차 부터 변경된
+        #      금액으로 지표가 되기를 원하는거야"
+        #
+        # 그냥 덮어쓰면 지난달 매출까지 새 판가로 다시 계산된다.
+        # _df_apply_price 가 구간(phases)으로 쌓고 값도 같이 넣는다.
+        _pc = _df_apply_price(m, it, _price_tag)
+        if _pc:
+            _pc["project_key"] = pid
+            price_changes.append(_pc)
+        if it.get("price_currency"):
+            m["price_currency"] = it["price_currency"]
+        if it.get("material_currency"):
+            m["material_currency"] = it["material_currency"]
+        # -----------------------------------------------------------
+        # 반도체 양식에만 있는 칸. 없는 양식에서는 안 건드린다.
+        # -----------------------------------------------------------
+        if it.get("year_qty") is not None:
+            m["year_qty"] = it["year_qty"]
+        if it.get("dev_type"):
+            m["dev_type"] = it["dev_type"]
+        if it.get("note"):
+            m["note"] = it["note"]
+        # -----------------------------------------------------------
+        # 납기 날짜
+        # -----------------------------------------------------------
+        #    칸이 있는 양식이면 빈칸도 그대로 (지운 날짜는 지운다).
+        for _dk in ("due_date", "due_revised", "made_date"):
+            if _dk in it:
+                m[_dk] = it[_dk] or ""
+        # -----------------------------------------------------------
+        # 주차별 계획·실적
+        # -----------------------------------------------------------
+        # 주차마다 '그 주차가 속한 달' 칸에 넣는다
+        if it.get("weeks"):
+            wp = m.setdefault("weekly_plan", {})
+            for _wk, _cell in it["weeks"].items():
+                _mon = _wcal.month_of_week(_wk) or month
+                if not _mon:
+                    continue
+                wp.setdefault(_mon, {})[_wk] = _cell
+    # -----------------------------------------------------------
+    # 2. 이슈사항 반영 — 진행 / 해결
+    # -----------------------------------------------------------
+    #    같은 이슈 = 프로젝트 + 품번 + 내용(띄어쓰기·기호 무시).
+    #    '해결' 이면 닫고, 줄이 빠진 것은 건드리지 않는다.
+    issue_applied = 0
+    issue_unmatched = []
+    issue_results = []
+    for ix in got["issues"]:
+        pid = _df_find_project(ix.get("owner"), idx, typo)
+        if not pid:
+            issue_unmatched.append(ix)
+            continue
+        res = _df_issue_apply(data, pid, ix, file=file.filename or "")
+        issue_results.append(res)
+        if res in (_iss.ADDED, _iss.CLOSED_NOW):
+            issue_applied += 1
+    # -----------------------------------------------------------
+    # 2-1. 국내 / 해외
+    # -----------------------------------------------------------
+    #    고객사마다 품목 줄에 적힌 값 중 가장 많은 것. 다 비었으면 안 바꾼다.
+    region_set = {}
+    if _dcol.region_on(division_id):
+        _votes = {}
+        for it in got["items"]:
+            grp = _dcol.parse_group(division_id, it.get("region"))
+            if not grp:
+                continue
+            pid = _df_find_project(it.get("owner"), idx, typo)
+            if pid:
+                _votes.setdefault(pid, {}).setdefault(tuple(grp), 0)
+                _votes[pid][tuple(grp)] += 1
+        for pid, v in _votes.items():
+            best = sorted(v.items(), key=lambda kv: -kv[1])[0][0]
+            data.setdefault("projects", {}).setdefault(pid, {"models": []})["customer_group"] = list(best)
+            data["projects"][pid]["customer_group_src"] = "excel"
+            region_set[pid] = _dcol.region_label(
+                _dcol.customer_group(division_id, pid, list(best)))
+        # 묶음 칸이 비어 '미분류' 로 들어가는 고객사 — 짐작하지 않고 알린다
+        _unsorted = []
+        for it in got["items"]:
+            pid = _df_find_project(it.get("owner"), idx, typo)
+            if not pid or pid in _unsorted:
+                continue
+            _pj = (data.get("projects") or {}).get(pid) or {}
+            # 그 고객사 모델들의 '구분 1' 중 가장 많은 것 (아리스타가 이걸로 묶는다)
+            _count = {}
+            for m in (_pj.get("models") or []):
+                _t = str((m or {}).get("dev_type") or "") if isinstance(m, dict) else ""
+                if _t:
+                    _count[_t] = _count.get(_t, 0) + 1
+            _top_type = ""
+            if _count:
+                _top_type = max(_count, key=_count.get)
+            _g = _dcol.customer_group(division_id, pid, _pj.get("customer_group"),
+                                      it.get("owner"), _top_type)
+            if _g and list(_g)[:1] == _dcol.UNSORTED[:1]:
+                _unsorted.append(pid)
+        if _unsorted:
+            got.setdefault("warnings", []).append(
+                "%s 칸이 비어 '미분류' 로 들어간 고객사 %d곳: %s — 그 칸을 채워 다시 올려 주세요"
+                % (_dcol.group_col(division_id)["header"], len(_unsorted),
+                   ", ".join(_display_project_label(x) for x in _unsorted[:10])))
+    # -----------------------------------------------------------
+    # 2-2. 용어 사전
+    # -----------------------------------------------------------
+    #    양식 한 장이 그 사업부 용어 전부다. 통째로 갈아 끼운다.
+    #    빈 목록이면 안 지운다 — 용어를 안 적은 양식이 훨씬 흔하다.
+    term_saved = 0
+    try:
+        term_saved = _dterm.put(division_id, got.get("terms") or [],
+                                file.filename or "")
+    except Exception as _e:
+        print("[용어] 담지 못했습니다(무시) — %s" % _e)
+    # -----------------------------------------------------------
+    # 3. 양식에 없는 모델
+    # -----------------------------------------------------------
+    #    목록은 늘 만들어 돌려준다 (화면에 보여 주려고). 실제로 지우는
+    #    것은 사람이 켰을 때만.
+    stale = _df_stale_models(data, seen)
+    # -----------------------------------------------------------
+    # 빠진 모델에 '언제부터 안 보이나' 를 적는다
+    # -----------------------------------------------------------
+    # 지우지는 않는다. 개발품(RPM)은 끝나면 양식에서 그냥 빠지는데, 지워 버리면 그 품목의 주차별 계획·실적이 통째로 없어진다
+    _mark = {}
+    for x in stale:
+        _mark.setdefault(x["project_key"], set()).add(str(x["id"] or ""))
+    for pid, ids in _mark.items():
+        for m in ((data.get("projects") or {}).get(pid) or {}).get("models") or []:
+            if not isinstance(m, dict) or str(m.get("id") or "") not in ids:
+                continue
+            if not m.get("missing_since"):
+                m["missing_since"] = {
+                    "month": month or "",
+                    "week": got.get("as_of_week") or "",
+                    "at": _dt.date.today().strftime("%Y-%m-%d"),
+                }
+
+    removed = []
+    if remove_missing and stale:
+        _by_pid = {}
+        for x in stale:
+            _by_pid.setdefault(x["project_key"], set()).add(x["id"])
+        for pid, ids in _by_pid.items():
+            proj = (data.get("projects") or {}).get(pid) or {}
+            keep = []
+            for m in (proj.get("models") or []):
+                if isinstance(m, dict) and str(m.get("id") or "") in ids:
+                    removed.append({"project_key": pid,
+                                    "model": m.get("name") or m.get("id")})
+                    continue
+                keep.append(m)
+            proj["models"] = keep
+    # -----------------------------------------------------------
+    # 4. 양식에 없는 프로젝트는 끈다
+    # -----------------------------------------------------------
+    #    모델보다 나중이다 — 위에서 이번 양식의 품목을 다 붙여 놓아야
+    #    '어느 프로젝트가 살아 있나' 가 정확하다.
+    proj_sync = _df_project_sync(division_id, got["items"], idx)
+
+    _save_models(data)
+    print("[사업부 양식] %s '%s': 모델 신규 %d · 갱신 %d · 삭제 %d · "
+          "이슈 %d · 미매칭 %d"
+          % (division_id, file.filename or "", len(created), len(updated),
+             len(removed), issue_applied, len(unmatched)))
+
+    return {
+        "ok": True,
+        "stale": stale,
+        "removed": removed,
+        "division_id": division_id,
+        "file_name": file.filename or "",
+        "month": month,
+        "weeks": got["weeks"],
+        "created": created,
+        "updated": updated,
+        "unmatched": unmatched,
+        "created_projects": [{"key": p["id"], "label": p["label"]}
+                             for p in made_projects],
+        # 양식에 없어서 화면에서 내린 프로젝트 / 다시 적혀서 올린 프로젝트
+        "hidden_projects": proj_sync["hidden"],
+        "shown_projects": proj_sync["shown"],
+        # 판가가 바뀐 품목 — '언제부터 얼마로' 를 그대로 보여 준다
+        "price_changes": price_changes,
+        "price_from": _price_tag,
+        "issue_applied": issue_applied,
+        "issue_summary": _iss.summary(issue_results),
+        "region_set": region_set,
+        "issue_unmatched": [
+            {"owner": x.get("owner"), "text": x.get("text")}
+            for x in issue_unmatched
+        ],
+        "term_saved": term_saved,
+        # 양식 안의 일일 실적은 아직 반영하지 않는다
+        "daily_rows": len(got.get("daily") or []),
+        "warnings": got["warnings"] + _df_typo_warnings(typo),
+    }
+
+# ============================================================
+#  계획 파일 (plan-file)
+# ============================================================
+# 올린 파일이 무엇을 바꾸는지 먼저 보여준다 ← admin v2 _pfRerun() · pfFile.onchange()
 @app.post("/admin/projects/{project_key}/plan-file/preview")
 async def admin_plan_file_preview(
     project_key: str,
@@ -15952,7 +10706,7 @@ async def admin_plan_file_preview(
     month: str = Form(""),
     _admin: int = Depends(get_admin_session),
 ):
-    """올린 파일이 무엇을 바꾸는지 먼저 보여준다. 저장하지 않는다."""
+    _form_only("plan-file")
     key = project_key.strip()
     orig, wb = await _pbx_open_upload(
         file, "/admin/projects/{project_key}/plan-file/preview", key)
@@ -16039,6 +10793,7 @@ async def admin_plan_file_preview(
     return out
 
 
+# 미리보기에서 확인한 내용을 저장한다 ← admin v2 _pfModelsOnly() · onclick()
 @app.post("/admin/projects/{project_key}/plan-file/apply")
 async def admin_plan_file_apply(
     project_key: str,
@@ -16048,10 +10803,7 @@ async def admin_plan_file_apply(
     overwrite: str = Form(""),
     _admin: int = Depends(get_admin_session),
 ):
-    """미리보기에서 확인한 내용을 저장한다.
-
-    overwrite 를 보내지 않으면 모델 칸은 **비어 있던 것만** 채운다.
-    """
+    _form_only("plan-file")
     key = project_key.strip()
     orig, wb = await _pbx_open_upload(
         file, "/admin/projects/{project_key}/plan-file/apply", key)
@@ -16132,11 +10884,7 @@ async def admin_plan_file_apply(
         applied += hit
         done.append({"month": mon, "applied": hit, "weeks": diff["weeks"]})
 
-    # 프로젝트 현황 — 양식 아래 '프로젝트 현황' 두 줄 (2026-10-22)
-    #
-    # 모델 줄의 비고와 **다른 층**이다. 비고는 그 모델 하나만 멈춘 것이고
-    # 여기는 프로젝트 전체가 멈춘 것이다. 섞으면 모델 하나 드롭이 프로젝트
-    # 전체 드롭으로 읽혀서, 그 프로젝트 모델 전부가 지연 집계에서 빠진다.
+    # 프로젝트 현황 — 양식 아래 '프로젝트 현황' 두 줄
     _pstat = None
     try:
         _ws2 = wb[parsed["sheet"]] if parsed.get("sheet") in wb.sheetnames else None
@@ -16177,7 +10925,7 @@ async def admin_plan_file_apply(
         "sheet": parsed.get("sheet"),
         "month": mon,
         "months": [d["month"] for d in done],
-        "uploaded_at": __import__("datetime").datetime.now().isoformat(),
+        "uploaded_at": datetime.now().isoformat(),
     }
 
     _save_models(data)
@@ -16194,9 +10942,9 @@ async def admin_plan_file_apply(
             "unmatched": un_all, "file_name": orig}
 
 
+# 주차별 계획 삭제
 @app.delete("/admin/projects/{project_key}/weekly-plan")
 def admin_delete_weekly_plan(project_key: str, _admin: int = Depends(get_admin_session)):
-    """주차별 계획 삭제"""
     _alias = {
         "havaplate": "hrva_plate",
         "hrvaplate": "hrva_plate",
@@ -16216,7 +10964,10 @@ def admin_delete_weekly_plan(project_key: str, _admin: int = Depends(get_admin_s
         _save_models(data)
     return {"ok": True, "project_key": _key}
 
-
+# ============================================================
+#  보고서 고치기 · 파일 붙이기 · AI 다듬기 (잠김)
+# ============================================================
+# 보고서 고치기 (잠김) ← admin v2 executeDelete() · __moreBtn.onclick() · _loadSalesForSection() 외
 @app.put("/admin/reports/{doc_id}")
 def admin_update_report(doc_id: str, payload: dict, _admin: int = Depends(get_admin_session)):
     # 수기 편집 저장
@@ -16290,10 +11041,9 @@ def admin_update_report(doc_id: str, payload: dict, _admin: int = Depends(get_ad
             it["project_overrides"] = existing_ov
 
         # N-1: 저장 시점의 현재 주차로 강제 업데이트 (수정 저장 기준)
-        from datetime import date
         current_week = date.today().isocalendar()[1]
         it["week_override"] = current_week
-        
+
         # parsed.display_title도 업데이트
         if it.get("parsed") and it["parsed"].get("projects"):
             projects_str = ", ".join(it["parsed"]["projects"])
@@ -16337,18 +11087,18 @@ def admin_update_report(doc_id: str, payload: dict, _admin: int = Depends(get_ad
         except Exception as _fcm_e:
             print(f"[FCM] hook 오류: {_fcm_e}")
     else:
-        print(f"[FCM] edit mode: alarm deferred to edit_done")
+        print("[FCM] edit mode: alarm deferred to edit_done")
 
     return {"ok": True, "doc_id": doc_id, "edit_mode": edit_mode}
 
 
+# 편집 완료: 저장된 before snapshot과 현재 상태 비교 → 알람 1회 발송 ← admin v2 _flushManualEditAlarmSession()
 @app.post("/admin/reports/{doc_id}/edit_done")
 def admin_report_edit_done(doc_id: str, _admin: int = Depends(get_admin_session)):
-    """편집 완료: 저장된 before snapshot과 현재 상태 비교 → 알람 1회 발송"""
     _before_snapshot = _clear_edit_session(doc_id)
     if not _before_snapshot:
         return {"ok": True, "doc_id": doc_id, "message": "no edit session found"}
-    
+
     try:
         _after_snapshot = _snapshot_notes_status()
         _events = _detect_status_transitions(_before_snapshot, _after_snapshot)
@@ -16357,12 +11107,13 @@ def admin_report_edit_done(doc_id: str, _admin: int = Depends(get_admin_session)
             _fire_status_alarms(_events)
             return {"ok": True, "doc_id": doc_id, "alarms_fired": len(_events)}
         else:
-            print(f"[FCM] edit_done: 변경 없음 (no alarms)")
+            print("[FCM] edit_done: 변경 없음 (no alarms)")
             return {"ok": True, "doc_id": doc_id, "alarms_fired": 0}
     except Exception as e:
         print(f"[FCM] edit_done 오류: {e}")
         return {"ok": False, "doc_id": doc_id, "error": str(e)}
 
+# 보고서 섹션에 파일 붙이기 (잠김) ← admin v2 _flushManualEditAlarmSession()
 @app.post("/admin/reports/{doc_id}/section-file")
 async def admin_upload_section_file(
     doc_id: str,
@@ -16371,7 +11122,7 @@ async def admin_upload_section_file(
 ):
     # 수기 프로젝트의 섹션 안 파일 블록용 업로드.
     # uploads/manual/{doc_id}/ 아래에 저장하고 다운로드 URL 반환.
-    import re as _re, uuid as _uuid, shutil as _shutil
+    import re as _re, uuid as _uuid
     items = _read_json(LATEST_FILE, [])
     target = None
     for it in items:
@@ -16425,13 +11176,13 @@ async def admin_upload_section_file(
     }
 
 
+# 섹션에 첨부된 xlsx 파일을 파싱해서 models/weeks 리턴 (판가 입력용) ← admin v2 _loadSalesForSection()
 @app.post("/admin/reports/{doc_id}/section-parse-xlsx")
 async def admin_parse_section_xlsx(
     doc_id: str,
     payload: dict,
     _admin: int = Depends(get_admin_session)
 ):
-    """섹션에 첨부된 xlsx 파일을 파싱해서 models/weeks 리턴 (판가 입력용)."""
     import re as _re
     filename = (payload or {}).get('filename') or ''
     filename = filename.strip()
@@ -16450,6 +11201,7 @@ async def admin_parse_section_xlsx(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'parse error: {e}')
 
+# 보고서 섹션에 붙인 파일 내려받기 ← admin v2 _loadXlsxPreviews()
 @app.get("/admin/manual-files/{doc_id}/{filename}")
 def admin_download_section_file(
     doc_id: str,
@@ -16467,6 +11219,7 @@ def admin_download_section_file(
     return FileResponse(str(fp), filename=filename)
 
 
+# 보고서에 붙인 엑셀을 표로 미리보기 ← admin v2 _loadXlsxPreviews()
 @app.get("/admin/manual-files/{doc_id}/{filename}/xlsx-preview")
 def admin_xlsx_preview(
     doc_id: str,
@@ -16484,14 +11237,15 @@ def admin_xlsx_preview(
         raise HTTPException(status_code=400, detail="not an excel file")
     try:
         from openpyxl import load_workbook
-        wb = load_workbook(str(fp), data_only=True)
+        wb = load_workbook(str(fp), data_only=True, keep_links=False)
         ws = wb.active
         sheet_name = ws.title if ws else ""
 
         MAX_ROWS = 50
         MAX_COLS = 20
-
-        # 1) 병합 범위 파악: (min_row, min_col) → (rowspan, colspan)
+        # -----------------------------------------------------------
+        # 병합 범위 파악: (min_row, min_col) → (rowspan, colspan)
+        # -----------------------------------------------------------
         merged_map = {}
         skip_cells = set()
         for mr in ws.merged_cells.ranges:
@@ -16501,8 +11255,9 @@ def admin_xlsx_preview(
                 for cc in range(c1, c2 + 1):
                     if (rr, cc) != (r1, c1):
                         skip_cells.add((rr, cc))
-
-        # 2) 실제 데이터 범위 (빈 행/열 제거 + 시작 여백 trim)
+        # -----------------------------------------------------------
+        # 실제 데이터 범위 (빈 행/열 제거 + 시작 여백 trim)
+        # -----------------------------------------------------------
         max_r = min(ws.max_row or 0, MAX_ROWS)
         max_c = min(ws.max_column or 0, MAX_COLS)
 
@@ -16521,8 +11276,9 @@ def admin_xlsx_preview(
         real_max_r = max(r for r, _ in non_empty)
         real_min_c = min(c for _, c in non_empty)
         real_max_c = max(c for _, c in non_empty)
-
-        # 3) 행 데이터 구성 (실제 데이터 bounding box만)
+        # -----------------------------------------------------------
+        # 행 데이터 구성 (실제 데이터 bounding box만)
+        # -----------------------------------------------------------
         rows = []
         for r in range(real_min_r, real_max_r + 1):
             row_cells = []
@@ -16554,8 +11310,8 @@ def admin_xlsx_preview(
                     8: "5B9BD5", 9: "70AD47",
                 }
 
+                # openpyxl tint(-1.0~1.0)를 근사 반영.
                 def _apply_tint(hex6: str, tint) -> str:
-                    """openpyxl tint(-1.0~1.0)를 근사 반영."""
                     try:
                         t = float(tint or 0)
                     except Exception:
@@ -16567,12 +11323,16 @@ def admin_xlsx_preview(
                     b = int(hex6[4:6], 16)
                     if t < 0:
                         f = 1 + t
-                        r = int(r * f); g = int(g * f); b = int(b * f)
+                        r = int(r * f)
+                        g = int(g * f)
+                        b = int(b * f)
                     else:
                         r = int(r + (255 - r) * t)
                         g = int(g + (255 - g) * t)
                         b = int(b + (255 - b) * t)
-                    r = max(0, min(255, r)); g = max(0, min(255, g)); b = max(0, min(255, b))
+                    r = max(0, min(255, r))
+                    g = max(0, min(255, g))
+                    b = max(0, min(255, b))
                     return f"{r:02X}{g:02X}{b:02X}"
 
                 def _color_to_hex(color_obj):
@@ -16670,6 +11430,7 @@ def admin_xlsx_preview(
         raise HTTPException(status_code=500, detail=f"excel parse error: {e}")
 
 
+# 보고서 글을 AI 로 다듬기 (잠김) ← admin v2 _flushManualEditAlarmSession()
 @app.post("/admin/reports/{doc_id}/polish-text")
 def admin_polish_text(
     doc_id: str,
@@ -16816,8 +11577,9 @@ def admin_polish_text(
         polished = _re.sub(r"\s*```$", "", polished)
         if not polished:
             raise HTTPException(status_code=500, detail="empty model output")
-
-        # === 후처리: 표기 통일 강제 (프롬프트가 놓친 경우 대비) ===
+        # -----------------------------------------------------------
+        # 후처리: 표기 통일 강제 (프롬프트가 놓친 경우 대비)
+        # -----------------------------------------------------------
         # 화살표 통일: --> / -> / => / ⇒ / ~> → →
         # 주의: <br>, </li>, <br/> 등 HTML 안의 - 는 건드리지 않음
         polished = _re.sub(r"-->", "→", polished)
@@ -16872,6 +11634,7 @@ def admin_polish_text(
         raise HTTPException(status_code=500, detail=f"ai polish error: {e}")
 
 
+# 보고서 숨기기/보이기 (잠김) ← admin v2 __moreBtn.onclick()
 @app.post("/admin/reports/{doc_id}/hide")
 def admin_toggle_hide(doc_id: str, _admin: int = Depends(get_admin_session)):
     # 숨김/숨김해제 토글. hidden=True 이면 /reports 에서 제외됨.
@@ -16890,9 +11653,10 @@ def admin_toggle_hide(doc_id: str, _admin: int = Depends(get_admin_session)):
     _resync_notes_from_latest()
     return {"ok": True, "doc_id": doc_id, "hidden": new_state}
 
-
+# ============================================================
+#  PPT · 카드 지우기 · 초기화 (잠김)
+# ============================================================
 def _resync_notes_from_latest() -> None:
-    """reports_latest.json 기준으로 notes.json 자동동기화 카드를 재생성"""
     try:
         latest_items = _read_json(LATEST_FILE, [])
         notes_data = _load_notes()
@@ -16915,11 +11679,13 @@ def _resync_notes_from_latest() -> None:
         traceback.print_exc()
 
 
+# PPT 파일 단위 삭제: reports_latest.json + 관련 폴더/파일 전부 정리
 @app.delete("/admin/doc/{doc_id}")
 def admin_delete_doc(doc_id: str, _admin: int = Depends(get_admin_session)):
-    """PPT 파일 단위 삭제: reports_latest.json + 관련 폴더/파일 전부 정리"""
     import shutil
-    # 1) reports_latest.json 에서 제거
+    # -----------------------------------------------------------
+    # reports_latest.json 에서 제거
+    # -----------------------------------------------------------
     items = _read_json(LATEST_FILE, [])
     before = len(items)
     items = [it for it in items if it.get("doc_id") != doc_id]
@@ -16927,8 +11693,9 @@ def admin_delete_doc(doc_id: str, _admin: int = Depends(get_admin_session)):
     if before == after:
         raise HTTPException(status_code=404, detail="해당 doc_id를 찾을 수 없습니다.")
     _write_json(LATEST_FILE, items)
-
-    # 2) 파일 시스템 정리
+    # -----------------------------------------------------------
+    # 파일 시스템 정리
+    # -----------------------------------------------------------
     removed = []
     pptx_path = UPLOAD_DIR / f"{doc_id}.pptx"
     if pptx_path.exists():
@@ -16940,8 +11707,9 @@ def admin_delete_doc(doc_id: str, _admin: int = Depends(get_admin_session)):
         if target.exists() and target.is_dir():
             shutil.rmtree(target)
             removed.append(f"{folder_dir.name}/{doc_id}/")
-
-    # 3) upload_hashes.json 에서 제거
+    # -----------------------------------------------------------
+    # upload_hashes.json 에서 제거
+    # -----------------------------------------------------------
     try:
         idx = _load_upload_hash_index()
         new_idx = {k: v for k, v in idx.items() if v.get("doc_id") != doc_id}
@@ -16954,12 +11722,12 @@ def admin_delete_doc(doc_id: str, _admin: int = Depends(get_admin_session)):
     return {"ok": True, "doc_id": doc_id, "removed": removed, "remaining": after}
 
 
+# PPT doc_id 여러 개 일괄 삭제
 @app.post("/admin/docs/delete-batch")
 def admin_delete_docs_batch(
     payload: dict,
     _admin: int = Depends(get_admin_session),
 ):
-    """PPT doc_id 여러 개 일괄 삭제"""
     doc_ids = payload.get("doc_ids", []) if isinstance(payload, dict) else []
     if not isinstance(doc_ids, list):
         raise HTTPException(status_code=400, detail="doc_ids must be a list")
@@ -16985,13 +11753,13 @@ def admin_delete_docs_batch(
     }
 
 
+# 카드(product) 1장 단위 삭제
 @app.delete("/admin/card")
 def admin_delete_card(
     doc_id: str,
     product_idx: int,
     _admin: int = Depends(get_admin_session),
 ):
-    """카드(product) 1장 단위 삭제"""
     items = _read_json(LATEST_FILE, [])
     target = None
     for it in items:
@@ -17016,6 +11784,7 @@ def admin_delete_card(
     }
 
 
+# 자료 초기화 (잠김).
 @app.post("/admin/reset")
 def admin_reset(
     password: str = Form(default=""),
@@ -17028,2611 +11797,19 @@ def admin_reset(
     return {"ok": True, "message": "최신 데이터가 초기화되었습니다."}
 
 
-# =========================================================
-# 어드민 업로드 페이지 HTML
-# =========================================================
-_ADMIN_UPLOAD_HTML = """
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>사업부 보고 관리자</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
-    background: #f5f7fa;
-    color: #1f2937;
-    line-height: 1.6;
-  }
-  header {
-    background: #1E3A5F;
-    color: white;
-    padding: 20px 32px;
-  }
-  header h1 { font-size: 20px; font-weight: 700; }
-  header .meta { font-size: 12px; color: #cbd5e1; margin-top: 4px; }
 
-  nav.tabs {
-    display: flex;
-    background: white;
-    border-bottom: 1px solid #e5e7eb;
-    padding: 0 32px;
-    gap: 8px;
-    overflow-x: auto;
-  }
-  nav.tabs button {
-    padding: 14px 20px;
-    border: none;
-    background: transparent;
-    cursor: pointer;
-    font-size: 15px;
-    color: #6b7280;
-    border-bottom: 3px solid transparent;
-    transition: all 0.15s;
-    font-weight: 500;
-    white-space: nowrap;
-  }
-  nav.tabs button:hover { color: #1E3A5F; background: #f9fafb; }
-  nav.tabs button.active {
-    color: #1E3A5F;
-    border-bottom-color: #1E3A5F;
-    font-weight: 700;
-  }
-
-  main {
-    max-width: 960px;
-    margin: 0 auto;
-    padding: 32px 20px;
-  }
-  .tab-content { display: none; }
-  .tab-content.active { display: block; }
-
-  .card {
-    background: white;
-    padding: 24px;
-    border-radius: 12px;
-    margin-bottom: 20px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-  }
-  .card h2 { margin: 0 0 16px; font-size: 18px; color: #1f2937; }
-
-  label { display: block; margin: 14px 0 6px; font-weight: 600; font-size: 13px; color: #333; }
-  input, select, textarea {
-    width: 100%;
-    padding: 10px;
-    border: 1px solid #ddd;
-    border-radius: 8px;
-    font-size: 14px;
-    background: white;
-    font-family: inherit;
-  }
-  button {
-    background: #1E3A5F;
-    color: white;
-    border: none;
-    padding: 12px 24px;
-    border-radius: 8px;
-    font-size: 15px;
-    font-weight: 600;
-    cursor: pointer;
-    margin-top: 16px;
-  }
-  button:hover { background: #2c4d75; }
-  button.delete {
-    background: #ff3b30;
-    padding: 6px 12px;
-    font-size: 13px;
-    margin-top: 0;
-  }
-  button.delete:hover { background: #d92e26; }
-
-  .image-item {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 12px;
-    border-bottom: 1px solid #eee;
-  }
-  .image-item:last-child { border-bottom: none; }
-  .image-item img {
-    width: 80px;
-    height: 60px;
-    object-fit: cover;
-    border-radius: 6px;
-    border: 1px solid #ddd;
-  }
-  .image-item .info { flex: 1; font-size: 13px; color: #555; }
-  .image-item .info strong { color: #1f2937; }
-  .image-item .badges { margin-top: 4px; }
-  .badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 11px;
-    background: #e5e7eb;
-    color: #374151;
-    margin-right: 4px;
-  }
-  .badge.section { background: #fff3cd; color: #856404; }
-
-  #uploadMsg {
-    margin-top: 12px;
-    padding: 10px;
-    border-radius: 6px;
-    font-size: 14px;
-  }
-  #uploadMsg.success { background: #d4edda; color: #155724; }
-  #uploadMsg.error { background: #f8d7da; color: #721c24; }
-
-  /* 노트 첨부 (표/사진) 버튼 */
-  .note-item-row { display: flex; align-items: flex-start; gap: 6px; }
-  .note-item-text { flex: 1; }
-  .note-attach-btn {
-    background: transparent; border: 1px solid #d1d5db; color: #6b7280;
-    padding: 2px 8px; font-size: 11px; border-radius: 4px; cursor: pointer;
-    margin: 0; line-height: 1.4; white-space: nowrap;
-  }
-  .note-attach-btn:hover { background: #f3f4f6; color: #1E3A5F; border-color: #1E3A5F; }
-  .note-attach-btn.has-attachment { background: #fef3c7; color: #92400e; border-color: #f59e0b; }
-  .note-mini-table {
-    margin: 6px 0 6px 28px; border-collapse: collapse; font-size: 12px;
-    background: white; border: 1px solid #e5e7eb; border-radius: 4px;
-  }
-  .note-mini-table th, .note-mini-table td {
-    border: 1px solid #e5e7eb; padding: 4px 8px; text-align: left;
-  }
-  .note-mini-table th { background: #f9fafb; font-weight: 600; color: #374151; }
-  .note-mini-photo {
-    margin: 6px 0 6px 28px; max-width: 200px; max-height: 120px;
-    border-radius: 6px; border: 1px solid #e5e7eb; cursor: pointer; display: block;
-  }
-  .note-attach-controls { display: flex; gap: 4px; margin: 4px 0 0 28px; }
-  .note-attach-controls button {
-    font-size: 11px; padding: 2px 6px; margin: 0;
-    background: #f3f4f6; color: #4b5563; border: 1px solid #d1d5db; border-radius: 4px;
-  }
-  .note-attach-controls button.danger { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
-
-  /* 표 편집 모달 */
-  .modal-overlay {
-    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
-    z-index: 1000; justify-content: center; align-items: center;
-  }
-  .modal-overlay.show { display: flex; }
-  .modal-box {
-    background: white; border-radius: 12px; padding: 24px;
-    max-width: 90vw; max-height: 90vh; overflow: auto; min-width: 520px;
-  }
-  .modal-box h3 { margin: 0 0 12px; color: #1E3A5F; font-size: 18px; }
-  .modal-box .modal-input {
-    width: 100%; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px;
-    font-size: 13px; margin-bottom: 10px; box-sizing: border-box;
-  }
-  .modal-box textarea.modal-input { min-height: 80px; font-family: monospace; }
-  .modal-box .modal-table {
-    border-collapse: collapse; width: 100%; margin-bottom: 12px; font-size: 13px;
-  }
-  .modal-box .modal-table th, .modal-box .modal-table td {
-    border: 1px solid #d1d5db; padding: 4px;
-  }
-  .modal-box .modal-table input {
-    border: none; width: 100%; padding: 4px; font-size: 13px; box-sizing: border-box;
-  }
-  .modal-box .modal-table input:focus { outline: 2px solid #1E3A5F; }
-  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
-  .modal-actions button { margin: 0; padding: 8px 16px; font-size: 13px; }
-  .modal-actions button.cancel { background: #6b7280; }
-  .modal-actions button.danger { background: #dc2626; }
-
-  /* 사진 확대 모달 */
-  .photo-overlay {
-    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.9);
-    z-index: 1100; justify-content: center; align-items: center; cursor: pointer;
-  }
-  .photo-overlay.show { display: flex; }
-  .photo-overlay img { max-width: 95vw; max-height: 95vh; }
-
-
-  /* 매핑 관리 대시보드 */
-  .map-chip {
-    padding: 6px 12px; border: 1px solid #d1d5db; border-radius: 16px;
-    background: white; color: #4b5563; font-size: 13px; cursor: pointer;
-    transition: all 0.15s;
-  }
-  .map-chip:hover { background: #f3f4f6; border-color: #1E3A5F; color: #1E3A5F; }
-  .map-chip.active { background: #1E3A5F; color: white; border-color: #1E3A5F; font-weight: 600; }
-  .map-chip .count {
-    display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 8px;
-    font-size: 11px; background: #e5e7eb; color: #374151;
-  }
-  .map-chip.active .count { background: rgba(255,255,255,0.25); color: white; }
-
-  .map-pcard {
-    background: white; border: 1px solid #e5e7eb; border-radius: 8px;
-    padding: 12px 14px; transition: all 0.15s; cursor: default;
-  }
-  .map-pcard:hover { border-color: #1E3A5F; box-shadow: 0 2px 8px rgba(30,58,95,0.08); }
-  .map-pcard .ptitle { font-size: 14px; font-weight: 600; color: #1f2937; margin-bottom: 8px; }
-  .map-pcard .pmeta { display: flex; gap: 10px; font-size: 12px; color: #6b7280; }
-  .map-pcard .pmeta .badge-ppt { color: #1E3A5F; }
-  .map-pcard .pmeta .badge-note { color: #10b981; }
-  .map-pcard .pmeta .badge-empty { color: #d1d5db; }
-
-  .placeholder {
-    background: white;
-    border: 2px dashed #d1d5db;
-    border-radius: 12px;
-    padding: 60px 40px;
-    text-align: center;
-    color: #6b7280;
-  }
-  .placeholder .icon { font-size: 48px; margin-bottom: 16px; }
-  .placeholder h3 { font-size: 18px; margin-bottom: 8px; color: #374151; }
-  .placeholder p { font-size: 14px; }
-
-  .footer-info {
-    text-align: center;
-    color: #9ca3af;
-    font-size: 12px;
-    padding: 24px;
-  }
-
-  /* Dropzone */
-  .dropzone {
-    border: 2px dashed #cbd5e1;
-    border-radius: 10px;
-    padding: 28px 16px;
-    text-align: center;
-    cursor: pointer;
-    transition: all 0.15s ease;
-    background: #f8fafc;
-  }
-  .dropzone:hover { border-color: #1E3A5F; background: #f1f5f9; }
-  .dropzone.dragover { border-color: #1E3A5F; background: #e0e7ff; transform: scale(1.01); }
-  .dz-icon { font-size: 36px; margin-bottom: 8px; }
-  .dz-title { font-size: 14px; font-weight: 600; color: #1E3A5F; margin-bottom: 4px; }
-  .dz-sub { font-size: 12px; color: #64748b; }
-  .file-row {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 8px 12px; margin-top: 6px;
-    background: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;
-  }
-  .file-row-name { font-size: 13px; color: #1f2937; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 8px; }
-  .file-row-size { font-size: 11px; color: #6b7280; margin-right: 8px; }
-  .file-row-remove { background: transparent; color: #b91c1c; border: none; cursor: pointer; font-size: 16px; padding: 0 4px; }
-  .file-row-remove:hover { color: #7f1d1d; }
-
-  
-  /* Progress bar */
-  .pf-row { padding: 10px 12px; border-bottom: 1px solid #f1f5f9; font-size: 13px; }
-  .pf-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
-  .pf-status { width: 22px; text-align: center; font-size: 15px; }
-  .pf-name { font-weight: 600; color: #1f2937; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .pf-pct { color: #1E3A5F; font-weight: 700; min-width: 44px; text-align: right; }
-  .pf-barwrap { background: #e5e7eb; border-radius: 999px; height: 8px; overflow: hidden; }
-  .pf-bar { background: linear-gradient(90deg, #1E3A5F, #3b82f6); height: 100%; width: 0%; transition: width 0.18s ease; }
-  .pf-bar.done { background: linear-gradient(90deg, #10b981, #059669); }
-  .pf-bar.fail { background: linear-gradient(90deg, #ef4444, #b91c1c); }
-  .pf-bar.warn { background: linear-gradient(90deg, #f59e0b, #d97706); }
-  .pf-detail { margin-top: 6px; color: #6b7280; font-size: 12px; }
-  .pf-total {
-    display: flex; align-items: center; gap: 10px;
-    background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;
-    padding: 10px 14px; margin-bottom: 12px; font-size: 13px;
-  }
-  .pf-total .pf-barwrap { flex: 1; height: 10px; }
-  .pf-total-label { font-weight: 700; color: #1E3A5F; }
-  .pf-total-pct { font-weight: 700; color: #1E3A5F; min-width: 44px; text-align: right; }
-
-  </style>
-</head>
-<body>
-<header style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
-  <div>
-    <h1 style="margin:0;">📊 사업부 보고 관리자</h1>
-    <div class="meta" id="header-meta">로딩 중...</div>
-  </div>
-  <div id="adminSessionBar" style="display:flex;align-items:center;gap:8px;background:#1E3A5F;color:#fff;padding:8px 12px;border-radius:8px;font-size:13px;white-space:nowrap;">
-    <span>🔐 관리자 세션 유지 중</span>
-    <span style="background:#0f2342;padding:3px 10px;border-radius:999px;">남은 시간 <strong id="adminSessionRemain">확인 중...</strong></span>
-    <button type="button" id="adminExtendBtn" style="background:#3b82f6;color:#fff;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;">8시간 연장</button>
-    <button type="button" id="adminLogoutBtn" style="background:#ef4444;color:#fff;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;">로그아웃</button>
-  </div>
-</header>
-
-<nav class="tabs">
-  <button class="tab-btn active" data-tab="ppt">📤 PPT 업로드</button>
-  <button class="tab-btn" data-tab="notes">📝 주간 보고 업로드</button>
-  <button class="tab-btn" data-tab="mapping">⚙️ 매핑 관리</button>
-</nav>
-
-<main>
-
-  <!-- ============================== 탭 1: PPT 업로드 ============================== -->
-  <section class="tab-content active" id="tab-ppt">
-    <div class="card">
-      <h2>📤 새 PPT 업로드</h2>
-      <form id="pptUploadForm">
-        <label for="pptPassword">업로드 비밀번호</label>
-        <input type="password" id="pptPassword" placeholder="관리자 비밀번호" required />
-
-        <label>PPT 파일 (여러 개 가능 · 드래그 & 드롭 지원)</label>
-        <div id="pptDropzone" class="dropzone">
-          <div class="dz-icon">📂</div>
-          <div class="dz-title">여기로 PPT 파일을 드래그하거나 클릭해서 선택</div>
-          <div class="dz-sub">.pptx / .ppt · 여러 번 추가 가능 · 중복 자동 제거</div>
-          <input type="file" id="pptFiles" accept=".pptx,.ppt" multiple hidden />
-        </div>
-        <div id="pptFileListHeader" style="display:none; margin-top:12px; display:flex; justify-content:space-between; align-items:center;">
-          <div id="pptFileCount" style="font-size:13px; color:#374151; font-weight:600;"></div>
-          <button type="button" id="pptClearAll" style="background:#fee2e2; color:#b91c1c; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px;">전체 비우기</button>
-        </div>
-        <div id="pptFileList" style="margin-top: 8px; font-size: 13px;"></div>
-
-        <label for="reportFamily">리포트 패밀리 (선택)</label>
-        <input type="text" id="reportFamily" placeholder="default" value="default" />
-
-        <!-- 중복 허용은 업로드 시작 버튼 옆으로 이동 -->
-
-        <details style="margin-top: 20px;">
-          <summary style="cursor: pointer; font-weight: 600; color: #1E3A5F; padding: 10px 0;">
-            ▼ 사전 매핑 (선택) — 모든 파일에 동일 적용
-          </summary>
-          <div style="padding: 12px 0; border-top: 1px solid #eee; margin-top: 8px;">
-            <p style="font-size: 12px; color: #6b7280; margin-bottom: 12px;">
-              자동 분류가 실패한 카드만 여기서 정한 값으로 폴백됩니다. 자동 분류 잘 되는 카드는 영향 없음.
-            </p>
-
-            <label for="pptDivision">사업부</label>
-            <select id="pptDivision">
-              <option value="">— 자동 분류 —</option>
-            </select>
-
-            <label for="pptProject">프로젝트</label>
-            <select id="pptProject" disabled>
-              <option value="">— 사업부 먼저 선택 —</option>
-            </select>
-          </div>
-        </details>
-
-        <div style="margin-top:16px;">
-          <div style="display:flex; align-items:center; gap:12px;">
-            <button type="submit" id="pptUploadBtn">업로드 시작</button>
-            <label style="display:inline-flex; align-items:center; gap:6px; font-size:13px; padding:6px 10px; background:#f3f4f6; border-radius:6px; cursor:pointer; white-space:nowrap;">
-              <input type="checkbox" id="allowDuplicateUpload" />
-              <span>중복 허용</span>
-            </label>
-          </div>
-          <div style="font-size:11px; color:#9ca3af; margin-top:6px;">
-            기본 차단 · 같은 파일 다시 올릴 때만 체크
-          </div>
-        </div>
-      </form>
-    </div>
-
-    <div class="card" id="uploadHistoryCard">
-      <h2 style="display:flex; align-items:center; justify-content:space-between;">
-        <span>🗂️ 업로드 내역</span>
-        <span style="font-size:12px; font-weight:normal;">
-          <label style="margin-right:8px;"><input type="checkbox" id="historySelectAll" /> 전체 선택</label>
-          <button type="button" id="historyDeleteBtn" style="background:#fee2e2; color:#b91c1c; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-size:12px;">선택 삭제</button>
-        </span>
-      </h2>
-      <p style="color:#6b7280;font-size:13px;margin-top:-4px;">PPT 파일 단위로 삭제하면 관련 카드가 모두 제거됩니다.</p>
-      <div id="uploadHistoryArea" style="overflow-x:auto;">
-        <div style="color:#999;padding:16px;">불러오는 중...</div>
-      </div>
-    </div>
-    <div class="card" id="pptProgressCard" style="display: none;">
-      <h2>📊 업로드 진행</h2>
-      <div id="pptProgressSummary" style="font-size: 14px; color: #374151; margin-bottom: 12px;"></div>
-      <div id="pptProgressList"></div>
-    </div>
-
-  </section>
-
-  <!-- ============================== 탭 2: 이미지 업로드 (기존 폼 그대로) ============================== -->
-
-  <!-- ============================== 탭 3: 매핑 관리 ============================== -->
-  <section class="tab-content" id="tab-notes">
-    <div class="card">
-      <h2>📝 주간 보고 업로드</h2>
-      <p style="color:#6b7280;font-size:13px;margin-top:-4px;">담당자가 받은 주간 보고 텍스트를 그대로 붙여넣고, AI 정리 후 저장하면 사장님 앱에 표시됩니다.</p>
-
-      <div style="display:flex;gap:12px;align-items:flex-end;margin:16px 0;flex-wrap:wrap;">
-        <div>
-          <label style="display:block;font-size:13px;color:#374151;margin-bottom:4px;">사업부</label>
-          <select id="noteDivision" style="padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;min-width:180px;">
-            <option value="">로딩 중...</option>
-          </select>
-        </div>
-        <div>
-          <label style="display:block;font-size:13px;color:#374151;margin-bottom:4px;">보고일자</label>
-          <input type="date" id="noteReportDate" style="padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;font-size:14px;" />
-        </div>
-        <button type="button" id="noteLoadBtn" style="padding:8px 14px;background:#e5e7eb;color:#374151;border:none;border-radius:6px;cursor:pointer;font-size:13px;">📥 기존 노트 불러오기</button>
-      </div>
-
-      <label style="display:block;font-size:13px;color:#374151;margin-bottom:4px;">원본 텍스트</label>
-      <textarea id="noteRawText" placeholder="<페러데이 4T>&#10;1. LPM&#10; - 5호기, 6호기-테스트완료(4/3)&#10;..." style="width:100%;height:280px;padding:12px;border:1px solid #d1d5db;border-radius:6px;font-size:13px;font-family:'Menlo','Monaco',monospace;line-height:1.5;"></textarea>
-
-      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
-        <button type="button" id="noteAiParseBtn" style="padding:10px 18px;background:#3b82f6;color:white;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:500;">🤖 AI로 정리하기</button>
-
-        <span id="noteStatus" style="align-self:center;font-size:13px;color:#6b7280;"></span>
-      </div>
-    </div>
-
-    <div class="card" id="notePreviewCard" style="display:none;">
-      <h2>✨ 미리보기 (앱에서 이렇게 보입니다)</h2>
-      <div id="notePreviewArea" style="background:#f5f7fb;padding:16px;border-radius:8px;"></div>
-    </div>
-  </section>
-
-  <section class="tab-content" id="tab-mapping">
-    <div class="card">
-      <h2>📊 사업부 ↔ 프로젝트 통합 대시보드</h2>
-      <p style="color:#6b7280;font-size:13px;margin-bottom:14px;">사업부 칩을 클릭하면 해당 사업부의 프로젝트 리스트가 표시됩니다.</p>
-      <div id="mappingDivisionChips" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;"></div>
-      <div id="mappingDivisionMeta" style="font-size:13px;color:#6b7280;margin-bottom:10px;"></div>
-      <div id="mappingProjectGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;"></div>
-      <div id="mappingEmpty" style="color:#9ca3af;padding:24px;text-align:center;display:none;">프로젝트가 등록되지 않은 사업부입니다.</div>
-    </div>
-  </section>
-
-
-</main>
-
-<div class="footer-info">
-  v2 — 5단계 진행 중 ·
-  <a href="/docs" target="_blank" style="color: #6b7280;">API Docs</a>
-</div>
-
-<script>
-  // 헤더 시간 표시
-  function updateHeaderTime() {
-    const now = new Date();
-    const wd = ['일','월','화','수','목','금','토'][now.getDay()];
-    const ampm = now.getHours() < 12 ? '오전' : '오후';
-    const h12 = now.getHours() % 12 || 12;
-    const m = String(now.getMinutes()).padStart(2, '0');
-    document.getElementById('header-meta').textContent =
-      `마지막 새로고침: ${now.getMonth()+1}/${now.getDate()} (${wd}) ${ampm} ${h12}:${m}`;
-  }
-  updateHeaderTime();
-
-  // 탭 전환
-  // ─── PPT → 주간 보고 초안 생성 ───
-  let _draftDocId = null;
-
-  function openDraftModal(docId, fileName) {
-    _draftDocId = docId;
-    document.getElementById('draftModalFile').textContent = fileName || docId;
-    document.getElementById('draftModalStatus').textContent = '';
-    const wrap = document.getElementById('draftDivChips');
-    wrap.innerHTML = '<span style="color:#999;">사업부 로딩 중...</span>';
-    document.getElementById('draftDivModal').classList.add('show');
-
-    fetch('/divisions', { credentials: 'same-origin' })
-      .then(r => r.json())
-      .then(data => {
-        const divs = data.divisions || [];
-        wrap.innerHTML = '';
-        divs.forEach(d => {
-          const chip = document.createElement('button');
-          chip.type = 'button';
-          chip.textContent = (d.badge_short_label || d.label) + ' (' + (d.projects ? d.projects.length : 0) + ')';
-          chip.className = 'map-chip';
-          chip.style.cursor = 'pointer';
-          chip.onclick = () => runPptxDraft(d.id, d.label);
-          wrap.appendChild(chip);
-        });
-      })
-      .catch(e => {
-        wrap.innerHTML = '<span style="color:#c00;">사업부 로드 실패: ' + e.message + '</span>';
-      });
-  }
-
-  function closeDraftModal() {
-    document.getElementById('draftDivModal').classList.remove('show');
-    _draftDocId = null;
-  }
-
-  async function runPptxDraft(divisionId, divisionLabel) {
-    const status = document.getElementById('draftModalStatus');
-    status.textContent = '⏳ PPT 분석 중... (10-30초)';
-    status.style.color = '#6b7280';
-    try {
-      const r = await fetch('/admin/notes/from_pptx', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({ doc_id: _draftDocId, division_id: divisionId }),
-      });
-      if (!r.ok) {
-        let detail = r.status;
-        try { const err = await r.json(); detail = err.detail || detail; } catch(_){}
-        status.textContent = '❌ 실패: ' + detail;
-        status.style.color = '#c00';
-        return;
-      }
-      const data = await r.json();
-      const cards = data.cards || [];
-      if (cards.length === 0) {
-        status.textContent = '⚠️ 추출된 카드가 없습니다';
-        status.style.color = '#c00';
-        return;
-      }
-      // 1) 주간 보고 탭으로 전환
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      const noteBtn = document.querySelector('.tab-btn[data-tab="notes"]');
-      if (noteBtn) noteBtn.classList.add('active');
-      document.getElementById('tab-notes').classList.add('active');
-
-      // 2) 사업부 셀렉트 + 날짜 자동 설정
-      const sel = document.getElementById('noteDivision');
-      if (sel) sel.value = divisionId;
-      const dateEl = document.getElementById('noteReportDate');
-      if (dateEl && !dateEl.value) {
-        const today = new Date();
-        dateEl.value = today.toISOString().slice(0, 10);
-      }
-
-      // 3) 미리보기 자동 주입
-      _noteParsedCards = cards;
-      renderNotePreview(_noteParsedCards);
-      const noteStatus = document.getElementById('noteStatus');
-      if (noteStatus) {
-        noteStatus.textContent = '✅ PPT에서 ' + cards.length + '개 카드 자동 생성 — 확인 후 저장하세요';
-        noteStatus.style.color = '#16a34a';
-      }
-      closeDraftModal();
-    } catch (e) {
-      status.textContent = '❌ 오류: ' + e.message;
-      status.style.color = '#c00';
-    }
-  }
-
-  // ESC로 초안 모달 닫기
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-      const m = document.getElementById('draftDivModal');
-      if (m && m.classList.contains('show')) closeDraftModal();
-    }
-  });
-
-  document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const target = btn.dataset.tab;
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-      btn.classList.add('active');
-      document.getElementById('tab-' + target).classList.add('active');
-    });
-  });
-
-  // ============================== 기존 이미지 업로드 로직 (그대로 유지) ==============================
-
-  // 사업부 목록 로드
-  async function loadProjects() {
-    try {
-      const res = await fetch('/projects');
-      const data = await res.json();
-      const sel = document.getElementById('projectKey');
-      if (!sel) return;
-      data.projects.forEach(p => {
-        const opt = document.createElement('option');
-        opt.value = p.key;
-        opt.textContent = p.label || p.key;
-        sel.appendChild(opt);
-      });
-    } catch (e) {
-      console.error('사업부 목록 로드 실패:', e);
-    }
-  }
-
-  // 등록된 이미지 목록 로드
-  
-
-  
-  // ============================================================
-  // 업로드 내역 (PPT doc_id 단위 삭제)
-  // ============================================================
-  async function loadUploadHistory() {
-    const area = document.getElementById('uploadHistoryArea');
-    if (!area) return;
-    try {
-      const r = await fetch('/admin/uploads/history', { credentials: 'same-origin' });
-      if (!r.ok) {
-        area.innerHTML = '<div style="color:#c00;padding:16px;">권한이 없습니다. 다시 로그인하세요.</div>';
-        return;
-      }
-      const j = await r.json();
-      const items = j.items || [];
-      if (items.length === 0) {
-        area.innerHTML = '<div style="color:#999;padding:16px;">업로드된 PPT가 없습니다.</div>';
-        return;
-      }
-      let html = '<table style="width:100%;border-collapse:collapse;font-size:13px;min-width:600px;">';
-      html += '<thead><tr style="background:#f3f4f6;text-align:left;">';
-      html += '<th style="padding:10px 8px;width:32px;text-align:center;"></th>';
-      html += '<th style="padding:10px 8px;">업로드 일시</th>';
-      html += '<th style="padding:10px 8px;">파일명 / doc_id</th>';
-      html += '<th style="padding:10px 8px;text-align:center;">카드</th>';
-      html += '<th style="padding:10px 8px;text-align:center;">슬라이드</th>';
-      html += '<th style="padding:10px 8px;text-align:center;">삭제</th>';
-      html += '</tr></thead><tbody>';
-      items.forEach(it => {
-        let tsLabel = '-';
-        if (it.upload_timestamp) {
-          try {
-            tsLabel = new Date(it.upload_timestamp).toLocaleString('ko-KR', {
-              year: '2-digit', month: '2-digit', day: '2-digit',
-              hour: '2-digit', minute: '2-digit'
-            });
-          } catch (_) { tsLabel = it.upload_timestamp; }
-        }
-        const safeFname = (it.file_name || '(이름 없음)').replace(/</g, '&lt;');
-        html += '<tr style="border-bottom:1px solid #e5e7eb;">';
-        html += `<td style="padding:10px 8px;text-align:center;"><input type="checkbox" class="history-row-check" data-doc-id="${it.doc_id}"></td>`;
-        html += `<td style="padding:10px 8px;white-space:nowrap;">${tsLabel}</td>`;
-        html += `<td style="padding:10px 8px;">${safeFname}<br><small style="color:#999;">${it.doc_id}</small></td>`;
-        html += `<td style="padding:10px 8px;text-align:center;">${it.product_count}</td>`;
-        html += `<td style="padding:10px 8px;text-align:center;">${it.slide_count}</td>`;
-        html += `<td style="padding:10px 8px;text-align:center;white-space:nowrap;">`
-              + `<button data-doc-id="${it.doc_id}" data-file-name="${(it.file_name || '').replace(/"/g, '&quot;').replace(/</g, '&lt;')}" class="draft-btn" style="background:#3b82f6;color:#fff;border:none;padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px;margin-right:6px;">📝 초안</button>`
-              + `<button onclick="deleteDoc('${it.doc_id}', ${it.product_count})" style="background:#ef4444;color:#fff;border:none;padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px;">삭제</button>`
-              + `</td>`;
-        html += '</tr>';
-      });
-      html += '</tbody></table>';
-      area.innerHTML = html;
-      // 초안 버튼 이벤트 바인딩
-      area.querySelectorAll('.draft-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-          openDraftModal(btn.dataset.docId, btn.dataset.fileName);
-        });
-      });
-    } catch (e) {
-      area.innerHTML = `<div style="color:#c00;padding:16px;">불러오기 실패: ${e.message}</div>`;
-    }
-  }
-
-  async function deleteDoc(docId, productCount) {
-    if (!confirm(`정말 삭제하시겠습니까?\n\n관련 카드 ${productCount}개가 모두 제거되고\nPPT 파일과 슬라이드 이미지도 삭제됩니다.`)) return;
-    try {
-      const r = await fetch(`/admin/doc/${docId}`, {
-        method: 'DELETE',
-        credentials: 'same-origin'
-      });
-      if (!r.ok) {
-        let detail = r.status;
-        try { const err = await r.json(); detail = err.detail || detail; } catch (_) {}
-        alert('삭제 실패: ' + detail);
-        return;
-      }
-      const result = await r.json();
-      alert(`✅ 삭제 완료\n남은 PPT: ${result.remaining}개`);
-      loadUploadHistory();
-    } catch (e) {
-      alert('삭제 오류: ' + e.message);
-    }
-  }
-
-
-  // ============================================================
-  // 관리자 세션 UI
-  // ============================================================
-  let adminSessionExpiresAt = null;
-
-  function fmtRemain(sec) {
-    if (sec < 0) sec = 0;
-    const h = Math.floor(sec / 3600);
-    const m = Math.floor((sec % 3600) / 60);
-    const s = sec % 60;
-    if (h > 0) return `${h}시간 ${m}분`;
-    if (m > 0) return `${m}분 ${s}초`;
-    return `${s}초`;
-  }
-
-  async function refreshAdminSessionInfo() {
-    try {
-      const r = await fetch('/admin/session', { credentials: 'same-origin' });
-      if (!r.ok) {
-        location.href = '/admin/login?next=/admin/upload';
-        return;
-      }
-      const j = await r.json();
-      adminSessionExpiresAt = j.expires_at;
-
-      // password input 숨김 + required 해제
-      document.querySelectorAll('input[type="password"]').forEach(el => {
-        el.required = false;
-        const label = el.id ? document.querySelector(`label[for="${el.id}"]`) : null;
-        if (label) label.style.display = 'none';
-        el.style.display = 'none';
-      });
-    } catch (e) {
-      console.error('session load fail', e);
-    }
-  }
-
-  function tickAdminSessionRemain() {
-    const el = document.getElementById('adminSessionRemain');
-    if (!el || !adminSessionExpiresAt) return;
-    const remain = adminSessionExpiresAt - Math.floor(Date.now() / 1000);
-    el.textContent = fmtRemain(remain);
-    if (remain <= 0) {
-      location.href = '/admin/login?next=/admin/upload';
-    }
-  }
-
-  document.getElementById('adminExtendBtn')?.addEventListener('click', async () => {
-    const r = await fetch('/admin/extend', { method: 'POST', credentials: 'same-origin' });
-    if (r.ok) {
-      const j = await r.json();
-      adminSessionExpiresAt = j.expires_at;
-      tickAdminSessionRemain();
-      alert('세션이 8시간 연장되었습니다.');
-    } else {
-      location.href = '/admin/login?next=/admin/upload';
-    }
-  });
-
-  document.getElementById('adminLogoutBtn')?.addEventListener('click', async () => {
-    await fetch('/admin/logout', { method: 'POST', credentials: 'same-origin' });
-    location.href = '/admin/login?next=/admin/upload';
-  });
-
-  refreshAdminSessionInfo().then(() => {
-    tickAdminSessionRemain();
-    setInterval(tickAdminSessionRemain, 1000);
-    // 5초마다 백엔드 핑(서버측 만료 즉시 감지)
-    setInterval(refreshAdminSessionInfo, 5000);
-  });
-
-  // 탭/창 복귀 시 즉시 재검증
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      refreshAdminSessionInfo();
-    }
-  });
-  window.addEventListener('focus', refreshAdminSessionInfo);
-
-
-  // 초기 로드
-  loadProjects();
-  loadUploadHistory();
-
-  // ============================================================
-  // 5-2b-2: PPT 업로드 폼 (다중 파일 + 사전 매핑 + 진행 표시)
-  // ============================================================
-
-  // 사업부 dropdown 채우기
-  async function loadDivisionsForPpt() {
-    try {
-      const res = await fetch('/admin/config/divisions');
-      const data = await res.json();
-      const sel = document.getElementById('pptDivision');
-      data.divisions.forEach(d => {
-        const opt = document.createElement('option');
-        opt.value = d.id;
-        opt.textContent = d.label;
-        sel.appendChild(opt);
-      });
-    } catch (e) {
-      console.error('사업부 로드 실패:', e);
-    }
-  }
-
-  // 사업부 선택 시 프로젝트 dropdown 채우기
-  document.getElementById('pptDivision').addEventListener('change', async (e) => {
-    const divId = e.target.value;
-    const projSel = document.getElementById('pptProject');
-    projSel.innerHTML = '<option value="">— 자동 분류 —</option>';
-
-    if (!divId) {
-      projSel.disabled = true;
-      projSel.innerHTML = '<option value="">— 사업부 먼저 선택 —</option>';
-      return;
-    }
-
-    try {
-      const res = await fetch('/admin/config/projects?division_id=' + encodeURIComponent(divId));
-      const data = await res.json();
-      data.projects.forEach(p => {
-        const opt = document.createElement('option');
-        opt.value = p.id;
-        opt.textContent = p.label + (p.group ? ' (' + p.group + ')' : '');
-        projSel.appendChild(opt);
-      });
-      projSel.disabled = false;
-    } catch (e) {
-      console.error('프로젝트 로드 실패:', e);
-    }
-  });
-
-  // 파일 선택 시 목록 표시
-
-  // 한 파일 업로드 (XHR 기반 진행률 % 반환)
-  function uploadSinglePpt(file, password, reportFamily, divisionId, projectId, allowDuplicate, itemEl, onProgress) {
-    return new Promise((resolve) => {
-      const fd = new FormData();
-      fd.append('file', file);
-      fd.append('password', password);
-      fd.append('report_family', reportFamily || 'default');
-      if (divisionId) fd.append('division_id', divisionId);
-      if (projectId) fd.append('project_id', projectId);
-      if (allowDuplicate) fd.append('allow_duplicate', 'true');
-
-      // 상태: 시작
-      const statusEl = itemEl.querySelector('.pf-status');
-      const pctEl = itemEl.querySelector('.pf-pct');
-      const barEl = itemEl.querySelector('.pf-bar');
-      const detailEl = itemEl.querySelector('.pf-detail');
-      statusEl.textContent = '⬆️';
-      detailEl.textContent = '업로드 중...';
-
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/upload', true);
-
-      // 업로드 바이트 진행률 (0~90% 구간 사용, 서버 처리는 90~100% 마무리에서 채움)
-      xhr.upload.onprogress = (ev) => {
-        if (!ev.lengthComputable) return;
-        const pct = Math.round((ev.loaded / ev.total) * 90);
-        barEl.style.width = pct + '%';
-        pctEl.textContent = pct + '%';
-        if (typeof onProgress === 'function') onProgress(pct);
-      };
-
-      // 업로드 완료 → 서버 처리 단계로 전환
-      xhr.upload.onload = () => {
-        statusEl.textContent = '⚙️';
-        detailEl.textContent = '서버 처리 중...';
-        barEl.style.width = '95%';
-        pctEl.textContent = '95%';
-        if (typeof onProgress === 'function') onProgress(95);
-      };
-
-      xhr.onload = () => {
-        let data = {};
-        try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
-        if (xhr.status === 409 && data && data.code === 'duplicate_upload') {
-          barEl.style.width = '100%';
-          barEl.classList.add('warn');
-          pctEl.textContent = '중복';
-          statusEl.textContent = '⚠️';
-          detailEl.innerHTML = '<span style="color:#b45309;">' + (data.detail || '이미 업로드된 파일') + '</span>';
-          if (typeof onProgress === 'function') onProgress(100);
-          resolve({ ok: false, duplicate: true, file: file.name, file_key: fileKey(file), error: data.detail || 'duplicate upload' });
-          return;
-        }
-        if (xhr.status >= 200 && xhr.status < 300 && data && data.ok !== false) {
-          barEl.style.width = '100%';
-          barEl.classList.add('done');
-          pctEl.textContent = '100%';
-          statusEl.textContent = '✅';
-          detailEl.textContent = '카드 ' + (data.product_count || 0) + '개 추출 (슬라이드 ' + (data.slide_count || 0) + '장)';
-          if (typeof onProgress === 'function') onProgress(100);
-          resolve({ ok: true, file: file.name, file_key: fileKey(file), data });
-        } else {
-          const msg = (data && (data.detail || data.message)) || ('HTTP ' + xhr.status);
-          barEl.classList.add('fail');
-          statusEl.textContent = '❌';
-          detailEl.innerHTML = '<span style="color:#dc2626;">' + msg + '</span>';
-          if (typeof onProgress === 'function') onProgress(100);
-          resolve({ ok: false, file: file.name, file_key: fileKey(file), error: msg });
-        }
-      };
-
-      xhr.onerror = () => {
-        barEl.classList.add('fail');
-        statusEl.textContent = '❌';
-        detailEl.innerHTML = '<span style="color:#dc2626;">네트워크 오류</span>';
-        if (typeof onProgress === 'function') onProgress(100);
-        resolve({ ok: false, file: file.name, file_key: fileKey(file), error: 'network error' });
-      };
-
-      xhr.send(fd);
-    });
-  }
-
-  // 업로드 폼 submit
-
-  // ============================================================
-  // 5-2b-2: 누적 + 드래그&드롭 + 개별 삭제 + 전체 비우기
-  // ============================================================
-  let pptSelectedFiles = []; // 누적된 File 객체 배열
-
-  function formatBytes(b) {
-    if (b < 1024) return b + ' B';
-    if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
-    return (b/1024/1024).toFixed(1) + ' MB';
-  }
-
-  function fileKey(f) { return f.name + '_' + f.size; }
-
-  function renderPptFileList() {
-    const listEl = document.getElementById('pptFileList');
-    const headerEl = document.getElementById('pptFileListHeader');
-    const countEl = document.getElementById('pptFileCount');
-    const btn = document.getElementById('pptUploadBtn');
-
-    listEl.innerHTML = '';
-    if (pptSelectedFiles.length === 0) {
-      headerEl.style.display = 'none';
-      btn.textContent = '업로드 시작';
-      btn.disabled = true;
-      btn.style.opacity = '0.5';
-      return;
-    }
-
-    headerEl.style.display = 'flex';
-    countEl.textContent = pptSelectedFiles.length + '개 파일 선택됨';
-    btn.textContent = pptSelectedFiles.length + '개 업로드';
-    btn.disabled = false;
-    btn.style.opacity = '1';
-
-    pptSelectedFiles.forEach((f, idx) => {
-      const row = document.createElement('div');
-      row.className = 'file-row';
-      row.innerHTML =
-        '<div class="file-row-name">📄 ' + f.name + '</div>' +
-        '<div class="file-row-size">' + formatBytes(f.size) + '</div>' +
-        '<button type="button" class="file-row-remove" data-idx="' + idx + '" title="제거">✕</button>';
-      listEl.appendChild(row);
-    });
-
-    listEl.querySelectorAll('.file-row-remove').forEach(b => {
-      b.addEventListener('click', (e) => {
-        const i = parseInt(e.currentTarget.getAttribute('data-idx'));
-        pptSelectedFiles.splice(i, 1);
-        renderPptFileList();
-      });
-    });
-  }
-
-  function addPptFiles(fileList) {
-    const allowed = ['.pptx', '.ppt'];
-    const existing = new Set(pptSelectedFiles.map(fileKey));
-    let added = 0, skipped = 0;
-    Array.from(fileList).forEach(f => {
-      const lower = f.name.toLowerCase();
-      if (!allowed.some(ext => lower.endsWith(ext))) { skipped++; return; }
-      if (existing.has(fileKey(f))) { skipped++; return; }
-      pptSelectedFiles.push(f);
-      existing.add(fileKey(f));
-      added++;
-    });
-    renderPptFileList();
-    if (skipped > 0) console.log('skip(중복/비PPT):', skipped);
-  }
-
-  // 파일 선택 input change
-  document.getElementById('pptFiles').addEventListener('change', (e) => {
-    addPptFiles(e.target.files);
-    e.target.value = ''; // 같은 파일 재선택 가능하도록
-  });
-
-  // 드롭존 클릭 → input 열기
-  const dz = document.getElementById('pptDropzone');
-  dz.addEventListener('click', () => document.getElementById('pptFiles').click());
-
-  // 드래그 & 드롭
-  ['dragenter','dragover'].forEach(ev => dz.addEventListener(ev, (e) => {
-    e.preventDefault(); e.stopPropagation();
-    dz.classList.add('dragover');
-  }));
-  ['dragleave','drop'].forEach(ev => dz.addEventListener(ev, (e) => {
-    e.preventDefault(); e.stopPropagation();
-    dz.classList.remove('dragover');
-  }));
-  dz.addEventListener('drop', (e) => {
-    if (e.dataTransfer && e.dataTransfer.files) {
-      addPptFiles(e.dataTransfer.files);
-    }
-  });
-
-  // 페이지 전체 드래그 기본동작 방지
-  ['dragover','drop'].forEach(ev => {
-    window.addEventListener(ev, (e) => { e.preventDefault(); }, false);
-  });
-
-  // 전체 비우기
-  document.getElementById('pptClearAll').addEventListener('click', () => {
-    pptSelectedFiles = [];
-    renderPptFileList();
-  });
-
-  // 초기 렌더 (버튼 비활성화)
-  renderPptFileList();
-
-  document.getElementById('pptUploadForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-
-    const files = pptSelectedFiles.slice();
-    if (files.length === 0) {
-      alert('PPT 파일을 1개 이상 선택해주세요.');
-      return;
-    }
-
-    const password = document.getElementById('pptPassword').value;
-    const reportFamily = document.getElementById('reportFamily').value || 'default';
-    const divisionId = document.getElementById('pptDivision').value;
-    const projectId = document.getElementById('pptProject').value;
-    const allowDuplicate = document.getElementById('allowDuplicateUpload').checked;
-
-    // 진행 영역 표시 + 초기화
-    const progressCard = document.getElementById('pptProgressCard');
-    const progressList = document.getElementById('pptProgressList');
-    const progressSummary = document.getElementById('pptProgressSummary');
-    // 진행카드를 업로드내역 위로 이동 (업로드 중에만 보임)
-    const historyCard = document.getElementById('uploadHistoryCard');
-    if (historyCard && progressCard && historyCard.parentNode) {
-      historyCard.parentNode.insertBefore(progressCard, historyCard);
-    }
-    progressCard.style.display = 'block';
-    progressList.innerHTML = '';
-    progressSummary.textContent = `총 ${files.length}개 파일 처리 시작...`;
-
-    // 전체 진행률 영역
-    progressSummary.innerHTML = `
-      <div class="pf-total">
-        <span class="pf-total-label">전체 진행률</span>
-        <span id="pfTotalText">0 / ${files.length}</span>
-        <div class="pf-barwrap"><div class="pf-bar" id="pfTotalBar"></div></div>
-        <span class="pf-total-pct" id="pfTotalPct">0%</span>
-      </div>
-    `;
-    const totalBar = document.getElementById('pfTotalBar');
-    const totalPct = document.getElementById('pfTotalPct');
-    const totalText = document.getElementById('pfTotalText');
-
-    // 각 파일별 진행 항목 생성
-    const fileProgress = new Array(files.length).fill(0);
-    const itemEls = files.map((f, idx) => {
-      const div = document.createElement('div');
-      div.className = 'pf-row';
-      div.innerHTML = `
-        <div class="pf-head">
-          <span class="pf-status">⏳</span>
-          <span class="pf-name">📄 ${f.name}</span>
-          <span class="pf-pct">0%</span>
-        </div>
-        <div class="pf-barwrap"><div class="pf-bar"></div></div>
-        <div class="pf-detail">대기 중</div>
-      `;
-      progressList.appendChild(div);
-      return div;
-    });
-
-    function updateTotal() {
-      const sum = fileProgress.reduce((a,b)=>a+b, 0);
-      const pct = Math.round(sum / files.length);
-      totalBar.style.width = pct + '%';
-      totalPct.textContent = pct + '%';
-      const doneCnt = fileProgress.filter(p => p >= 100).length;
-      totalText.textContent = doneCnt + ' / ' + files.length;
-    }
-
-    // 업로드 버튼 비활성화
-    const btn = document.getElementById('pptUploadBtn');
-    btn.disabled = true;
-    btn.textContent = '업로드 중...';
-
-    // 순차 업로드 (파일별 % → 전체 진행률 합산)
-    const results = [];
-    for (let i = 0; i < files.length; i++) {
-      const result = await uploadSinglePpt(
-        files[i], password, reportFamily, divisionId, projectId, allowDuplicate, itemEls[i],
-        (pct) => { fileProgress[i] = pct; updateTotal(); }
-      );
-      fileProgress[i] = 100;
-      updateTotal();
-      results.push(result);
-    }
-
-    // 완료 후 통계 (전체 진행률 바 아래에 결과 줄 추가)
-    const ok = results.filter(r => r.ok).length;
-    const fail = results.length - ok;
-    const totalCards = results.filter(r => r.ok).reduce((s, r) => s + (r.data.product_count || 0), 0);
-    const doneLine = document.createElement('div');
-    doneLine.style.cssText = 'margin-top:4px; font-size:13px;';
-    doneLine.innerHTML = '<strong>완료:</strong> ' + ok + '/' + files.length + '개 성공' +
-      (fail > 0 ? ', <span style="color:#dc2626;">' + fail + '개 실패</span>' : '') +
-      ' · 총 카드 <strong>' + totalCards + '개</strong> 추출';
-    progressSummary.appendChild(doneLine);
-
-    // 성공한 파일만 선택 목록에서 제거
-    const successKeys = new Set(results.filter(r => r.ok).map(r => r.file_key));
-    pptSelectedFiles = pptSelectedFiles.filter(f => !successKeys.has(fileKey(f)));
-    renderPptFileList();
-
-    // 버튼 복구
-    btn.disabled = false;
-    btn.textContent = '업로드 시작';
-
-    // 이미지 탭의 사업부 목록 갱신 (새로 업로드된 PPT 의 프로젝트가 잡힐 수 있게)
-    try { loadProjects(); } catch (e) {}
-
-    // 업로드 내역 즉시 갱신
-    try { loadUploadHistory(); } catch (e) {}
-
-    // 5초 뒤 진행카드 숨김
-    setTimeout(() => {
-      const pc = document.getElementById('pptProgressCard');
-      if (pc) pc.style.display = 'none';
-    }, 5000);
-  });
-
-  // 업로드 내역 다중 선택 핸들러 (전체 선택 / 선택 삭제)
-  document.addEventListener('change', (e) => {
-    if (e.target && e.target.id === 'historySelectAll') {
-      const checked = e.target.checked;
-      document.querySelectorAll('.history-row-check').forEach(cb => { cb.checked = checked; });
-    }
-  });
-  document.addEventListener('click', async (e) => {
-    if (e.target && e.target.id === 'historyDeleteBtn') {
-      const ids = Array.from(document.querySelectorAll('.history-row-check:checked'))
-        .map(cb => cb.dataset.docId).filter(Boolean);
-      if (ids.length === 0) { alert('삭제할 항목을 선택하세요.'); return; }
-      if (!confirm(ids.length + '개의 업로드를 삭제할까요? PPT 파일과 관련 카드가 모두 제거됩니다.')) return;
-      e.target.disabled = true;
-      try {
-        const r = await fetch('/admin/docs/delete-batch', {
-          method: 'POST',
-          credentials: 'include',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({doc_ids: ids})
-        });
-        if (r.status === 401) { location.href = '/admin/login'; return; }
-        const d = await r.json();
-        alert((d.removed_count || 0) + '개 삭제 완료');
-        try { loadUploadHistory(); } catch(_){}
-      } catch (err) {
-        alert('삭제 실패: ' + err);
-      } finally {
-        e.target.disabled = false;
-      }
-    }
-  });
-
-
-  // PPT 탭 진입 시 dropdown 초기 채우기
-  loadDivisionsForPpt();
-
-  // ============================== 노트 관리 (사업부 보고) ==============================
-  let _noteParsedCards = null;
-
-  async function loadNoteDivisions() {
-    try {
-      const r = await fetch('/admin/config/divisions', { credentials: 'same-origin' });
-      if (!r.ok) throw new Error('fetch failed');
-      const data = await r.json();
-      const sel = document.getElementById('noteDivision');
-      if (!sel) return;
-      sel.innerHTML = '';
-      (data.divisions || []).forEach(d => {
-        const opt = document.createElement('option');
-        opt.value = d.id;
-        opt.textContent = d.label;
-        sel.appendChild(opt);
-      });
-    } catch (e) {
-      console.error('사업부 로드 실패', e);
-    }
-  }
-
-  // 보고일자 기본값 = 오늘
-  function initNoteDate() {
-    const el = document.getElementById('noteReportDate');
-    if (!el) return;
-    const today = new Date();
-    const y = today.getFullYear();
-    const m = String(today.getMonth() + 1).padStart(2, '0');
-    const d = String(today.getDate()).padStart(2, '0');
-    el.value = `${y}-${m}-${d}`;
-  }
-
-  
-
-function showUploadDonePopup(cardCount, onClose) {
-  // 기존 팝업 있으면 제거
-  const oldBg = document.getElementById('uploadDoneBg');
-  if (oldBg) oldBg.remove();
-
-  const bg = document.createElement('div');
-  bg.id = 'uploadDoneBg';
-  bg.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.45);z-index:9999;display:flex;align-items:center;justify-content:center;';
-
-  const box = document.createElement('div');
-  box.style.cssText = 'background:#fff;border-radius:14px;padding:28px 32px;min-width:300px;max-width:90%;box-shadow:0 10px 30px rgba(0,0,0,0.2);text-align:center;font-family:inherit;';
-
-  box.innerHTML = '<div style="font-size:42px;margin-bottom:10px;">✅</div>'
-    + '<div style="font-size:18px;font-weight:600;color:#111;margin-bottom:6px;">업로드 완료되었습니다</div>'
-    + '<div style="font-size:14px;color:#6b7280;margin-bottom:20px;">' + cardCount + '개 카드가 저장되었습니다</div>'
-    + '<button id="uploadDoneOk" style="background:#10b981;color:#fff;border:none;border-radius:8px;padding:10px 28px;font-size:15px;font-weight:600;cursor:pointer;">확인</button>';
-
-  bg.appendChild(box);
-  document.body.appendChild(bg);
-
-  const ok = document.getElementById('uploadDoneOk');
-  function close() {
-    bg.remove();
-    if (typeof onClose === 'function') onClose();
-  }
-  ok.addEventListener('click', close);
-  bg.addEventListener('click', function(e){ if (e.target === bg) close(); });
-}
-
-function renderNotePreview(cards) {
-  const area = document.getElementById('notePreviewArea');
-  const card = document.getElementById('notePreviewCard');
-  if (!area || !card) return;
-
-  if (!cards || cards.length === 0) {
-    card.style.display = 'none';
-    area.innerHTML = '';
-    return;
-  }
-
-  const esc = (s) => String(s == null ? '' : s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-
-  const renderAttachBtns = (ci, si, ii) => {
-    // disabled by request — 미리보기에서 표/사진 버튼 숨김
-    return '';
-  };
-
-  const renderMiniTable = (table) => {
-    if (!table) return '';
-    const headers = Array.isArray(table.headers) ? table.headers : [];
-    const rows = Array.isArray(table.rows) ? table.rows : [];
-    const previewRows = rows.slice(0, 3);
-    let html = `
-      <div style="margin-top:8px;padding:10px;border:1px solid #d1d5db;border-radius:8px;background:#fafafa;">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-          <strong style="font-size:13px;">📊 ${esc(table.title || '표')}</strong>
-          <span style="font-size:11px;color:#6b7280;">탭/클릭으로 확대·수정</span>
-        </div>
-        <div style="overflow-x:auto;">
-          <table style="border-collapse:collapse;width:100%;font-size:12px;background:#fff;">
-    `;
-    if (headers.length) {
-      html += '<thead><tr>';
-      headers.forEach(h => {
-        html += `<th style="border:1px solid #e5e7eb;padding:6px 8px;background:#f3f4f6;text-align:left;">${esc(h)}</th>`;
-      });
-      html += '</tr></thead>';
-    }
-    html += '<tbody>';
-    previewRows.forEach(r => {
-      html += '<tr>';
-      (Array.isArray(r) ? r : []).forEach(c => {
-        html += `<td style="border:1px solid #e5e7eb;padding:6px 8px;">${esc(c)}</td>`;
-      });
-      html += '</tr>';
-    });
-    html += '</tbody></table></div>';
-    if (rows.length > 3) {
-      html += `<div style="margin-top:4px;font-size:11px;color:#6b7280;">… 외 ${rows.length - 3}행</div>`;
-    }
-    html += '</div>';
-    return html;
-  };
-
-  const renderDueChip = (dueRaw) => {
-    if (!dueRaw) return '';
-    const m = /^(\\d{4})-(\\d{2})-(\\d{2})/.exec(dueRaw);
-    if (!m) return '';
-    const due = new Date(parseInt(m[1]), parseInt(m[2])-1, parseInt(m[3]));
-    const today = new Date();
-    today.setHours(0,0,0,0);
-    const diff = Math.round((due - today) / (1000*60*60*24));
-    let bg = '#dbeafe', fg = '#1e40af', label;
-    if (diff < 0) { bg = '#fee2e2'; fg = '#b91c1c'; label = `D+${-diff} 지남`; }
-    else if (diff === 0) { bg = '#fef3c7'; fg = '#92400e'; label = 'D-0 오늘'; }
-    else if (diff <= 3) { bg = '#fed7aa'; fg = '#9a3412'; label = `D-${diff}`; }
-    else { label = `D-${diff}`; }
-    const dateLabel = `${m[2]}/${m[3]}`;
-    return `<span style="display:inline-block;margin-left:6px;padding:1px 7px;border-radius:10px;background:${bg};color:${fg};font-size:11px;font-weight:600;">${label} (${dateLabel})</span>`;
-  };
-
-  const renderPhoto = (photoRef) => {
-    if (!photoRef) return '';
-    const url = '/note_photos/' + photoRef;
-    const isExcel = /\\/xls_/.test(photoRef);
-    if (isExcel) {
-      return `
-        <div style="margin:8px 0 14px 0;">
-          <div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:8px;overflow:auto;">
-            <img src="${esc(url)}"
-                 onclick="showPhotoOverlay('${esc(url)}')"
-                 style="display:block;width:100%;height:auto;border-radius:6px;cursor:pointer;" />
-          </div>
-        </div>
-      `;
-    }
-    return `
-      <div style="margin-top:8px;">
-        <img src="${esc(url)}"
-             onclick="showPhotoOverlay('${esc(url)}')"
-             style="max-width:240px;max-height:150px;border-radius:8px;border:1px solid #d1d5db;cursor:pointer;object-fit:cover;" />
-      </div>
-    `;
-  };
-
-  // 일반 항목 한 줄 렌더 (group 묶음 안/밖 공용)
-  const renderOneItem = (it, ci, si, ii) => {
-    if (typeof it === 'string') {
-      it = { type: 'bullet', text: it };
-    }
-    if (!it || typeof it !== 'object') return '';
-    const type = it.type || 'bullet';
-    const text = esc(it.text || '');
-    const hasTable = !!it.table_ref;
-    const hasPhoto = !!it.photo_ref;
-    const tableData = it.table_data || null;
-    const photoRef = it.photo_ref || '';
-
-    if (type === 'table') {
-      if (tableData && tableData.preview_image_data) {
-        const _safeTitle = String(it.text || tableData.title || '엑셀').replace(/[&<>"']/g, function(ch){
-          return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
-        });
-        return `
-          <div style="margin:8px 0 14px 0;">
-            <div style="font-size:13px;font-weight:700;color:#334155;margin-bottom:6px;">📊 ${_safeTitle}</div>
-            <div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:8px;overflow:auto;">
-              <img src="${tableData.preview_image_data}" style="display:block;max-width:100%;height:auto;border-radius:6px;" />
-            </div>
-          </div>
-        `;
-      }
-      return ``;
-    }
-    if (type === 'photo') {
-      return `<div style="margin:8px 0;">${renderPhoto(photoRef)}</div>`;
-    }
-
-    // 색상 매핑 (item.color > 타입 기본색)
-    const _colorMap = { red:'#dc2626', blue:'#1e88e5', orange:'#ef6c00' };
-    const itemColor = _colorMap[String(it.color || '').toLowerCase()] || '';
-
-    let prefix = '•';
-    let textStyle = 'font-size:14px;color:#111827;';
-    let leftPad = '';
-    const rawText = String(it.text || '').trim();
-    const startsWithStar = rawText.startsWith('※');
-
-    if (type === 'highlight') {
-      textStyle = 'font-size:14px;color:#dc2626;font-weight:700;';
-    } else if (type === 'sub') {
-      // 화살표 중복 방지: 본문이 이미 → / ↳ / => 로 시작하면 prefix 비움
-      prefix = /^(?:→|↳|=>)\\s*/.test(rawText) ? '' : '→';
-      textStyle = 'font-size:13px;color:#374151;';
-      leftPad = 'padding-left:18px;';
-    }
-
-    // ※ 줄은 굵게 + 기본 검정 (color 지정 있으면 그게 우선)
-    if (startsWithStar) {
-      textStyle = 'font-size:14px;color:#111827;font-weight:700;';
-      prefix = '';
-    }
-
-    // item.color 가 있으면 최종적으로 그 색으로 덮어쓰기 (font-weight 유지)
-    if (itemColor) {
-      textStyle = textStyle.replace(/color:[^;]+;?/, '') + 'color:' + itemColor + ';';
-    }
-
-    if (hasTable && !tableData && typeof loadTableDataForItem === 'function') {
-      setTimeout(() => {
-        try { loadTableDataForItem(it, () => renderNotePreview(_noteParsedCards)); } catch (_) {}
-      }, 0);
-    }
-
-    const dueChip = renderDueChip(it.due_date || '');
-    return `
-      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin:6px 0;${leftPad}">
-        <div style="flex:1;min-width:0;">
-          <div style="${textStyle}">${prefix} ${text} ${dueChip}</div>
-          ${hasTable ? renderMiniTable(tableData) : ''}
-          ${hasPhoto ? renderPhoto(photoRef) : ''}
-        </div>
-        ${renderAttachBtns(ci, si, ii)}
-      </div>
-    `;
-  };
-
-  // group_id 같은 항목들을 연속 구간으로 묶어 노란 박스로 렌더
-  const renderItemsWithGroups = (items, ci, si) => {
-    let html = '';
-    let i = 0;
-    while (i < items.length) {
-      const raw = items[i];
-      const it = (typeof raw === 'string') ? { type: 'bullet', text: raw } : (raw || {});
-      const gid = it.group_id || '';
-
-      if (gid) {
-        // 같은 group_id 가진 연속 구간 모으기
-        const groupItems = [];
-        let j = i;
-        while (j < items.length) {
-          const r = items[j];
-          const x = (typeof r === 'string') ? { type: 'bullet', text: r } : (r || {});
-          if (x.group_id !== gid) break;
-          groupItems.push({ raw: r, idx: j });
-          j++;
-        }
-
-        // 노란 박스 시작
-        html += `
-          <div style="margin:8px 0;padding:10px 12px;border-left:4px solid #d97706;background:#fffbeb;border-radius:6px;">
-        `;
-
-        // group_note 와 일반 항목 분리
-        const normals = groupItems.filter(g => {
-          const o = (typeof g.raw === 'string') ? { type: 'bullet' } : (g.raw || {});
-          return o.type !== 'group_note';
-        });
-        const notes = groupItems.filter(g => {
-          const o = (typeof g.raw === 'string') ? { type: 'bullet' } : (g.raw || {});
-          return o.type === 'group_note';
-        });
-
-        // 일반 항목 먼저
-        normals.forEach(g => {
-          html += renderOneItem(g.raw, ci, si, g.idx);
-        });
-
-        // group_note (있으면 박스 안 아래에)
-        notes.forEach(g => {
-          const o = (typeof g.raw === 'string') ? { type: 'group_note', text: g.raw } : g.raw;
-          const text = esc(o.text || '');
-          html += `
-            <div style="margin:6px 0 0 4px;padding-top:6px;border-top:1px dashed #fcd34d;">
-              <div style="font-size:13px;color:#92400e;font-style:italic;">↪ ${text} ${renderDueChip(o.due_date || '')}</div>
-            </div>
-          `;
-        });
-
-        html += `</div>`;
-        i = j;
-      } else {
-        // group 아닌 일반 항목
-        if (it.type === 'group_note') {
-          // group_id 없는 group_note 도 노란 박스로 단독 표시
-          const text = esc(it.text || '');
-          html += `
-            <div style="margin:8px 0 8px 18px;padding:8px 10px;border-left:4px solid #d97706;background:#fffbeb;border-radius:6px;">
-              <div style="font-size:13px;color:#92400e;font-style:italic;">↪ ${text}</div>
-            </div>
-          `;
-        } else {
-          html += renderOneItem(raw, ci, si, i);
-        }
-        i++;
-      }
-    }
-    return html;
-  };
-
-  let html = '';
-  cards.forEach((c, ci) => {
-    const title = esc(c.title || '');
-    const sections = Array.isArray(c.sections) ? c.sections : [];
-    html += `
-      <div style="background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px;margin-bottom:16px;">
-        <div style="font-weight:800;font-size:18px;margin-bottom:12px;">${title}</div>
-    `;
-
-    sections.forEach((s, si) => {
-      const stitle = esc(s.title || '');
-      const items = Array.isArray(s.items) ? s.items : [];
-      html += `
-        <div style="margin-bottom:12px;">
-          <div style="background:#f5f7fb;border-radius:8px;padding:8px 10px;font-weight:700;margin-bottom:8px;">${stitle}</div>
-      `;
-
-      html += renderItemsWithGroups(items, ci, si);
-
-      // 섹션 레벨 표 (구버전 호환)
-      if (s.table_ref && s.table_data) {
-        html += renderMiniTable(s.table_data);
-      } else if (s.table_ref && typeof loadTableDataForItem === 'function') {
-        setTimeout(() => {
-          try { loadTableDataForItem(s, () => renderNotePreview(_noteParsedCards)); } catch (_) {}
-        }, 0);
-      }
-
-      html += `</div>`;
-    });
-
-    html += `</div>`;
-  });
-
-  // 미리보기 맨 아래 저장 버튼
-  html += `
-    <div style="display:flex;justify-content:flex-end;margin-top:16px;">
-      <button type="button" id="noteSaveBtn"
-        style="padding:12px 24px;background:#10b981;color:white;border:none;border-radius:8px;cursor:pointer;font-size:15px;font-weight:600;">
-        💾 저장
-      </button>
-    </div>
-  `;
-  area.innerHTML = html;
-  // 새로 생긴 저장 버튼에 이벤트 바인딩
-  const newSaveBtn = area.querySelector('#noteSaveBtn');
-  if (newSaveBtn) newSaveBtn.addEventListener('click', noteSave);
-  card.style.display = 'block';
-}
-  window.renderNotePreview = renderNotePreview;
-
-
-  async function loadTableDataForItem(it, cb) {
-    if (!it.table_ref || it._table_loading) return;
-    it._table_loading = true;
-    try {
-      const r = await fetch('/notes/table/' + it.table_ref);
-      if (r.ok) {
-        const d = await r.json();
-        it._table_data = d.table;
-      }
-    } catch (e) {}
-    it._table_loading = false;
-    if (cb) cb();
-  }
-
-  function showPhotoOverlay(url) {
-    document.getElementById('photoOverlayImg').src = url;
-    document.getElementById('photoOverlay').classList.add('show');
-  }
-
-  async function noteAiParse() {
-    const text = document.getElementById('noteRawText').value.trim();
-    const status = document.getElementById('noteStatus');
-    const saveBtn = document.getElementById('noteSaveBtn');
-    if (!text) {
-      status.textContent = '⚠️ 텍스트를 입력하세요';
-      status.style.color = '#dc2626';
-      return;
-    }
-    status.textContent = '🤖 AI 정리 중...';
-    status.style.color = '#6b7280';
-    if (saveBtn) { saveBtn.disabled = true; saveBtn.style.opacity = '0.5'; }
-    const _divId = document.getElementById('noteDivision').value;
-    try {
-      const r = await fetch('/admin/notes/ai_parse', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, division_id: _divId }),
-      });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = await r.json();
-      _noteParsedCards = data.cards || [];
-      window._noteParsedCards = _noteParsedCards;
-      renderNotePreview(_noteParsedCards);
-      status.textContent = `✅ ${_noteParsedCards.length}개 카드 정리 완료`;
-      status.style.color = '#10b981';
-      if (saveBtn) { saveBtn.disabled = false; saveBtn.style.opacity = '1'; }
-    } catch (e) {
-      status.textContent = '❌ AI 정리 실패: ' + e.message;
-      status.style.color = '#dc2626';
-      _noteParsedCards = null;
-    }
-  }
-  window.noteAiParse = noteAiParse;
-
-
-  async function noteSave() {
-    if (!_noteParsedCards) {
-      alert('먼저 AI로 정리해주세요');
-      return;
-    }
-    const divisionId = document.getElementById('noteDivision').value;
-    const reportDate = document.getElementById('noteReportDate').value;
-    if (!divisionId) { alert('사업부를 선택하세요'); return; }
-    if (!reportDate) { alert('보고일자를 선택하세요'); return; }
-
-    const status = document.getElementById('noteStatus');
-    status.textContent = '💾 저장 중...';
-    status.style.color = '#6b7280';
-    try {
-      const r = await fetch('/admin/notes', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          division_id: divisionId,
-          report_date: reportDate,
-          raw_text: document.getElementById('noteRawText').value || '',
-          cards: _noteParsedCards,
-        }),
-      });
-      if (!r.ok) {
-        const err = await r.text();
-        throw new Error(err || `HTTP ${r.status}`);
-      }
-      const data = await r.json();
-      status.textContent = `✅ 업로드 완료 (${data.card_count}개 카드)`;
-      status.style.color = '#10b981';
-
-      // 미리보기 숨기고 원본 텍스트만 남기기
-      _noteParsedCards = null;
-      const previewCard = document.getElementById('notePreviewCard');
-      const previewArea = document.getElementById('notePreviewArea');
-      if (previewArea) previewArea.innerHTML = '';
-      if (previewCard) previewCard.style.display = 'none';
-
-      const saveBtn = document.getElementById('noteSaveBtn');
-      if (saveBtn) { saveBtn.disabled = true; saveBtn.style.opacity = '0.5'; }
-    } catch (e) {
-      status.textContent = '❌ 저장 실패: ' + e.message;
-      status.style.color = '#dc2626';
-    }
-  }
-
-  // cards JSON → 텍스트 변환 (편집 가능 포맷)
-  function _cardsToText(cards) {
-    if (!cards || cards.length === 0) return '';
-    const out = [];
-    cards.forEach((c, ci) => {
-      out.push(`<${c.title || '프로젝트'}>`);
-      const sections = Array.isArray(c.sections) ? c.sections : [];
-      sections.forEach((s, si) => {
-        if (s.title) out.push(`[${s.title}]`);
-        const items = Array.isArray(s.items) ? s.items : [];
-        // group_id 모아서 } 표기 만들기
-        let i = 0;
-        while (i < items.length) {
-          const it = items[i] || {};
-          const gid = it.group_id || '';
-          if (gid) {
-            // 같은 group_id 연속 묶기
-            const group = [];
-            let j = i;
-            while (j < items.length && (items[j] || {}).group_id === gid) {
-              group.push(items[j]);
-              j++;
-            }
-            const normals = group.filter(g => (g.type || '') !== 'group_note');
-            const notes = group.filter(g => (g.type || '') === 'group_note');
-            normals.forEach((g, idx) => {
-              const isLast = idx === normals.length - 1;
-              const t = (g.type || 'bullet');
-              let prefix = '- ';
-              if (t === 'highlight') prefix = '*';
-              else if (t === 'sub') prefix = '  → ';
-              const tail = (isLast && notes.length > 0) ? ' } ' + notes.map(n => n.text || '').join(', ') : '';
-              out.push(prefix + (g.text || '') + tail);
-            });
-            // 단일 group_note 만 있고 normal 없으면 그냥 출력
-            if (normals.length === 0 && notes.length > 0) {
-              notes.forEach(n => out.push('} ' + (n.text || '')));
-            }
-            i = j;
-          } else {
-            const t = (it.type || 'bullet');
-            if (t === 'highlight') out.push('*' + (it.text || ''));
-            else if (t === 'sub') out.push('  → ' + (it.text || ''));
-            else if (t === 'group_note') out.push('} ' + (it.text || ''));
-            else if (t === 'table') out.push('[표]');
-            else if (t === 'photo') out.push('[사진]');
-            else out.push('- ' + (it.text || ''));
-            i++;
-          }
-        }
-      });
-      if (ci < cards.length - 1) out.push('');
-    });
-    return out.join(String.fromCharCode(10));
-  }
-
-  async function noteLoadExisting() {
-    const divisionId = document.getElementById('noteDivision').value;
-    if (!divisionId) { alert('사업부를 먼저 선택하세요'); return; }
-    const status = document.getElementById('noteStatus');
-    status.textContent = '📥 불러오는 중...';
-    status.style.color = '#6b7280';
-    try {
-      const r = await fetch(`/notes?division_id=${encodeURIComponent(divisionId)}`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = await r.json();
-      const cards = data.cards || [];
-      if (data.report_date) {
-        document.getElementById('noteReportDate').value = data.report_date;
-      }
-      if (cards.length > 0) {
-        const txt = _cardsToText(cards);
-        const ta = document.getElementById('noteRawText');
-        if (ta) ta.value = txt;
-        // 미리보기 닫기 (사용자가 텍스트 먼저 보고 수정하도록)
-        _noteParsedCards = null;
-        const card = document.getElementById('notePreviewCard');
-        if (card) card.style.display = 'none';
-        status.textContent = `✅ ${cards.length}개 카드를 텍스트로 불러옴 — 수정 후 "🤖 AI 정리" 를 눌러주세요`;
-        status.style.color = '#10b981';
-      } else {
-        status.textContent = '저장된 노트가 없습니다';
-        status.style.color = '#6b7280';
-      }
-    } catch (e) {
-      status.textContent = '❌ 불러오기 실패: ' + e.message;
-      status.style.color = '#dc2626';
-    }
-  }
-
-  // ─── 표/사진 첨부 ───
-  let _editingTable = null; // {cardIdx, secIdx, itemIdx, headers, rows, title}
-
-  function _getItem(ci, si, ii) {
-    if (!_noteParsedCards) return null;
-    const c = _noteParsedCards[ci]; if (!c) return null;
-    const s = (c.sections || [])[si]; if (!s) return null;
-    return (s.items || [])[ii] || null;
-  }
-
-  async function openTableModal(ci, si, ii) {
-    const it = _getItem(ci, si, ii); if (!it) return;
-    let tableData = { title: '', headers: ['구분', '값'], rows: [['', '']] };
-    let isExisting = false;
-    if (it.table_ref) {
-      try {
-        const r = await fetch('/notes/table/' + it.table_ref);
-        if (r.ok) {
-          const d = await r.json();
-          tableData = d.table || tableData;
-          isExisting = true;
-        }
-      } catch (e) {}
-    }
-    _editingTable = {
-      ci, si, ii,
-      title: tableData.title || '',
-      headers: (tableData.headers && tableData.headers.length) ? [...tableData.headers] : ['구분', '값'],
-      rows: (tableData.rows && tableData.rows.length) ? tableData.rows.map(r => [...r]) : [['', '']],
-    };
-    document.getElementById('tableModalTitle').value = _editingTable.title;
-    document.getElementById('tablePasteArea').value = '';
-    document.getElementById('tableModalDeleteBtn').style.display = isExisting ? 'inline-block' : 'none';
-    renderTableEditor();
-    document.getElementById('tableModal').classList.add('show');
-  }
-
-  function closeTableModal() {
-    document.getElementById('tableModal').classList.remove('show');
-    _editingTable = null;
-  }
-
-  function renderTableEditor() {
-    if (!_editingTable) return;
-    const area = document.getElementById('tableEditorArea');
-    area.innerHTML = '';
-    const tbl = document.createElement('table');
-    tbl.className = 'modal-table';
-
-    // 헤더 행
-    const thead = document.createElement('thead');
-    const trh = document.createElement('tr');
-    _editingTable.headers.forEach((h, ci) => {
-      const th = document.createElement('th');
-      const inp = document.createElement('input');
-      inp.value = h;
-      inp.style.fontWeight = '600';
-      inp.style.background = '#f9fafb';
-      inp.oninput = (e) => { _editingTable.headers[ci] = e.target.value; };
-      th.appendChild(inp);
-      trh.appendChild(th);
-    });
-    thead.appendChild(trh);
-    tbl.appendChild(thead);
-
-    // 데이터 행
-    const tbody = document.createElement('tbody');
-    _editingTable.rows.forEach((row, ri) => {
-      const tr = document.createElement('tr');
-      _editingTable.headers.forEach((_, ci) => {
-        const td = document.createElement('td');
-        const inp = document.createElement('input');
-        inp.value = row[ci] !== undefined ? row[ci] : '';
-        inp.oninput = (e) => {
-          while (row.length < _editingTable.headers.length) row.push('');
-          row[ci] = e.target.value;
-        };
-        td.appendChild(inp);
-        tr.appendChild(td);
-      });
-      tbody.appendChild(tr);
-    });
-    tbl.appendChild(tbody);
-    area.appendChild(tbl);
-  }
-
-  function addTableRow() {
-    if (!_editingTable) return;
-    _editingTable.rows.push(_editingTable.headers.map(() => ''));
-    renderTableEditor();
-  }
-
-  function removeTableRow() {
-    if (!_editingTable) return;
-    if (_editingTable.rows.length <= 1) { alert('최소 1행은 있어야 합니다'); return; }
-    _editingTable.rows.pop();
-    renderTableEditor();
-  }
-
-  function addTableCol() {
-    if (!_editingTable) return;
-    _editingTable.headers.push('항목' + (_editingTable.headers.length + 1));
-    _editingTable.rows.forEach(r => r.push(''));
-    renderTableEditor();
-  }
-
-  function removeTableCol() {
-    if (!_editingTable) return;
-    if (_editingTable.headers.length <= 1) { alert('최소 1열은 있어야 합니다'); return; }
-    _editingTable.headers.pop();
-    _editingTable.rows.forEach(r => r.pop());
-    renderTableEditor();
-  }
-
-  // 클립보드 붙여넣기 자동 파싱 (Tab/쉼표)
-  document.addEventListener('DOMContentLoaded', () => {
-    const pa = document.getElementById('tablePasteArea');
-    if (pa) {
-      pa.addEventListener('paste', (e) => {
-        setTimeout(() => {
-          const text = pa.value;
-          if (!text.trim() || !_editingTable) return;
-          const _LF = String.fromCharCode(10);
-          const _CR = String.fromCharCode(13);
-          const _TAB = String.fromCharCode(9);
-          const _norm = String(text).split(_CR + _LF).join(_LF).split(_CR).join(_LF);
-          const lines = _norm.split(_LF).filter(function(l){ return l.trim(); });
-          if (lines.length === 0) return;
-          const sep = lines[0].indexOf(_TAB) >= 0 ? _TAB : ',';
-          const parsed = lines.map(l => l.split(sep).map(c => c.trim()));
-          if (parsed.length >= 1) {
-            _editingTable.headers = parsed[0];
-            _editingTable.rows = parsed.slice(1).length ? parsed.slice(1) : [parsed[0].map(() => '')];
-            renderTableEditor();
-            pa.value = '';
-          }
-        }, 50);
-      });
-    }
-  });
-
-  async function saveTableFromModal() {
-    if (!_editingTable) return;
-    const divisionId = document.getElementById('noteDivision').value;
-    if (!divisionId) { alert('사업부를 선택하세요'); return; }
-    const it = _getItem(_editingTable.ci, _editingTable.si, _editingTable.ii); if (!it) return;
-
-    const tableData = {
-      title: document.getElementById('tableModalTitle').value.trim(),
-      headers: _editingTable.headers,
-      rows: _editingTable.rows,
-    };
-
-    try {
-      const body = { division_id: divisionId, table: tableData };
-      if (it.table_ref) body.table_ref = it.table_ref;
-      const r = await fetch('/admin/notes/table', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const d = await r.json();
-      it.table_ref = d.table_ref;
-      it._table_data = tableData;
-      closeTableModal();
-      renderNotePreview(_noteParsedCards);
-      // 카드 변경 자동 반영을 위해 노트 저장 권장 메시지
-      const st = document.getElementById('noteStatus');
-      st.textContent = '✅ 표 저장됨 — 노트 변경사항이 있다면 "💾 저장" 버튼을 눌러주세요';
-      st.style.color = '#10b981';
-    } catch (e) {
-      alert('표 저장 실패: ' + e.message);
-    }
-  }
-
-  async function deleteTableFromModal() {
-    if (!_editingTable) return;
-    const it = _getItem(_editingTable.ci, _editingTable.si, _editingTable.ii); if (!it) return;
-    if (!it.table_ref) { closeTableModal(); return; }
-    if (!confirm('이 표를 삭제하시겠습니까?')) return;
-    try {
-      const r = await fetch('/admin/notes/table/' + it.table_ref, {
-        method: 'DELETE', credentials: 'same-origin',
-      });
-      // 404여도 클라이언트는 정리
-      delete it._table_data;
-      delete it.table_ref;
-      closeTableModal();
-      renderNotePreview(_noteParsedCards);
-      const st = document.getElementById('noteStatus');
-      st.textContent = '🗑️ 표 삭제됨 — "💾 저장" 버튼을 눌러주세요';
-      st.style.color = '#f59e0b';
-    } catch (e) {
-      alert('표 삭제 실패: ' + e.message);
-    }
-  }
-
-  // 사진 업로드
-  let _pendingPhotoTarget = null; // {ci, si, ii}
-  function openPhotoUpload(ci, si, ii) {
-    const it = _getItem(ci, si, ii); if (!it) return;
-    const divisionId = document.getElementById('noteDivision').value;
-    if (!divisionId) { alert('사업부를 선택하세요'); return; }
-    _pendingPhotoTarget = { ci, si, ii };
-    document.getElementById('notePhotoFileInput').click();
-  }
-
-  document.addEventListener('DOMContentLoaded', () => {
-    const inp = document.getElementById('notePhotoFileInput');
-    if (inp) {
-      inp.addEventListener('change', async (e) => {
-        const file = e.target.files[0];
-        if (!file || !_pendingPhotoTarget) return;
-        const { ci, si, ii } = _pendingPhotoTarget;
-        const it = _getItem(ci, si, ii);
-        const divisionId = document.getElementById('noteDivision').value;
-        if (!it || !divisionId) { inp.value = ''; return; }
-        const fd = new FormData();
-        fd.append('division_id', divisionId);
-        fd.append('file', file);
-        try {
-          const r = await fetch('/admin/notes/photo', {
-            method: 'POST', credentials: 'same-origin', body: fd,
-          });
-          if (!r.ok) throw new Error('HTTP ' + r.status);
-          const d = await r.json();
-          it.photo_ref = d.photo_ref;
-          renderNotePreview(_noteParsedCards);
-          const st = document.getElementById('noteStatus');
-          st.textContent = '✅ 사진 업로드됨 — "💾 저장" 버튼을 눌러주세요';
-          st.style.color = '#10b981';
-        } catch (err) {
-          alert('사진 업로드 실패: ' + err.message);
-        } finally {
-          inp.value = '';
-          _pendingPhotoTarget = null;
-        }
-      });
-    }
-  });
-
-  async function removeNotePhoto(ci, si, ii) {
-    const it = _getItem(ci, si, ii); if (!it || !it.photo_ref) return;
-    if (!confirm('이 사진을 삭제하시겠습니까?')) return;
-    try {
-      await fetch('/admin/notes/photo/' + it.photo_ref, {
-        method: 'DELETE', credentials: 'same-origin',
-      });
-    } catch (e) {}
-    delete it.photo_ref;
-    renderNotePreview(_noteParsedCards);
-    const st = document.getElementById('noteStatus');
-    st.textContent = '🗑️ 사진 삭제됨 — "💾 저장" 버튼을 눌러주세요';
-    st.style.color = '#f59e0b';
-  }
-
-  // ─── 매핑 관리 대시보드 ───
-  let _mapDivisions = [];
-  let _mapActiveDivId = null;
-  let _mapReports = [];
-  let _mapNotes = {};
-
-  async function initMappingTab() {
-    try {
-      const divResp = await fetch('/divisions');
-      if (!divResp.ok) throw new Error('divisions HTTP ' + divResp.status);
-      const divData = await divResp.json();
-      _mapDivisions = divData.divisions || [];
-
-      try {
-        const r = await fetch('/admin/uploads/history', { credentials: 'same-origin' });
-        if (r.ok) {
-          const d = await r.json();
-          _mapReports = d.items || d.reports || [];
-        }
-      } catch (e) { _mapReports = []; }
-
-      _mapNotes = {};
-      for (const d of _mapDivisions) {
-        try {
-          const r = await fetch('/notes?division_id=' + encodeURIComponent(d.id));
-          if (r.ok) {
-            const data = await r.json();
-            _mapNotes[d.id] = data;
-          }
-        } catch (e) {}
-      }
-
-      renderMappingChips();
-      if (_mapDivisions.length > 0) {
-        selectMappingDivision(_mapDivisions[0].id);
-      }
-    } catch (e) {
-      const grid = document.getElementById('mappingProjectGrid');
-      if (grid) grid.innerHTML = '<div style="color:#dc2626;padding:16px;">로드 실패: ' + e.message + '</div>';
-    }
-  }
-
-  function renderMappingChips() {
-    const wrap = document.getElementById('mappingDivisionChips');
-    if (!wrap) return;
-    wrap.innerHTML = '';
-    _mapDivisions.forEach(d => {
-      const chip = document.createElement('button');
-      chip.className = 'map-chip' + (d.id === _mapActiveDivId ? ' active' : '');
-      chip.dataset.divId = d.id;
-      chip.innerHTML = d.label + '<span class="count">' + (d.projects || []).length + '</span>';
-      chip.onclick = () => selectMappingDivision(d.id);
-      wrap.appendChild(chip);
-    });
-  }
-
-  function _countProjectMatches(divisionId, project) {
-    let pptCardCount = 0;
-    const aliases = (project.aliases || []).map(s => s.toLowerCase());
-    const labelLc = (project.label || '').toLowerCase();
-    const projectId = project.id;
-
-    for (const rep of _mapReports) {
-      const products = rep.products || [];
-      for (const p of products) {
-        const pkey = p.project_key || p.project || '';
-        if (pkey === projectId) { pptCardCount += 1; continue; }
-        const text = ((p.name || '') + ' ' + (p.headline || '')).toLowerCase();
-        if (labelLc && text.includes(labelLc)) { pptCardCount += 1; continue; }
-        for (const al of aliases) {
-          if (al && text.includes(al)) { pptCardCount += 1; break; }
-        }
-      }
-    }
-    return pptCardCount;
-  }
-
-  function selectMappingDivision(divId) {
-    _mapActiveDivId = divId;
-    renderMappingChips();
-
-    const div = _mapDivisions.find(d => d.id === divId);
-    if (!div) return;
-
-    const meta = document.getElementById('mappingDivisionMeta');
-    const grid = document.getElementById('mappingProjectGrid');
-    const empty = document.getElementById('mappingEmpty');
-
-    const projects = div.projects || [];
-    const noteData = _mapNotes[divId] || {};
-    const noteCards = noteData.cards || [];
-
-    if (meta) {
-      meta.textContent = '▼ ' + div.label + ' — 프로젝트 ' + projects.length + '개 / 주간 보고 카드 ' + noteCards.length + '개';
-    }
-
-    if (projects.length === 0) {
-      if (grid) grid.innerHTML = '';
-      if (empty) empty.style.display = 'block';
-      return;
-    }
-    if (empty) empty.style.display = 'none';
-
-    if (grid) {
-      grid.innerHTML = '';
-      projects.forEach(prj => {
-        const card = document.createElement('div');
-        card.className = 'map-pcard';
-        card.style.cursor = 'pointer';
-        card.onclick = () => openMappingDetail(divId, prj.id);
-
-        const labelLc = (prj.label || '').toLowerCase();
-        const noteMatch = noteCards.some(nc => {
-          const t = (nc.title || '').toLowerCase();
-          return t && (t.includes(labelLc) || labelLc.includes(t));
-        });
-
-        const pptCount = _countProjectMatches(divId, prj);
-
-        const pptCls = pptCount > 0 ? 'badge-ppt' : 'badge-empty';
-        const noteCls = noteMatch ? 'badge-note' : 'badge-empty';
-        const noteText = noteMatch ? '✅' : '—';
-
-        card.innerHTML =
-          '<div class="ptitle">' + (prj.label || '?') + '</div>' +
-          '<div class="pmeta">' +
-            '<span class="' + pptCls + '">📊 PPT ' + pptCount + '</span>' +
-            '<span class="' + noteCls + '">📝 노트 ' + noteText + '</span>' +
-          '</div>';
-
-        grid.appendChild(card);
-      });
-    }
-  }
-
-  function openMappingDetail(divisionId, projectId) {
-    const div = _mapDivisions.find(d => d.id === divisionId);
-    if (!div) return;
-    const prj = (div.projects || []).find(x => x.id === projectId);
-    if (!prj) return;
-
-    document.getElementById('mappingDetailTitle').textContent = prj.label + ' (' + div.label + ')';
-
-    // PPT 카드 매칭
-    const aliases = (prj.aliases || []).map(s => s.toLowerCase());
-    const labelLc = (prj.label || '').toLowerCase();
-    const pptMatches = [];
-
-    for (const rep of _mapReports) {
-      const fname = rep.file_name || '';
-      const ts = rep.upload_timestamp || '';
-      const products = rep.products || [];
-      for (const pd of products) {
-        const pkey = pd.project_key || pd.project || '';
-        const text = ((pd.name || '') + ' ' + (pd.headline || '')).toLowerCase();
-        let matched = false;
-        if (pkey === projectId) matched = true;
-        else if (labelLc && text.includes(labelLc)) matched = true;
-        else {
-          for (const al of aliases) {
-            if (al && text.includes(al)) { matched = true; break; }
-          }
-        }
-        if (matched) {
-          pptMatches.push({ rep_file: fname, rep_ts: ts, product: pd });
-        }
-      }
-    }
-
-    // 노트 카드 매칭 (해당 사업부의 노트 중 카드 title이 프로젝트명 포함)
-    const noteData = _mapNotes[divisionId] || {};
-    const noteCards = noteData.cards || [];
-    const noteMatches = noteCards.filter(nc => {
-      const t = (nc.title || '').toLowerCase();
-      return t && (t.includes(labelLc) || labelLc.includes(t));
-    });
-
-    // Subtitle
-    const sub = document.getElementById('mappingDetailSubtitle');
-    sub.textContent = 'PPT 카드 ' + pptMatches.length + '개 / 노트 카드 ' + noteMatches.length + '개';
-
-    // PPT 영역
-    const pptArea = document.getElementById('mappingDetailPpt');
-    if (pptMatches.length === 0) {
-      pptArea.innerHTML = '<div style="color:#9ca3af;padding:10px 0;">매핑된 PPT 카드가 없습니다.</div>';
-    } else {
-      pptArea.innerHTML = '';
-      pptMatches.forEach(m => {
-        const wrap = document.createElement('div');
-        wrap.style.cssText = 'background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;margin-bottom:8px;';
-        const fname = m.rep_file || '(파일명 없음)';
-        const ts = m.rep_ts ? new Date(m.rep_ts).toLocaleString('ko-KR') : '';
-        const name = m.product.name || '';
-        const headline = m.product.headline || '';
-        const bullets = m.product.summary_bullets || [];
-
-        let html = '<div style="font-size:11px;color:#9ca3af;margin-bottom:4px;">📄 ' + fname + (ts ? ' · ' + ts : '') + '</div>';
-        html += '<div style="font-weight:600;color:#1f2937;margin-bottom:2px;">' + (name || '(이름 없음)') + '</div>';
-        if (headline) html += '<div style="color:#4b5563;margin-bottom:6px;">' + headline + '</div>';
-        if (bullets.length) {
-          html += '<ul style="margin:4px 0 0 18px;padding:0;color:#374151;">';
-          bullets.forEach(b => { html += '<li style="margin-bottom:2px;">' + b + '</li>'; });
-          html += '</ul>';
-        }
-        wrap.innerHTML = html;
-        pptArea.appendChild(wrap);
-      });
-    }
-
-    // 노트 영역
-    const noteArea = document.getElementById('mappingDetailNotes');
-    if (noteMatches.length === 0) {
-      noteArea.innerHTML = '<div style="color:#9ca3af;padding:10px 0;">매핑된 주간 보고 노트가 없습니다.</div>';
-    } else {
-      noteArea.innerHTML = '';
-      const reportDate = noteData.report_date || '';
-      noteMatches.forEach(nc => {
-        const wrap = document.createElement('div');
-        wrap.style.cssText = 'background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:10px 12px;margin-bottom:8px;';
-        let html = '<div style="font-weight:600;color:#1E3A5F;margin-bottom:4px;">' + (nc.title || '(제목 없음)') + (reportDate ? ' · ' + reportDate : '') + '</div>';
-        (nc.sections || []).forEach(sec => {
-          html += '<div style="font-size:12px;font-weight:600;color:#374151;margin:6px 0 2px;padding:3px 8px;background:#dcfce7;border-radius:4px;">' + (sec.title || '') + '</div>';
-          (sec.items || []).forEach(it => {
-            const isHl = it.type === 'highlight';
-            const isSub = it.type === 'sub';
-            const dot = isSub ? '↳' : '•';
-            const color = isHl ? '#dc2626' : '#1f2937';
-            const fw = isHl ? '600' : '400';
-            const ml = isSub ? '20px' : '6px';
-            html += '<div style="font-size:12px;color:' + color + ';font-weight:' + fw + ';margin-left:' + ml + ';line-height:1.6;">' + dot + ' ' + (it.text || '') + '</div>';
-          });
-        });
-        wrap.innerHTML = html;
-        noteArea.appendChild(wrap);
-      });
-    }
-
-    document.getElementById('mappingDetailModal').classList.add('show');
-  }
-
-  function closeMappingDetail() {
-    document.getElementById('mappingDetailModal').classList.remove('show');
-  }
-
-  let _mapInitialized = false;
-  document.addEventListener('DOMContentLoaded', () => {
-    document.querySelectorAll('.tab-btn').forEach(btn => {
-      if (btn.dataset.tab === 'mapping') {
-        btn.addEventListener('click', () => {
-          if (!_mapInitialized) {
-            _mapInitialized = true;
-            initMappingTab();
-          }
-        });
-      }
-    });
-    // ESC로 모달 닫기
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        const m = document.getElementById('mappingDetailModal');
-        if (m && m.classList.contains('show')) m.classList.remove('show');
-      }
-    });
-  });
-
-  // 노트 탭 초기화
-  document.addEventListener('DOMContentLoaded', () => {
-    initNoteDate();
-    loadNoteDivisions();
-    const aiBtn = document.getElementById('noteAiParseBtn');
-    if (aiBtn) aiBtn.addEventListener('click', noteAiParse);
-    const saveBtn = document.getElementById('noteSaveBtn');
-    if (saveBtn) saveBtn.addEventListener('click', noteSave);
-    const loadBtn = document.getElementById('noteLoadBtn');
-    if (loadBtn) loadBtn.addEventListener('click', function(){ if (window.openNoteLoadModal) { window.openNoteLoadModal(); } else { alert('note_loader.js 로딩 실패'); } });
-  });
-
-</script>
-
-<!-- 표 편집 모달 -->
-<div class="modal-overlay" id="tableModal">
-  <div class="modal-box">
-    <h3>📊 표 편집</h3>
-    <input type="text" id="tableModalTitle" class="modal-input" placeholder="표 제목 (선택)" />
-    <div style="font-size:12px;color:#6b7280;margin-bottom:6px;">
-      💡 Excel에서 복사한 표를 아래에 붙여넣으면 자동 인식됩니다 (Tab/쉼표 구분).
-    </div>
-    <textarea id="tablePasteArea" class="modal-input" placeholder="여기에 붙여넣기 → 자동 파싱"></textarea>
-    <div id="tableEditorArea"></div>
-    <div style="display:flex; gap:6px; margin-bottom:12px;">
-      <button onclick="addTableRow()" style="background:#e5e7eb;color:#374151;margin:0;padding:6px 12px;font-size:12px;">＋ 행 추가</button>
-      <button onclick="addTableCol()" style="background:#e5e7eb;color:#374151;margin:0;padding:6px 12px;font-size:12px;">＋ 열 추가</button>
-      <button onclick="removeTableRow()" style="background:#fee2e2;color:#991b1b;margin:0;padding:6px 12px;font-size:12px;">－ 마지막 행 삭제</button>
-      <button onclick="removeTableCol()" style="background:#fee2e2;color:#991b1b;margin:0;padding:6px 12px;font-size:12px;">－ 마지막 열 삭제</button>
-    </div>
-    <div class="modal-actions">
-      <button class="danger" id="tableModalDeleteBtn" onclick="deleteTableFromModal()">🗑️ 삭제</button>
-      <button class="cancel" onclick="closeTableModal()">취소</button>
-      <button onclick="saveTableFromModal()">💾 저장</button>
-    </div>
-  </div>
-</div>
-
-<!-- 매핑 관리: 프로젝트 상세 모달 -->
-<div class="modal-overlay" id="mappingDetailModal">
-  <div class="modal-box" style="min-width:600px;max-width:800px;">
-    <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:12px;">
-      <h3 id="mappingDetailTitle" style="margin:0;color:#1E3A5F;">프로젝트 상세</h3>
-      <button onclick="closeMappingDetail()" style="background:transparent;color:#6b7280;font-size:24px;padding:0;margin:0;border:none;cursor:pointer;line-height:1;">✕</button>
-    </div>
-
-    <div style="font-size:13px;color:#6b7280;margin-bottom:14px;" id="mappingDetailSubtitle"></div>
-
-    <h4 style="margin:14px 0 8px;color:#1E3A5F;font-size:15px;">📊 PPT 카드</h4>
-    <div id="mappingDetailPpt" style="font-size:13px;"></div>
-
-    <h4 style="margin:18px 0 8px;color:#1E3A5F;font-size:15px;">📝 주간 보고 노트</h4>
-    <div id="mappingDetailNotes" style="font-size:13px;"></div>
-  </div>
-</div>
-
-<!-- PPT 초안 생성 사업부 선택 모달 -->
-<div class="modal-overlay" id="draftDivModal">
-  <div class="modal-box" style="max-width:520px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-      <h3 style="margin:0;">📝 주간 보고 초안 생성</h3>
-      <button onclick="closeDraftModal()" style="background:transparent;color:#6b7280;font-size:24px;padding:0;margin:0;border:none;cursor:pointer;line-height:1;">✕</button>
-    </div>
-    <p style="color:#6b7280;font-size:13px;margin:0 0 10px;"><span id="draftModalFile" style="color:#374151;font-weight:600;"></span></p>
-    <p style="color:#6b7280;font-size:13px;margin:0 0 14px;">이 PPT를 어느 사업부 주간 보고로 변환할까요?</p>
-    <div id="draftDivChips" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;"></div>
-    <div id="draftModalStatus" style="font-size:13px;color:#6b7280;margin-top:8px;min-height:18px;"></div>
-  </div>
-</div>
-
-<!-- 사진 확대 모달 -->
-<div class="photo-overlay" id="photoOverlay" onclick="this.classList.remove('show')">
-  <img id="photoOverlayImg" src="" alt="확대 사진" />
-</div>
-
-<!-- 숨김 사진 업로드 input -->
-<input type="file" id="notePhotoFileInput" accept="image/*" style="display:none;" />
-
-
-<script src="/static/note_loader.js"></script>
-<script src="/static/excel_drop.js"></script>
-<script src="/static/photo_drop.js">
-    
-    
-// 주차별 계획 입력 페이지 — 기존 박스 유지 + 모델별 입력 박스 추가
-window.showWeeklyPlanPage = function(projectKey) {
-  var container = document.getElementById('mdl-table-box');
-  if (!container) return;
-  
-  var today = new Date();
-  var currentMonth = today.getFullYear() + '-' + String(today.getMonth() + 1).padStart(2, '0');
-  
-  // 기존 흰색 박스 (엑셀 업로드 + 주차별 표)는 그대로 유지
-  var existingContent = container.innerHTML;
-  
-  // 새로운 모델별 입력 박스 추가
-  var newBoxHtml = '<div style="margin-top:20px;padding:20px;background:#fff;border-radius:8px;border:1px solid #e0e0e0;box-shadow:0 1px 3px rgba(0,0,0,0.1);">' +
-    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid #e0e0e0;">' +
-      '<h4 style="margin:0;font-size:16px;font-weight:600;color:#111827;">📝 모델별 주차별 계획 입력</h4>' +
-      '<div style="display:flex;gap:8px;">' +
-        '<select id="wp-month-select" style="padding:6px 12px;border:1px solid #D1D5DB;border-radius:6px;font-size:13px;background:#fff;">' +
-          '<option value="2026-06">2026년 6월</option>' +
-          '<option value="2026-07">2026년 7월</option>' +
-          '<option value="2026-08">2026년 8월</option>' +
-          '<option value="2026-09" selected>2026년 9월</option>' +
-          '<option value="2026-10">2026년 10월</option>' +
-          '<option value="2026-11">2026년 11월</option>' +
-        '</select>' +
-      '</div>' +
-    '</div>' +
-    
-    '<div id="wp-models-list" style="display:flex;flex-direction:column;gap:12px;">' +
-      '<div style="text-align:center;padding:40px;color:#6B7280;">로딩 중...</div>' +
-    '</div>' +
-  '</div>';
-  
-  container.innerHTML = existingContent + newBoxHtml;
-  
-  // 월 변경 시
-  document.getElementById('wp-month-select').onchange = function() {
-    loadAllModelsWeeklyPlan(projectKey, this.value);
-  };
-  
-  // 초기 로드
-  loadAllModelsWeeklyPlan(projectKey, currentMonth);
-};
-
-function loadAllModelsWeeklyPlan(projectKey, month) {
-  var container = document.getElementById('wp-models-list');
-  if (!container) return;
-  
-  container.innerHTML = '<div style="text-align:center;padding:40px;color:#6B7280;">로딩 중...</div>';
-  
-  fetch('/projects/' + encodeURIComponent(projectKey) + '/models?month=' + encodeURIComponent(month))
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      var models = (d.models || []).filter(function(m) { return m.group === '양산'; });
-      
-      if (models.length === 0) {
-        container.innerHTML = '<div style="text-align:center;padding:40px;color:#6B7280;font-size:14px;">양산 모델이 없습니다</div>';
-        return;
-      }
-      
-      var html = '';
-      models.forEach(function(m, idx) {
-        html += '<div class="wp-model-card" style="border:1px solid #E5E7EB;border-radius:8px;overflow:hidden;transition:all 0.2s;">' +
-          '<div class="wp-model-header" style="background:#F9FAFB;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;cursor:pointer;border-bottom:1px solid #E5E7EB;" onclick="toggleWpModel(' + idx + ')">' +
-            '<div style="display:flex;align-items:center;gap:12px;">' +
-              '<div style="width:32px;height:32px;background:#3B82F6;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;font-size:12px;">' + (idx + 1) + '</div>' +
-              '<div>' +
-                '<div style="font-weight:600;font-size:14px;color:#111827;">' + (m.name || m.id) + '</div>' +
-                '<div style="font-size:12px;color:#6B7280;">' + m.id + '</div>' +
-              '</div>' +
-            '</div>' +
-            '<div style="display:flex;align-items:center;gap:8px;">' +
-              '<span id="wp-status-' + idx + '" style="font-size:12px;color:#6B7280;">로딩 중...</span>' +
-              '<span id="wp-toggle-' + idx + '" style="color:#6B7280;font-size:14px;transition:transform 0.2s;">▼</span>' +
-            '</div>' +
-          '</div>' +
-          '<div class="wp-model-body" id="wp-body-' + idx + '" style="display:none;padding:16px;background:#fff;">' +
-            '<div class="wp-loading" style="text-align:center;padding:20px;color:#6B7280;font-size:13px;">데이터 로딩 중...</div>' +
-          '</div>' +
-        '</div>';
-      });
-      
-      container.innerHTML = html;
-      
-      // 각 모델 데이터 로드
-      models.forEach(function(m, idx) {
-        loadModelWeeklyData(projectKey, m.id, month, idx);
-      });
-    });
-}
-
-function toggleWpModel(idx) {
-  var body = document.getElementById('wp-body-' + idx);
-  var toggle = document.getElementById('wp-toggle-' + idx);
-  if (body.style.display === 'none') {
-    body.style.display = 'block';
-    toggle.style.transform = 'rotate(180deg)';
-  } else {
-    body.style.display = 'none';
-    toggle.style.transform = 'rotate(0deg)';
-  }
-}
-
-function loadModelWeeklyData(projectKey, modelId, month, idx) {
-  var body = document.getElementById('wp-body-' + idx);
-  var status = document.getElementById('wp-status-' + idx);
-  
-  fetch('/projects/' + encodeURIComponent(projectKey) + '/models/' + encodeURIComponent(modelId) + '/weekly-plan?month=' + month)
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.detail) {
-        body.innerHTML = '<div style="color:#DC2626;padding:20px;text-align:center;font-size:13px;">' + d.detail + '</div>';
-        status.textContent = '오류';
-        status.style.color = '#DC2626';
-        return;
-      }
-      
-      // 상태 업데이트
-      var totalPlan = d.month_total_plan || 0;
-      var totalActual = d.month_total_actual || 0;
-      var progress = totalPlan > 0 ? Math.round(totalActual / totalPlan * 100) : 0;
-      status.textContent = '진행률 ' + progress + '%';
-      status.style.color = progress > 0 ? '#059669' : '#6B7280';
-      
-      var html = '<div style="overflow-x:auto;">' +
-        '<table style="width:100%;border-collapse:collapse;font-size:13px;">' +
-          '<thead>' +
-            '<tr style="background:#F9FAFB;">' +
-              '<th style="padding:10px 12px;border:1px solid #E5E7EB;text-align:left;font-weight:600;color:#374151;">주차</th>' +
-              '<th style="padding:10px 12px;border:1px solid #E5E7EB;text-align:left;font-weight:600;color:#374151;">계획</th>' +
-              '<th style="padding:10px 12px;border:1px solid #E5E7EB;text-align:left;font-weight:600;color:#374151;">실적</th>' +
-              '<th style="padding:10px 12px;border:1px solid #E5E7EB;text-align:left;font-weight:600;color:#374151;">잔여</th>' +
-              '<th style="padding:10px 12px;border:1px solid #E5E7EB;text-align:left;font-weight:600;color:#374151;">진행률</th>' +
-            '</tr>' +
-          '</thead>' +
-          '<tbody>';
-      
-      d.weeks.forEach(function(w) {
-        var prog = w.plan > 0 ? Math.round(w.actual / w.plan * 100) : 0;
-        var progColor = prog === 100 ? '#059669' : prog > 0 ? '#2563EB' : '#6B7280';
-        html += '<tr style="transition:background 0.15s;" onmouseover="this.style.background=\'#F9FAFB\'" onmouseout="this.style.background=\'#fff\'">' +
-          '<td style="padding:10px 12px;border:1px solid #E5E7EB;font-weight:600;color:#111827;">' + w.week + '</td>' +
-          '<td style="padding:10px 12px;border:1px solid #E5E7EB;">' +
-            '<input type="number" class="wp-plan-input" data-model-idx="' + idx + '" data-week="' + w.week + '" value="' + w.plan + '" style="width:70px;padding:6px 8px;border:1px solid #D1D5DB;border-radius:6px;font-size:13px;text-align:center;" min="0">' +
-          '</td>' +
-          '<td style="padding:10px 12px;border:1px solid #E5E7EB;">' +
-            '<input type="number" class="wp-actual-input" data-model-idx="' + idx + '" data-week="' + w.week + '" value="' + w.actual + '" style="width:70px;padding:6px 8px;border:1px solid #D1D5DB;border-radius:6px;font-size:13px;text-align:center;" min="0">' +
-          '</td>' +
-          '<td style="padding:10px 12px;border:1px solid #E5E7EB;color:#6B7280;">' + w.remaining + '</td>' +
-          '<td style="padding:10px 12px;border:1px solid #E5E7EB;font-weight:600;color:' + progColor + '">' + prog + '%</td>' +
-        '</tr>';
-      });
-      
-      html += '</tbody>' +
-          '<tfoot>' +
-            '<tr style="background:#F3F4F6;font-weight:600;">' +
-              '<td style="padding:10px 12px;border:1px solid #E5E7EB;color:#111827;">총계</td>' +
-              '<td style="padding:10px 12px;border:1px solid #E5E7EB;color:#111827;" id="wp-total-plan-' + idx + '">' + d.month_total_plan + '</td>' +
-              '<td style="padding:10px 12px;border:1px solid #E5E7EB;color:#111827;" id="wp-total-actual-' + idx + '">' + d.month_total_actual + '</td>' +
-              '<td style="padding:10px 12px;border:1px solid #E5E7EB;color:#111827;" id="wp-total-remaining-' + idx + '">' + d.month_remaining + '</td>' +
-              '<td style="padding:10px 12px;border:1px solid #E5E7EB;color:#111827;" id="wp-total-progress-' + idx + '">' + d.progress + '%</td>' +
-            '</tr>' +
-          '</tfoot>' +
-        '</table>' +
-      '</div>' +
-      '<div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end;">' +
-        '<button type="button" class="mdl-btn" onclick="saveWpModelPlan(\'' + projectKey + '\', \'' + modelId + '\', \'' + month + '\', ' + idx + ')" style="background:#2563EB;color:#fff;padding:8px 16px;font-size:13px;border-radius:6px;border:none;cursor:pointer;font-weight:500;transition:background 0.2s;" onmouseover="this.style.background=\'#1D4ED8\'" onmouseout="this.style.background=\'#2563EB\'">💾 저장</button>' +
-        '<button type="button" class="mdl-btn" onclick="resetWpModelPlan(' + idx + ')" style="background:#DC2626;color:#fff;padding:8px 16px;font-size:13px;border-radius:6px;border:none;cursor:pointer;font-weight:500;transition:background 0.2s;" onmouseover="this.style.background=\'#B91C1C\'" onmouseout="this.style.background=\'#DC2626\'">🔄 초기화</button>' +
-      '</div>';
-      
-      body.innerHTML = html;
-      
-      // 실시간 합계 계산
-      function updateTotals() {
-        var plans = document.querySelectorAll('.wp-plan-input[data-model-idx="' + idx + '"]');
-        var actuals = document.querySelectorAll('.wp-actual-input[data-model-idx="' + idx + '"]');
-        var tp = 0, ta = 0;
-        plans.forEach(function(p) { tp += parseInt(p.value) || 0; });
-        actuals.forEach(function(a) { ta += parseInt(a.value) || 0; });
-        var remaining = Math.max(0, tp - ta);
-        var prog = tp > 0 ? Math.round(ta / tp * 100) : 0;
-        
-        document.getElementById('wp-total-plan-' + idx).textContent = tp;
-        document.getElementById('wp-total-actual-' + idx).textContent = ta;
-        document.getElementById('wp-total-remaining-' + idx).textContent = remaining;
-        document.getElementById('wp-total-progress-' + idx).textContent = prog + '%';
-        
-        // 상태 업데이트
-        status.textContent = '진행률 ' + prog + '%';
-        status.style.color = prog > 0 ? '#059669' : '#6B7280';
-      }
-      
-      document.querySelectorAll('.wp-plan-input[data-model-idx="' + idx + '"], .wp-actual-input[data-model-idx="' + idx + '"]').forEach(function(input) {
-        input.onchange = updateTotals;
-        input.oninput = updateTotals;
-      });
-    });
-}
-
-function saveWpModelPlan(projectKey, modelId, month, idx) {
-  var weeks = {};
-  document.querySelectorAll('.wp-plan-input[data-model-idx="' + idx + '"]').forEach(function(p) {
-    var week = p.dataset.week;
-    var actual = document.querySelector('.wp-actual-input[data-model-idx="' + idx + '"][data-week="' + week + '"]').value;
-    weeks[week] = { plan: parseInt(p.value) || 0, actual: parseInt(actual) || 0 };
-  });
-  
-  fetch('/admin/projects/' + encodeURIComponent(projectKey) + '/models/' + encodeURIComponent(modelId) + '/weekly-plan', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'same-origin',
-    body: JSON.stringify({ month: month, weeks: weeks })
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(d) {
-    if (d.ok) {
-      // 성공 메시지 (토스트)
-      var toast = document.createElement('div');
-      toast.style.cssText = 'position:fixed;top:20px;right:20px;background:#059669;color:#fff;padding:12px 20px;border-radius:8px;font-size:14px;font-weight:500;box-shadow:0 4px 6px rgba(0,0,0,0.1);z-index:9999;';
-      toast.textContent = '✅ 저장 완료 (진행률: ' + d.progress + '%)';
-      document.body.appendChild(toast);
-      setTimeout(function() { toast.remove(); }, 3000);
-      
-      // 데이터 다시 로드
-      loadModelWeeklyData(projectKey, modelId, month, idx);
-    } else {
-      alert('❌ 저장 실패: ' + (d.detail || '알 수 없는 오류'));
-    }
-  });
-}
-
-function resetWpModelPlan(idx) {
-  if (!confirm('⚠️ 모든 주차의 계획과 실적을 0으로 초기화하시겠습니까?')) return;
-  document.querySelectorAll('.wp-plan-input[data-model-idx="' + idx + '"], .wp-actual-input[data-model-idx="' + idx + '"]').forEach(function(input) {
-    input.value = 0;
-  });
-  // 합계 업데이트 트리거
-  var firstInput = document.querySelector('.wp-plan-input[data-model-idx="' + idx + '"]');
-  if (firstInput) firstInput.onchange();
-}
-
-</script>
-</body>
-
-</html>
-"""
-
+# ============================================================
+#  챗봇 (/chat) · RAG
+# ============================================================
 def _kmonth(month: str) -> str:
-    """'2026-09' → '9월'. 경영진 답변에는 ISO 표기 대신 이걸 쓴다."""
     try:
         return f"{int(str(month).split('-')[1])}월"
     except Exception:
         return str(month or "")
 
 
+# 주차 단위 출하 수량/매출 확정 답변(LLM 우회).
 def _week_shipment_answer(project_key, week, mode='qty', with_models=False, with_revenue=False, with_weeks=False):
-    """주차 단위 출하 수량/매출 확정 답변(LLM 우회). 데이터가 없으면 None."""
     if not week:
         return None
     week = str(week).upper()
@@ -19651,7 +11828,16 @@ def _week_shipment_answer(project_key, week, mode='qty', with_models=False, with
             _g = _probe.get('groups') or {}
             _yc = ((_g.get('양산') or {}).get('weeks') or {}).get(week) or {}
             _dc = ((_g.get('개발') or {}).get('weeks') or {}).get(week) or {}
-            if any(int(x.get(f) or 0) for x in (_yc, _dc) for f in ('plan', 'actual')):
+            # 양산 · 개발 두 칸 중 계획이나 실적이 하나라도 있으면 그 달이다
+            _has_num = False
+            for _cell in (_yc, _dc):
+                for _f in ('plan', 'actual'):
+                    if int(_cell.get(_f) or 0):
+                        _has_num = True
+                        break
+                if _has_num:
+                    break
+            if _has_num:
                 month = _c
                 break
     except Exception:
@@ -19687,7 +11873,16 @@ def _week_shipment_answer(project_key, week, mode='qty', with_models=False, with
         grp = wr.get('groups') or {}
         yc = ((grp.get('양산') or {}).get('weeks') or {}).get(week) or {}
         dc = ((grp.get('개발') or {}).get('weeks') or {}).get(week) or {}
-        if not any(int(x.get(f) or 0) for x in (yc, dc) for f in ('plan', 'actual')):
+        # 양산 · 개발 두 칸 다 계획·실적이 0 이면 건너뛴다
+        _has_num = False
+        for _cell in (yc, dc):
+            for _f in ('plan', 'actual'):
+                if int(_cell.get(_f) or 0):
+                    _has_num = True
+                    break
+            if _has_num:
+                break
+        if not _has_num:
             continue
         used_labels.append(_display_project_label(k))
         _yp, _ya = int(yc.get('plan') or 0), int(yc.get('actual') or 0)
@@ -19759,8 +11954,8 @@ def _week_shipment_answer(project_key, week, mode='qty', with_models=False, with
     return '\n'.join(lines)
 
 
+# 월 단위 출하 수량/매출 확정 답변(LLM 우회).
 def _month_shipment_answer(project_key, month, mode='qty', with_models=False, with_revenue=False, with_weeks=False):
-    """월 단위 출하 수량/매출 확정 답변(LLM 우회). 데이터가 없으면 None."""
     keys = []
     if project_key and project_key != 'all':
         keys = [project_key]
@@ -19784,7 +11979,16 @@ def _month_shipment_answer(project_key, month, mode='qty', with_models=False, wi
         grp = wr.get('groups') or {}
         y_tot = (grp.get('양산') or {}).get('total') or {}
         d_tot = (grp.get('개발') or {}).get('total') or {}
-        if not any(int(x.get(f) or 0) for x in (y_tot, d_tot) for f in ('plan', 'actual')):
+        # 양산 · 개발 합계가 다 0 이면 건너뛴다
+        _has_num = False
+        for _cell in (y_tot, d_tot):
+            for _f in ('plan', 'actual'):
+                if int(_cell.get(_f) or 0):
+                    _has_num = True
+                    break
+            if _has_num:
+                break
+        if not _has_num:
             continue
         used_labels.append(_display_project_label(k))
         for tgt, src_t in ((g_yang, y_tot), (g_dev, d_tot)):
@@ -19828,11 +12032,8 @@ def _month_shipment_answer(project_key, month, mode='qty', with_models=False, wi
         for v in week_rows.values():
             v['yp'] = v.get('syp', v['yp'])
             v['ya'] = v.get('sya', v['ya'])
-        _model_yang_actual = g_yang['actual']
         g_yang['plan'] = sum(v['yp'] for v in week_rows.values())
         g_yang['actual'] = sum(v['ya'] for v in week_rows.values())
-    else:
-        _model_yang_actual = g_yang['actual']
 
     if len(used_labels) > 2:
         label = f'반도체사업부 전체({len(used_labels)}개 프로젝트)'
@@ -19885,9 +12086,9 @@ def _month_shipment_answer(project_key, month, mode='qty', with_models=False, wi
     return '\n'.join(lines)
 
 
+# admin v2 전체 데이터 기반 챗봇 ← 앱 chat_service.dart ask()
 @app.post("/chat")
 async def chat(payload: dict):
-    """admin v2 전체 데이터 기반 챗봇"""
     message = (payload or {}).get("message", "").strip()
     if not message:
         return {"answer": "", "sources": [], "error": "empty message"}
@@ -19930,8 +12131,9 @@ async def chat(payload: dict):
 
     sess["last_project"] = last_project
     sess["last_week"] = last_week
-
-    # ── 블룸은 모델이 아니라 '대표님 일 보고' 보드를 본다 ──
+    # -----------------------------------------------------------
+    # 블룸은 모델이 아니라 '대표님 일 보고' 보드를 본다
+    # -----------------------------------------------------------
     if last_project and str(last_project).startswith('bloom'):
         try:
             _ans_b = _bloom_chat_answer(last_project, _user_text)
@@ -19947,9 +12149,9 @@ async def chat(payload: dict):
             return {'answer': _ans_b,
                     'sources': [{'key': last_project, 'label': _lbl_b}],
                     'corrected_query': None}
-
-    # ── 이슈·지연 질문은 적힌 그대로 답한다 (LLM 이 중간에 끊는 걸 막는다) ──
-    #
+    # -----------------------------------------------------------
+    # 이슈·지연 질문은 적힌 그대로 답한다 (LLM 이 중간에 끊는 걸 막는다)
+    # -----------------------------------------------------------
     # 이번 메시지에 프로젝트 이름이 없으면 전 프로젝트를 훑는다. 예전에는
     # 세션에 남아 있던 마지막 프로젝트로 좁혀서, 홈에 '8건 · 3곳' 이라고
     # 떠 있는데 챗은 한 곳 1건만 말했다.
@@ -19979,8 +12181,9 @@ async def chat(payload: dict):
                                   'label': _display_project_label(_proj_in_msg)}]
                                 if _one else []),
                     'corrected_query': None}
-
-    # ── 월 범위 기억 + 월 단위 수량/매출 즉답 (후속 질문 '각각 몇 대씩' 대응) ──
+    # -----------------------------------------------------------
+    # 월 범위 기억 + 월 단위 수량/매출 즉답 (후속 질문 '각각 몇 대씩' 대응)
+    # -----------------------------------------------------------
     _today_m = _dt_mod.now().date()
     _scope_month = None
     _mm_cur = _re3.search(r'(\d{1,2})\s*월', _user_text)
@@ -20026,8 +12229,9 @@ async def chat(payload: dict):
     _want_weeks = any(k in _user_text for k in ['주차별', '주별', '주차 별', '주간 추이', '추이', '주차마다'])
     _want_models = any(k in _user_text for k in
                        ['모델', '품번', '파트', 'part', '기종', '어떤 거', '어떤걸', '무슨 모델'])
-
-    # ── 후속 질문: 직전 질문의 기준(주차 or 월)을 그대로 이어간다 ──
+    # -----------------------------------------------------------
+    # 후속 질문: 직전 질문의 기준(주차 or 월)을 그대로 이어간다
+    # -----------------------------------------------------------
     if not _scope_month and not _has_week_in_msg and not _other_scope and (_qty_kw or _rev_kw):
         if sess.get('last_scope') == 'week' and sess.get('last_week'):
             _wk_prev = sess.get('last_week')
@@ -20061,8 +12265,9 @@ async def chat(payload: dict):
             _src_m = ([{'key': last_project, 'label': _display_project_label(last_project)}]
                       if last_project and last_project != 'all' else [])
             return {'answer': _ans_m, 'sources': _src_m, 'corrected_query': None}
-
-    # ── 한국어 주차 별칭 → ISO 주차 매핑 (오늘 = W35, 2026-08-27) ──
+    # -----------------------------------------------------------
+    # 한국어 주차 별칭 → ISO 주차 매핑 (오늘 = W35, 2026-08-27)
+    # -----------------------------------------------------------
     week_aliases = {
         '이번주': 0, '금주': 0, '이번 주': 0, '금번주': 0, '지금주': 0, '이번주차': 0,
         '차주': 1, '다음주': 1, '다음 주': 1, '내주': 1, '익주': 1,
@@ -20086,8 +12291,9 @@ async def chat(payload: dict):
             cur_wk = max(1, cur_wk + off)
             alias_hit = kw
             break
-
-    # ── 명시적 주차 숫자 ("33주차" 또는 "W33") 별칭 매핑 추가 ──
+    # -----------------------------------------------------------
+    # 명시적 주차 숫자 ("33주차" 또는 "W33") 별칭 매핑 추가
+    # -----------------------------------------------------------
     if not alias_hit:
         _m_explicit = _re3.search(r'(?<!\d)(\d{1,2})\s*주차', _user_text)
         if not _m_explicit:
@@ -20160,8 +12366,9 @@ async def chat(payload: dict):
         if f'[week:{last_week}]' not in message:
             message = f'[week:{last_week}] ' + message
         print(f'[chat] implicit alias → {last_week} (project={last_project})')
-        
-        # ── 월 키워드 감지 시 월 합계 컨텍스트를 변수에 저장 (system_prompt 정의 전이라 직접 참조 불가) ──
+        # -----------------------------------------------------------
+        # 월 키워드 감지 시 월 합계 컨텍스트를 변수에 저장 (system_prompt 정의 전이라 직접 참조 불가)
+        # -----------------------------------------------------------
         _month_match = _re3.search(r'(\d{1,2})\s*월', message)
         _today = _dt_mod.now().date()
         _target_month_num = None
@@ -20177,7 +12384,7 @@ async def chat(payload: dict):
             _prev = _today.month - 1 if _today.month > 1 else 12
             _target_month_num = _prev
             _month_label = f"{_today.year}-{_prev:02d} (지난 달)"
-        
+
         # 월 키워드 있으면 월 합계 컨텍스트 계산 후 변수에 저장
         if _target_month_num:
             _month_str = f"{_today.year}-{_target_month_num:02d}"
@@ -20202,7 +12409,7 @@ async def chat(payload: dict):
                 print(f"[chat] 월 컨텍스트 계산 완료: {_month_label} 총매출=${_total_rev:,}")
             except Exception as _e_mon:
                 print(f"[chat] 월 컨텍스트 계산 실패: {_e_mon}")
-        
+
     if alias_hit:
         last_week = f'W{cur_wk:02d}'
         sess['last_week'] = last_week
@@ -20215,8 +12422,9 @@ async def chat(payload: dict):
             last_project = 'all'
             sess['last_project'] = last_project
         print(f'[chat] alias {alias_hit!r} → {last_week} (project={last_project})')
-    
-    # ── 데이터 없는 주차는 LLM 우회하고 즉시 응답 ──
+    # -----------------------------------------------------------
+    # 데이터 없는 주차는 LLM 우회하고 즉시 응답
+    # -----------------------------------------------------------
     valid_weeks = _known_weeks(last_project)
     # 사용자가 실제로 주차를 지정한 경우에만 '데이터 없음'으로 끊는다
     _asked_week = bool(alias_hit) and alias_hit != 'implicit'
@@ -20231,12 +12439,12 @@ async def chat(payload: dict):
     try:
         from difflib import SequenceMatcher
         import unicodedata, re as _re2
-        
+
         def _sim(a, b):
             c = SequenceMatcher(None, a, b).ratio()
             j = SequenceMatcher(None, unicodedata.normalize("NFKD", a), unicodedata.normalize("NFKD", b)).ratio()
             return max(c, j)
-        
+
         voice_aliases = _load_learned_aliases().get("aliases", {})
         words = _re2.findall(r'[가-힣a-zA-Z0-9]+', message)
         for w in words:
@@ -20251,61 +12459,49 @@ async def chat(payload: dict):
     try:
         data = _load_models()
         projects = data.get("projects", {})
-        
+
         # 질문 유형 파악
-        is_issue = any(k in corrected for k in ['이슈', '문제', '이상', '지연', '리스크', 'issue'])
         is_process = any(k in corrected for k in ['프로세스', '공정', '단계', '진행률', '완료', 'process'])
-        is_weekly = any(k in corrected for k in ['주간', '계획', 'weekly', 'plan', '스케줄'])
-        is_status = any(k in corrected for k in ['현황', '상태', 'status', 'note'])
         is_price = any(k in corrected for k in ['판가', '재료비', '가격', 'price', 'cost'])
-        
+
         context_parts = []
         relevant_projects = []
-        
+
         msg_lower = corrected.lower()
-        
+
         for pk, proj in projects.items():
             proj_info = next((p for p in _cl.get_projects(visible_only=True) if p.get("id") == pk), None)
             label = proj_info.get("label", pk) if proj_info else pk
-            
+
             if (label.lower() not in msg_lower and pk.lower() not in msg_lower
                     and last_project not in ('all', pk)):
                 continue
-            
+
             relevant_projects.append({"key": pk, "label": label})
-            
+
             models = proj.get("models", [])
             mass = [m for m in models if m.get("group") == "양산"]
             dev = [m for m in models if m.get("group") == "개발"]
-            
+
             ctx = f"=== {label} ({pk}) ==="
             ctx += f"모델 수: 양산 {len(mass)}종, 개발 {len(dev)}종, 총 {len(models)}종"
-            
+
             progresses = [m.get("progress", 0) for m in models if m.get("progress") is not None]
             if progresses:
                 avg_prog = sum(progresses) / len(progresses)
                 ctx += f"평균 진행률: {avg_prog:.1f}%"
-            
+
             if proj.get("status_note"):
                 ctx += f"현황: {proj['status_note']}"
-            
+
             if proj.get("weekly_plan"):
                 wp = proj["weekly_plan"]
                 if isinstance(wp, dict):
                     ctx += f"주간 계획: {wp.get('title', '')} - {wp.get('content', '')[:100]}"
                 else:
                     ctx += f"주간 계획: {str(wp)[:100]}"
-            
+
             # 그룹 PO / 실적 / 잔량
-            #
-            # 예전에는 weekly_summary 를 그대로 부었다. 그건 옛 주간보고 엑셀에서 들어온
-            # 값이라 모델 목록을 고쳐도 따라오지 않는다. 엔클로저는 PO 4,873 을 들고
-            # 있었는데 모델 합계는 4,863 이었다 (엑셀의 '009 직납 154' vs 등록된 144).
-            # 화면(주차 현황 보드)은 모델 합계를 보여주므로, LLM 도 같은 걸 봐야 한다.
-            #
-            # 주차별 계획/실적은 여기서 다루지 않는다. 바로 아래 '주차별 매출' 블록이
-            # 이번 달 주차를 정확히 넣어 준다. 예전에는 여기서 W32~W35 를 코드에
-            # 박아 둬서, 9월을 물어도 8월 숫자가 같이 들어갔다.
             ws = proj.get("weekly_summary") or {}
             _spec_ctx = _load_board_spec(pk)
             if _spec_ctx:
@@ -20325,20 +12521,14 @@ async def chat(payload: dict):
                                 f" / 잔량 {g.get('remaining', 0)}; ")
             if (ws.get("개발") or {}).get("price_fixed"):
                 ctx += f"개발 단가 고정 ${ws['개발']['price_fixed']}; "
-            
+
             # 주차별 매출 (weekly-revenue v2)
             try:
                 # 같은 프로세스 내 직접 계산 (HTTP 호출 X → 타임아웃 원천 차단)
-                import datetime as _dt
                 month = _month_of_week(last_week) or _latest_data_month(pk)
                 weeks = _get_month_weeks(month) or ["W32", "W33", "W34", "W35"]
-                
-                # 주차별 수량·매출은 보드·매출 카드와 같은 엔진(get_weekly_revenue)에서 받는다.
-                #
-                # 예전에는 여기서 따로 계산했다. 그러다 보니 같은 주차를 두 번 물으면
-                # 답이 갈렸다. 특히 실적이 0일 때 계획 매출을 $3,350 고정 단가로 냈는데,
-                # 판가가 $9,100~$11,803 인 엔클로저에서 계획 106대가 $355,100 으로 나왔다
-                # (실제 $1,001,256). 엔진을 하나로 두면 갈릴 수가 없다.
+
+                # 주차별 수량·매출은 보드·매출 카드와 같은 엔진(get_weekly_revenue)에서 받는다
                 _wr = get_weekly_revenue(pk, month) or {}
                 _grp = _wr.get('groups') or {}
                 _yw = ((_grp.get('양산') or {}).get('weeks') or {})
@@ -20387,10 +12577,10 @@ async def chat(payload: dict):
                     ctx += f"합계: 양산 {m_rev.get('total',{}).get('plan',0)}/{m_rev.get('total',{}).get('actual',0)} ${m_rev.get('total',{}).get('revenue',0):,}, 개발 {d_rev.get('total',{}).get('plan',0)}/{d_rev.get('total',{}).get('actual',0)} ${d_rev.get('total',{}).get('revenue',0):,}, 전체 매출 ${rev.get('combined_revenue',0):,}"
             except Exception as e:
                 print(f"[chat] weekly-revenue 로드 실패 {pk}: {e}")
-            
+
             if proj.get("types"):
                 ctx += f"유형: {', '.join(proj['types'])}"
-            
+
             issue_models = [m for m in models if m.get("issues", "").strip()]
             if issue_models:
                 # 80자에서 자르면 '선적 스페이스 부' 처럼 말이 끊긴 채 넘어가고
@@ -20400,7 +12590,7 @@ async def chat(payload: dict):
                     _it = " / ".join(x.strip().rstrip(" ,") for x in
                                      str(m.get("issues") or "").splitlines() if x.strip())
                     ctx += f"\n  - {m.get('id') or m.get('name')}: {_it[:300]}"
-            
+
             if is_process and dev:
                 ctx += "개발 모델 진행률:"
                 for m in dev[:5]:
@@ -20409,7 +12599,7 @@ async def chat(payload: dict):
                     done = sum(1 for s in proc if s.get("actual") or s.get("status") == "완료")
                     total = len(proc)
                     ctx += f"  - {m.get('name')}: {prog}% ({done}/{total} 단계 완료)"
-            
+
             if is_price:
                 price_models = [m for m in models if m.get("price") or m.get("material_cost")]
                 if price_models:
@@ -20419,9 +12609,9 @@ async def chat(payload: dict):
                         c = m.get("material_cost", 0)
                         margin = ((p - c) / p * 100) if p > 0 else 0
                         ctx += f"  - {m.get('name')}: 판가 ${p:,}, 재료비 ${c:,}, 마진 {margin:.1f}%"
-            
+
             context_parts.append(ctx)
-        
+
         if not context_parts:
             context_parts.append("=== 전체 프로젝트 요약 ===")
             for pk, proj in projects.items():
@@ -20430,9 +12620,9 @@ async def chat(payload: dict):
                 dev = sum(1 for m in models if m.get("group") == "개발")
                 label = next((p.get("label") for p in _cl.get_projects(visible_only=True) if p.get("id") == pk), pk)
                 context_parts.append(f"{label}: 양산 {mass}종, 개발 {dev}종")
-        
+
         context = "\n".join(context_parts)
-        
+
         system_prompt = (
             "너는 반도체 사업부의 프로젝트 관리 어시스턴트다. "
             "주어진 [데이터]만을 근거로 한국어로 답한다.\n"
@@ -20456,14 +12646,16 @@ async def chat(payload: dict):
             "- 수량 단위는 '대'를 쓴다 ('종' 금지). 금액은 $1,234 형식.\n"
             "- '(근거: ...)' 같은 인용 표시는 붙이지 않는다."
         )
-
-        # ── 답변 검증용: 권위 데이터로 만든 폴백 문장과 허용 수치 ──
+        # -----------------------------------------------------------
+        # 답변 검증용: 권위 데이터로 만든 폴백 문장과 허용 수치
+        # -----------------------------------------------------------
         # LLM 이 문장을 만들되, 금액/수량이 권위 데이터와 다르면 이 문장으로 되돌린다.
         _direct_answer = None
         _allowed_amounts = set()
         _allowed_qty = set()
-
-        # ── 주차별 실적/매출 합계 백엔드 직접 계산 (all 프로젝트 질문 대응) ──
+        # -----------------------------------------------------------
+        # 주차별 실적/매출 합계 백엔드 직접 계산 (all 프로젝트 질문 대응)
+        # -----------------------------------------------------------
         _week_stats_ctx = ""
         if last_week and last_week.startswith('W'):
             try:
@@ -20476,16 +12668,19 @@ async def chat(payload: dict):
                         continue
                     _ws = _proj.get('weekly_summary', {})
                     for _g in ('양산', '개발'):
-                        if _g not in _ws: continue
+                        if _g not in _ws:
+                            continue
                         _wv = _ws[_g].get('weeks', {}).get(last_week, {})
                         _pa = int(_wv.get('actual') or 0)
                         _pl = int(_wv.get('plan') or 0)
                         if _g == '양산':
-                            _mass_a += _pa; _mass_p += _pl
+                            _mass_a += _pa
+                            _mass_p += _pl
                             # 매출은 아래 모델별 단가 루프에서 별도 계산
                             pass  # 양산 매출은 모델별 단가로 계산 (하단)
                         else:
-                            _dev_a += _pa; _dev_p += _pl
+                            _dev_a += _pa
+                            _dev_p += _pl
                             _dev_price = float((_ws[_g].get('price_fixed') or 3400))
                             _dev_r += _pa * _dev_price
                 # 양산 매출: weekly_summary actual이 모델별 합계와 다르면 weekly_summary를 절대 기준으로 사용
@@ -20518,8 +12713,9 @@ async def chat(payload: dict):
                 import traceback
                 print(f"[chat] 주차통계 계산 오류: {e}")
                 traceback.print_exc()
-
-        # ── 예측/전망 질문 감지 + 통계 자동 계산 ──
+        # -----------------------------------------------------------
+        # 예측/전망 질문 감지 + 통계 자동 계산
+        # -----------------------------------------------------------
         is_forecast = any(k in corrected for k in ['예상', '전망', '다음주', '다음 주', '앞으로', '추세', '리스크', '완료 가능'])
         forecast_note = ""
         if is_forecast and last_project:
@@ -20554,7 +12750,9 @@ async def chat(payload: dict):
                     forecast_note = " [예측통계: 주차별 실적 데이터 없음. 예측 불가.]"
             except Exception as e:
                 print(f"[chat] 예측 계산 오류: {e}")
-        # ── "몇 주차야" 질문 감지 → 주차 번호만 간결하게 응답 ──
+        # -----------------------------------------------------------
+        # "몇 주차야" 질문 감지 → 주차 번호만 간결하게 응답
+        # -----------------------------------------------------------
         # ── 자주 묻는 질문은 데이터에서 바로 답한다 (LLM 우회) ──
         # 주차·매출·수량 질문은 아래 기존 로직이 더 정확하므로 넘긴다.
         _skip_intent = any(k in _user_text for k in ['매출', '수량', '얼마', '몇 대', '몇대', '대수', '출하량']) \
@@ -20596,8 +12794,9 @@ async def chat(payload: dict):
         if any(k in corrected for k in ['몇 주차', '몇주차', '몇 주', '몇주', '주차야', '주차야?', '주차 알려줘']):
             answer = f"이번 주는 {last_week}입니다."
             return {"answer": answer, "sources": [{"key": last_project, "label": "하바플레이트"}] if last_project == 'hrva_plate' else [], "corrected_query": None}
-        
-        # ── 누적 매출 질문 처리 ('여태까지', '지금까지', '누적', '올해') ──
+        # -----------------------------------------------------------
+        # 누적 매출 질문 처리 ('여태까지', '지금까지', '누적', '올해')
+        # -----------------------------------------------------------
         _is_cumulative = any(k in message for k in ['여태', '지금까지', '누적', '올해', '전체 기간'])
         if _is_cumulative and last_project in {'all', 'hrva_plate'}:
             try:
@@ -20620,8 +12819,9 @@ async def chat(payload: dict):
                 print(f"[chat] 누적 매출 주입: ${_cum_rev:,} ({_proj_label})")
             except Exception as _e_cum:
                 print(f"[chat] 누적 매출 주입 실패: {_e_cum}")
-
-        # ── 전체 프로젝트 합계 계산 (project='all') ──
+        # -----------------------------------------------------------
+        # 전체 프로젝트 합계 계산 (project='all')
+        # -----------------------------------------------------------
         if alias_hit and last_project == 'all' and last_week in {'W32','W33','W34','W35'}:
             try:
                 # 모든 프로젝트의 매출 합계 계산
@@ -20630,31 +12830,31 @@ async def chat(payload: dict):
                 _total_dev_rev = 0
                 _total_mass_plan_rev = 0
                 _total_dev_plan_rev = 0
-                
+
                 for _proj_key in _all_projects:
                     _wr_data = get_weekly_revenue(_proj_key, _month_of_week(last_week) or _latest_data_month(_proj_key))
                     _mg = _wr_data.get('groups',{}).get('양산',{})
                     _dg = _wr_data.get('groups',{}).get('개발',{})
                     _mw = _mg.get('weeks',{}).get(last_week,{})
                     _dw = _dg.get('weeks',{}).get(last_week,{})
-                    
+
                     _m_plan, _m_act, _m_rev = _mw.get('plan',0), _mw.get('actual',0), _mw.get('revenue',0)
                     _d_plan, _d_act, _d_rev = _dw.get('plan',0), _dw.get('actual',0), _dw.get('revenue',0)
-                    
+
                     _total_mass_rev += _m_rev
                     _total_dev_rev += _d_rev
-                    
+
                     # 계획 기준 예상 매출 — 모델별 판가로 이미 계산돼 있다.
                     # 예전엔 실적이 0 이면 $3,350 고정 단가를 곱했다.
                     _m_plan_rev = int(_mw.get('plan_revenue') or 0)
                     _d_plan_rev = int(_dw.get('plan_revenue') or 0)
-                    
+
                     _total_mass_plan_rev += _m_plan_rev
                     _total_dev_plan_rev += _d_plan_rev
-                
+
                 _total_actual_rev = _total_mass_rev + _total_dev_rev
                 _total_plan_rev = _total_mass_plan_rev + _total_dev_plan_rev
-                
+
                 # 답변 기준 결정 (전체 프로젝트)
                 if _total_actual_rev > 0:
                     _all_basis = f"실적 기준 총 매출 ${_total_actual_rev:,} (양산 ${_total_mass_rev:,}, 개발 ${_total_dev_rev:,})"
@@ -20669,8 +12869,9 @@ async def chat(payload: dict):
                 print(f"[chat] 전체 프로젝트 주입: {last_week} 실적 ${_total_actual_rev:,}, 예상 ${_total_plan_rev:,}")
             except Exception as _e_all:
                 print(f"[chat] 전체 프로젝트 주입 실패: {_e_all}")
-        
-        # ── /weekly-revenue 직접 계산 결과를 last_week 컨텍스트로 강제 주입 ──
+        # -----------------------------------------------------------
+        # /weekly-revenue 직접 계산 결과를 last_week 컨텍스트로 강제 주입
+        # -----------------------------------------------------------
         if alias_hit and last_project in ('hrva_plate', 'all') and last_week in {'W32','W33','W34','W35'}:
             try:
                 _wr_month = _month_of_week(last_week) or _latest_data_month('hrva_plate')
@@ -20679,15 +12880,7 @@ async def chat(payload: dict):
                 _dg = _wr_data.get('groups',{}).get('개발',{})
                 _mw = _mg.get('weeks',{}).get(last_week,{})
                 _dw = _dg.get('weeks',{}).get(last_week,{})
-                # 수량·매출 모두 같은 엔진에서 받는다. 앱이 보여주는 값과 같아야 한다.
-                #
-                # 예전에는 여기서 세 번째 계산을 했다. weekly_summary 의 양산 실적을
-                # 모델별 계획 비율로 나눠 각 판가를 곱하고, 계획 매출은 $3,350,
-                # 계획이 없으면 $3,245 같은 고정 단가를 썼다. 그래서 같은 주차라도
-                # 챗봇과 화면의 숫자가 갈릴 수 있었다.
-                #
-                # 하바플레이트 개발은 모델별 입력이 비어 있어 get_weekly_revenue 가
-                # 알아서 그룹 총계 x $3,400 으로 잡아 준다. 여기서 따로 볼 필요가 없다.
+                # 수량·매출 모두 같은 엔진에서 받는다
                 _m_plan = int(_mw.get('plan') or 0)
                 _m_act = int(_mw.get('actual') or 0)
                 _m_rev = int(_mw.get('revenue') or 0)
@@ -20698,7 +12891,7 @@ async def chat(payload: dict):
                 _d_plan_rev = int(_dw.get('plan_revenue') or 0)
                 _total_actual_rev = _m_rev + _d_rev
                 _total_plan_rev = _m_plan_rev + _d_plan_rev
-                
+
                 # 시스템 프롬프트에 권위 데이터 주입
                 # 답변 기준 결정: 실적 있으면 실적 기준, 실적 0+계획 있으면 계획 기준, 둘 다 0이면 $0
                 if _m_act > 0 or _d_act > 0:
@@ -20719,7 +12912,9 @@ async def chat(payload: dict):
                 message = f"{last_week} 주차 하바플레이트 매출을 알려주세요. system_prompt의 권위 데이터를 그대로 인용해주세요."
                 print(f"[chat] message 재작성 완료: {message}")
                 print(f"[chat] 답변기준: {_answer_basis}")
-                # ── LLM 우회: 권위 데이터로 답변 직접 반환 (LLM이 수치를 변조하는 문제 원천 차단) ──
+                # -----------------------------------------------------------
+                # LLM 우회: 권위 데이터로 답변 직접 반환 (LLM이 수치를 변조하는 문제 원천 차단)
+                # -----------------------------------------------------------
                 if _m_act > 0 or _d_act > 0:
                     _qsrc = _orig_user_msg if '_orig_user_msg' in dir() else message
                     _qty_only = any(k in _qsrc for k in ['수량', '몇 대', '몇대', '대수', '나갔', '나왔', '출하']) and '매출' not in _qsrc
@@ -20762,7 +12957,7 @@ async def chat(payload: dict):
         # 월 컨텍스트 추가 (정의 전에 계산된 변수)
         if _month_context:
             system_prompt += _month_context
-            print(f"[chat] 월 컨텍스트 주입 완료")
+            print("[chat] 월 컨텍스트 주입 완료")
         # 주차 태그 강제 규칙
         if alias_hit and last_week:
             system_prompt += (
@@ -20773,9 +12968,9 @@ async def chat(payload: dict):
                 f"실적 미발생임을 먼저 밝힌 뒤 계획 기준 값을 말한다. 계획도 0일 때만 $0이라고 답한다.\n"
                 f"- '몇 주차야' 류 질문에는 주차 번호만 답하고 실적·매출은 붙이지 않는다."
             )
-
-        
-        # ── 벡터 검색: 규칙으로 못 잡는 비고·이슈·자재 메모를 배경으로 붙인다 ──
+        # -----------------------------------------------------------
+        # 벡터 검색: 규칙으로 못 잡는 비고·이슈·자재 메모를 배경으로 붙인다
+        # -----------------------------------------------------------
         try:
             _rag_maybe_refresh()
             _rag_txt = _rag_context(_user_text)
@@ -20790,7 +12985,7 @@ async def chat(payload: dict):
             print(f"[chat] RAG 컨텍스트 {len(_rag_txt)}자 주입")
 
         user_prompt = f"[데이터]\n{context}\n\n[질문]\n{corrected}"
-        
+
         if client:
             resp = client.chat.completions.create(
                 model=CHAT_MODEL,
@@ -20805,7 +13000,9 @@ async def chat(payload: dict):
             # 근거 표시 강제 제거
             import re as _re_clean1
             answer = _re_clean1.sub(r'\(근거:\s*[^)]+\)', '', answer).strip()
-            # ── 수치 검증: 권위 데이터에 없는 금액/수량을 말하면 폴백 문장으로 교체 ──
+            # -----------------------------------------------------------
+            # 수치 검증: 권위 데이터에 없는 금액/수량을 말하면 폴백 문장으로 교체
+            # -----------------------------------------------------------
             if _direct_answer:
                 _bad = _answer_number_mismatch(answer, _allowed_amounts, _allowed_qty)
                 if _bad:
@@ -20823,14 +13020,14 @@ async def chat(payload: dict):
             "sources": relevant_projects,
             "corrected_query": corrected if corrected != message else None
         }
-        
+
     except Exception as e:
         return {"answer": "", "sources": [], "error": f"chat_failed: {e}"}
 
 
+# 벡터 인덱스 상태 (몇 조각이 언제 만들어졌는지).
 @app.get("/admin/rag/status")
 def rag_status(_admin: int = Depends(get_admin_session)):
-    """벡터 인덱스 상태 (몇 조각이 언제 만들어졌는지)."""
     import datetime as _dtr
     out = {"ready": False, "count": 0, "built_at": "", "kinds": {}}
     try:
@@ -20849,43 +13046,27 @@ def rag_status(_admin: int = Depends(get_admin_session)):
     return out
 
 
+# 지금 데이터로 벡터 인덱스를 다시 만든다
 @app.post("/admin/rag/rebuild")
 def rag_rebuild(_admin: int = Depends(get_admin_session)):
-    """지금 데이터로 벡터 인덱스를 다시 만든다."""
     try:
         return _rag_rebuild()
     except Exception as e:
         return {"ok": False, "reason": f"failed: {e}"}
 
 
-# =========================================================
-# KPI 카드: 히스토리 파일 기반 (프로젝트별 월/주차 누적)
-# =========================================================
-from datetime import datetime, date, timedelta
-import calendar as _calendar
+KPI_HISTORY_FILE = BASE_DIR / "kpi_history.json"
+PROJECT_PROFILES_FILE = BASE_DIR / "project_profiles.json"
 
-KPI_HISTORY_FILE = BASE_DIR / "kpi_history.json" if "BASE_DIR" in globals() else Path("kpi_history.json")
-PROJECT_PROFILES_FILE = BASE_DIR / "project_profiles.json" if "BASE_DIR" in globals() else Path("project_profiles.json")
-
-
+# ============================================================
+#  PPT 표에서 출하 실적 읽기
+# ============================================================
 def _extract_tables_from_pptx(file_path) -> list:
-    """PPT 파일에서 모든 표를 추출.
-
-    반환 형식: [
-      {
-        "slide_index": int,   # 1부터 시작
-        "slide_title": str,   # 첫 번째 텍스트 도형(있으면)
-        "nearby_text": str,   # 슬라이드의 모든 텍스트를 이어붙인 것
-        "rows": [[cell, cell, ...], ...]
-      },
-      ...
-    ]
-    """
     from pptx import Presentation as _Presentation
     tables = []
     try:
         prs = _Presentation(str(file_path))
-    except Exception as e:
+    except Exception:
         return []
 
     for s_idx, slide in enumerate(prs.slides, start=1):
@@ -20935,8 +13116,8 @@ def _extract_tables_from_pptx(file_path) -> list:
     return tables
 
 
+# 표가 '출하 계획 및 실적' 관련인지 판정.
 def _is_shipping_plan_table(table_dict: dict) -> bool:
-    """표가 '출하 계획 및 실적' 관련인지 판정."""
     if not isinstance(table_dict, dict):
         return False
     keywords = [
@@ -20963,20 +13144,14 @@ def _is_shipping_plan_table(table_dict: dict) -> bool:
     return False
 
 
+# PPT에서 출하 계획 관련 표만 추출.
 def _find_shipping_plan_tables(file_path) -> list:
-    """PPT에서 출하 계획 관련 표만 추출."""
     all_tables = _extract_tables_from_pptx(file_path)
     return [t for t in all_tables if _is_shipping_plan_table(t)]
 
 
+# 여러 표 중 진짜 출하 계획 표를 하나만 선택.
 def _pick_primary_shipping_table(tables: list, project_key: str) -> dict | None:
-    """여러 표 중 진짜 출하 계획 표를 하나만 선택.
-
-    판별 기준:
-    1. R1 첫 셀에 '구분' 포함
-    2. R1에 '누적 합계' 또는 '누적합계' 포함
-    3. 데이터 행 첫 컬럼에 프로파일 등록 모델명 존재
-    """
     if not tables:
         return None
     profile = _get_project_profile(project_key) or {}
@@ -21022,26 +13197,8 @@ def _pick_primary_shipping_table(tables: list, project_key: str) -> dict | None:
     return candidates[0]
 
 
+# 표 → KPI 스키마로 변환.
 def _shipping_table_to_kpi_data(table: dict, project_key: str, file_name: str = "") -> dict:
-    """표 → KPI 스키마로 변환.
-
-    반환:
-    {
-      "project_key": "major_module",
-      "report_month": "2026-07",
-      "report_year": 2026,
-      "models": [
-        {
-          "model_id": "major_module::EFEM",
-          "display_name": "EFEM",
-          "months": {"2026-04": {"plan": 16, "actual": 9}, ...},
-          "weeks": {"2026-W27": {"plan": 2, "actual": 2}, ...},
-          "cumulative": {"po": 74, "shipped": 37}
-        }
-      ],
-      "warnings": [...]
-    }
-    """
     warnings = []
     profile = _get_project_profile(project_key) or {}
     profile_models = {
@@ -21173,8 +13330,9 @@ def _shipping_table_to_kpi_data(table: dict, project_key: str, file_name: str = 
                 cumulative["remaining"] = v
             elif kind == "yearly_actual":
                 cumulative["yearly_actual"] = v
-
-        # === 주차 실적/계획을 월별로 합산해서 월 데이터 보정 ===
+        # -----------------------------------------------------------
+        # 주차 실적/계획을 월별로 합산해서 월 데이터 보정
+        # -----------------------------------------------------------
         # 규칙: 표 헤더에서 이미 "이 W##이 어느 월 컬럼 아래 있는지" 알고 있으므로,
         #       ISO 주차 계산 없이 헤더의 month 정보를 그대로 사용
         # 필요한 매핑: week_key(2026-W27) -> month_str("7월") -> month_key("2026-07")
@@ -21225,9 +13383,10 @@ def _shipping_table_to_kpi_data(table: dict, project_key: str, file_name: str = 
         "warnings": warnings,
     }
 
-
+# ============================================================
+#  프로젝트 프로필 · PPT → KPI 반영
+# ============================================================
 def _load_project_profiles() -> dict:
-    """프로젝트 프로파일 전체 로드."""
     try:
         import json as _json
         with open(PROJECT_PROFILES_FILE, "r", encoding="utf-8") as f:
@@ -21243,28 +13402,15 @@ def _load_project_profiles() -> dict:
         return {"profiles": {}}
 
 
+# 특정 프로젝트 프로파일 반환. 없으면 None.
 def _get_project_profile(project_key: str) -> dict | None:
-    """특정 프로젝트 프로파일 반환. 없으면 None."""
     if not project_key:
         return None
     data = _load_project_profiles()
     return (data.get("profiles") or {}).get(project_key)
 
 
-def _save_project_profiles(data: dict) -> None:
-    """프로젝트 프로파일 저장. updated_at 자동 갱신."""
-    import json as _json
-    from datetime import datetime as _dt
-    if not isinstance(data, dict):
-        raise ValueError("profiles data must be dict")
-    now = _dt.now().isoformat()
-    for pk, prof in (data.get("profiles") or {}).items():
-        if isinstance(prof, dict):
-            prof["updated_at"] = now
-    with open(PROJECT_PROFILES_FILE, "w", encoding="utf-8") as f:
-        _json.dump(data, f, ensure_ascii=False, indent=2)
-
-
+# PPT 업로드 후 자동 KPI 추출 훅.
 def _auto_extract_kpi_from_pptx(
     saved_file_path,
     file_name: str,
@@ -21272,11 +13418,6 @@ def _auto_extract_kpi_from_pptx(
     project_id_hint=None,
     products=None,
 ) -> dict:
-    """PPT 업로드 후 자동 KPI 추출 훅.
-
-    실패해도 예외를 던지지 않음 (업로드는 성공 유지).
-    프로파일이 등록된 프로젝트만 파싱 시도.
-    """
     result = {
         "attempted": False,
         "project_key": None,
@@ -21287,7 +13428,9 @@ def _auto_extract_kpi_from_pptx(
         "cumulative_updated": False,
     }
     try:
-        # 1. project_key 결정
+        # -----------------------------------------------------------
+        # project_key 결정
+        # -----------------------------------------------------------
         project_key = None
 
         # 1-a. 명시적 힌트 우선
@@ -21335,8 +13478,9 @@ def _auto_extract_kpi_from_pptx(
             return result
 
         result["project_key"] = project_key
-
-        # 2. 프로파일 조회
+        # -----------------------------------------------------------
+        # 프로파일 조회
+        # -----------------------------------------------------------
         profile = _get_project_profile(project_key)
         if not profile:
             result["reason"] = f"프로파일 없음: {project_key}"
@@ -21344,29 +13488,33 @@ def _auto_extract_kpi_from_pptx(
             return result
 
         result["attempted"] = True
-
-        # 3. 표 감지
+        # -----------------------------------------------------------
+        # 표 감지
+        # -----------------------------------------------------------
         plan_tables = _find_shipping_plan_tables(saved_file_path)
         if not plan_tables:
             result["reason"] = "출하 계획 표를 찾지 못함"
             print(f"[KPI 자동 추출] 스킵: {result['reason']}")
             return result
-
-        # 4. 진짜 출하 표 선택
+        # -----------------------------------------------------------
+        # 진짜 출하 표 선택
+        # -----------------------------------------------------------
         primary = _pick_primary_shipping_table(plan_tables, project_key)
         if not primary:
             result["reason"] = "출하 표 후보 없음 (프로파일 모델 미매칭)"
             print(f"[KPI 자동 추출] 스킵: {result['reason']}")
             return result
-
-        # 5. KPI 스키마 변환
+        # -----------------------------------------------------------
+        # KPI 스키마 변환
+        # -----------------------------------------------------------
         kpi_data = _shipping_table_to_kpi_data(primary, project_key, file_name or "")
         if not kpi_data.get("models"):
             result["reason"] = "모델 데이터가 비어있음"
             print(f"[KPI 자동 추출] 스킵: {result['reason']}")
             return result
-
-        # 6. 저장
+        # -----------------------------------------------------------
+        # 저장
+        # -----------------------------------------------------------
         source_label = f"pptx:{doc_id}" if doc_id else f"pptx:{file_name}"
         apply_result = _apply_kpi_from_pptx(
             project_key,
@@ -21395,33 +13543,24 @@ def _auto_extract_kpi_from_pptx(
         return result
 
 
+# PPT에서 추출한 KPI 데이터를 kpi_history.json에 병합.
 def _apply_kpi_from_pptx(
     project_key: str,
     kpi_data: dict,
     source_info: dict = None,
     dry_run: bool = True,
 ) -> dict:
-    """PPT에서 추출한 KPI 데이터를 kpi_history.json에 병합.
-
-    - 기존 필드(efem, vtm, type, source, updated_at) 유지
-    - 신규 필드(models, cumulative) 추가
-    - dry_run=True: 실제 저장 안 하고 변경 예정 결과만 반환
-    - dry_run=False: 실제 저장
-    """
     from datetime import datetime as _dt
     source_info = source_info or {}
     now = _dt.now().isoformat()
 
+    # 수량 값 결정: actual 우선, 없으면 plan
     def _pick_value(model_dict, key_type):
-        """수량 값 결정: actual 우선, 없으면 plan"""
         v = (model_dict or {}).get(key_type)
         return v
 
+    # 월/주차 데이터에서 efem, vtm, type 결정.
     def _pick_efem_vtm_and_type(period_dict):
-        """월/주차 데이터에서 efem, vtm, type 결정.
-
-        period_dict: {"major_module::EFEM": {"plan": x, "actual": y}, ...}
-        """
         efem_val = None
         vtm_val = None
         chosen_type = None
@@ -21557,9 +13696,10 @@ def _apply_kpi_from_pptx(
         "changes": changes,
     }
 
-
+# ============================================================
+#  KPI 기록 · 달/주 꼬리표
+# ============================================================
 def _load_kpi_history() -> dict:
-    """kpi_history.json 로드. 없으면 빈 구조."""
     try:
         with open(KPI_HISTORY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -21567,24 +13707,26 @@ def _load_kpi_history() -> dict:
         return {"version": 1, "projects": {}}
 
 
+# KPI(출하 실적 · 손익) 기록을 저장한다
 def _save_kpi_history(data: dict) -> None:
     data["updated_at"] = datetime.utcnow().isoformat() + "Z"
     with open(KPI_HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+# date -> 'YYYY-Wnn'.
 def _iso_week_of(dt: date) -> str:
-    """date -> 'YYYY-Wnn'."""
     y, w, _ = dt.isocalendar()
     return f"{y}-W{w:02d}"
 
 
+# 날짜 → 'YYYY-MM'.
 def _month_key(dt: date) -> str:
     return f"{dt.year:04d}-{dt.month:02d}"
 
 
+# '2026-07' -> '7월'.
 def _month_label(month_key: str) -> str:
-    """'2026-07' -> '7월'."""
     try:
         _, m = month_key.split("-")
         return f"{int(m)}월"
@@ -21592,20 +13734,17 @@ def _month_label(month_key: str) -> str:
         return month_key
 
 
+# '2026-W28' -> 'W28'.
 def _week_label(week_key: str) -> str:
-    """'2026-W28' -> 'W28'."""
     try:
         return week_key.split("-")[1]
     except Exception:
         return week_key
 
 
+# items: dict[key -> row], key는 정렬 가능한 문자열 key_fn_today: 오늘의 기준 key past 개 이전 ~ future 개 이후까지
+# 반환.
 def _slice_window(items: dict, key_fn_today, past: int, future: int) -> list:
-    """
-    items: dict[key -> row], key는 정렬 가능한 문자열
-    key_fn_today: 오늘의 기준 key
-    past 개 이전 ~ future 개 이후까지 반환. 실제 있는 것만.
-    """
     today_key = key_fn_today()
     all_keys = sorted(items.keys())
     if not all_keys:
@@ -21623,14 +13762,10 @@ def _slice_window(items: dict, key_fn_today, past: int, future: int) -> list:
     hi = min(len(all_keys), idx + future + 1)
     return [(k, items[k]) for k in all_keys[lo:hi]]
 
-
+# ============================================================
+#  메이저모듈 KPI 카드 · 이슈 줄
+# ============================================================
 def _build_major_module_kpi_card() -> dict:
-    """
-    kpi_history.json 기반으로 메이저모듈 KPI 카드 생성.
-    - 판가 기준 매출 계산
-    - 월: 오늘 기준 직전 1개월(실적) + 향후 2개월 = 최대 3개
-    - 주: 오늘 기준 직전 0주 + 향후 4주 = 최대 5개
-    """
     hist = _load_kpi_history()
     proj = (hist.get("projects") or {}).get("major_module") or {}
     ue = proj.get("unit_economics") or {
@@ -21655,7 +13790,8 @@ def _build_major_module_kpi_card() -> dict:
 
     months = []
     for mk, row in m_slice:
-        e = row.get("efem", 0); v = row.get("vtm", 0)
+        e = row.get("efem", 0)
+        v = row.get("vtm", 0)
         months.append({
             "month": _month_label(mk),
             "type": row.get("type", "plan"),
@@ -21664,7 +13800,8 @@ def _build_major_module_kpi_card() -> dict:
 
     weeks = []
     for wk, row in w_slice:
-        e = row.get("efem", 0); v = row.get("vtm", 0)
+        e = row.get("efem", 0)
+        v = row.get("vtm", 0)
         weeks.append({
             "week": _week_label(wk),
             "type": row.get("type", "plan"),
@@ -21701,23 +13838,20 @@ def _build_major_module_kpi_card() -> dict:
     }
 
 
+# 이슈 라인 로드. 1) kpi_history.json 에 수동 등록된 값이 있으면 그걸 우선.
 def _build_major_module_issue_lines() -> list:
-    """이슈 라인 로드.
-    1) kpi_history.json 에 수동 등록된 값이 있으면 그걸 우선.
-    2) 없으면 notes.json 의 메이저모듈 sections 에서 자동 생성:
-       - type='sub' 이거나 due_date 있는 아이템을 추출
-       - due_date 있으면 severity/show_dday 자동 계산
-    """
     from datetime import date as _date
-
-    # 1) 수동 등록 우선
+    # -----------------------------------------------------------
+    # 수동 등록 우선
+    # -----------------------------------------------------------
     hist = _load_kpi_history()
     proj = (hist.get("projects") or {}).get("major_module") or {}
     manual = proj.get("issue_lines") or []
     if manual:
         return manual
-
-    # 2) notes.json에서 자동 생성
+    # -----------------------------------------------------------
+    # notes.json에서 자동 생성
+    # -----------------------------------------------------------
     try:
         notes_data = _load_notes()
         semi = (notes_data.get("notes") or {}).get("semiconductor") or {}
@@ -21775,9 +13909,6 @@ def _build_major_module_issue_lines() -> list:
         return []
 
 
-# =========================================================
-# KPI 관리 API (Phase 2): 월/주차/이슈 라인 upsert
-# =========================================================
 from pydantic import BaseModel
 
 
@@ -21800,7 +13931,9 @@ class KpiWeekPayload(BaseModel):
 class KpiIssueLinesPayload(BaseModel):
     issue_lines: list
 
-
+# ============================================================
+#  KPI 관리 주소 (월 · 주 · 엑셀)
+# ============================================================
 def _ensure_project(hist: dict, project_key: str) -> dict:
     hist.setdefault("projects", {})
     proj = hist["projects"].setdefault(project_key, {
@@ -21815,13 +13948,8 @@ def _ensure_project(hist: dict, project_key: str) -> dict:
     return proj
 
 
+# 같은 key가 이미 있을 때 덮어쓸지 판단.
 def _should_overwrite(existing: dict, incoming_type: str) -> bool:
-    """
-    같은 key가 이미 있을 때 덮어쓸지 판단.
-    - existing이 없으면 True
-    - actual > plan (actual이 들어오면 무조건 덮음)
-    - 같은 type이면 최신 upload가 덮음 (True)
-    """
     if not existing:
         return True
     et = existing.get("type", "plan")
@@ -21832,6 +13960,7 @@ def _should_overwrite(existing: dict, incoming_type: str) -> bool:
     return True  # 같은 type이면 최신이 덮음
 
 
+# 프로젝트 KPI(손익) 자료 ← admin v2 closeModal()
 @app.get("/admin/kpi/{project_key}")
 def admin_kpi_get(project_key: str, _exp: int = Depends(get_admin_session)):
     hist = _load_kpi_history()
@@ -21841,6 +13970,7 @@ def admin_kpi_get(project_key: str, _exp: int = Depends(get_admin_session)):
     return {"project_key": project_key, **proj}
 
 
+# KPI 월 자료 고치기 (잠김) ← admin v2 closeModal()
 @app.post("/admin/kpi/{project_key}/months")
 def admin_kpi_upsert_month(
     project_key: str,
@@ -21863,6 +13993,7 @@ def admin_kpi_upsert_month(
     return {"status": "ok", "month": payload.month, "row": proj["months"][payload.month]}
 
 
+# KPI 주 자료 고치기 (잠김) ← admin v2 closeModal()
 @app.post("/admin/kpi/{project_key}/weeks")
 def admin_kpi_upsert_week(
     project_key: str,
@@ -21885,24 +14016,13 @@ def admin_kpi_upsert_week(
     return {"status": "ok", "week": payload.week, "row": proj["weeks"][payload.week]}
 
 
+# 출하실적 엑셀 업로드 → 자동 파싱 → KPI 히스토리 반영.
 @app.post("/admin/kpi/{project_key}/upload_excel")
 async def admin_kpi_upload_excel(
     project_key: str,
     file: UploadFile = File(...),
     _admin: int = Depends(get_admin_session),
 ):
-    """
-    출하실적 엑셀 업로드 → 자동 파싱 → KPI 히스토리 반영.
-
-    엑셀 스키마 (major_module 기준):
-    - R1: 빈 행
-    - R2: 카테고리 헤더 (PO/실적/잔량/6월/7월/W27~W31 등)
-    - R3: 주차 헤더 (W27, W28, ...)
-    - R4: 계획/실적 서브헤더
-    - R5: EFEM 데이터
-    - R6: VTM 데이터
-    - R7: 합계 (파생, 저장 안 함)
-    """
     import openpyxl
     from io import BytesIO
     from datetime import datetime as _dt
@@ -21912,7 +14032,7 @@ async def admin_kpi_upload_excel(
         raise HTTPException(status_code=400, detail="빈 파일")
 
     try:
-        wb = openpyxl.load_workbook(BytesIO(raw), data_only=True)
+        wb = openpyxl.load_workbook(BytesIO(raw), data_only=True, keep_links=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"엑셀 파싱 실패: {e}")
 
@@ -22091,6 +14211,7 @@ async def admin_kpi_upload_excel(
         "detail": result,
     }
 
+# KPI 이슈 줄 바꾸기 (잠김).
 @app.post("/admin/kpi/{project_key}/issue_lines")
 def admin_kpi_replace_issue_lines(
     project_key: str,
@@ -22103,20 +14224,16 @@ def admin_kpi_replace_issue_lines(
     _save_kpi_history(hist)
     return {"status": "ok", "count": len(payload.issue_lines)}
 
-# ============================================================
-# 매출 자동 계산 헬퍼
-# ============================================================
-import re
-from datetime import date, datetime
-from typing import Optional
 
-
+# ============================================================
+#  매출 자동 계산 헬퍼
+# ============================================================
 def _iso_week_number(d: date) -> int:
     return d.isocalendar()[1]
 
 
+# W-번호 → 그 주의 목요일이 속한 월 (ISO 규칙)
 def _week_to_month(week_num: int, year: int) -> Optional[int]:
-    """W-번호 → 그 주의 목요일이 속한 월 (ISO 규칙)"""
     try:
         # ISO week's Thursday belongs to that year's month
         thursday = datetime.strptime(f"{year}-W{week_num:02d}-4", "%G-W%V-%u").date()
@@ -22125,26 +14242,19 @@ def _week_to_month(week_num: int, year: int) -> Optional[int]:
         return None
 
 
+# 각 주차별로:
 def _compute_sales_summary(parsed: dict, today: Optional[date] = None) -> str:
-    """
-    각 주차별로:
-      - 과거 → 실적
-      - 현재 → 실적 우선, 없으면 계획
-      - 미래 → 계획
-    매출 = 수량 × 판가
-    반환: "7월 74.0만불 · 8월 407.0만불 · W30 89.0만불"
-    """
     if today is None:
         today = date.today()
     cur_week = _iso_week_number(today)
     year = today.year
-    
+
     prices = parsed.get("prices", {})
     weeks = parsed.get("weeks", {})
-    
+
     if not prices or not weeks:
         return ""
-    
+
     # 주차별 매출 계산
     week_sales = {}  # {W27: 189.0}
     for wk, models in weeks.items():
@@ -22166,7 +14276,7 @@ def _compute_sales_summary(parsed: dict, today: Optional[date] = None) -> str:
                 use = qty.get("actual", 0) or qty.get("plan", 0)
             total += use * price
         week_sales[wk_num] = total
-    
+
     # 월별 집계
     month_sales = {}  # {7: 74.0, 8: 407.0}
     for wk_num, sales in week_sales.items():
@@ -22174,7 +14284,7 @@ def _compute_sales_summary(parsed: dict, today: Optional[date] = None) -> str:
         if mo is None:
             continue
         month_sales[mo] = month_sales.get(mo, 0.0) + sales
-    
+
     # 문자열 조립
     parts = []
     for mo in sorted(month_sales.keys()):
@@ -22182,19 +14292,17 @@ def _compute_sales_summary(parsed: dict, today: Optional[date] = None) -> str:
     # 현재 주차만 별도 강조 (있으면)
     if cur_week in week_sales:
         parts.append(f"W{cur_week} {week_sales[cur_week]:.1f}만불")
-    
+
     return " · ".join(parts)
 
-
 # ============================================================
-# [SALES-XLSX] 출하계획 엑셀 자동 파싱 + 판가 기반 매출 계산
+#  출하계획 엑셀 → 판가 × 수량 매출
 # ============================================================
 def parse_sales_excel(file_path):
-    """출하계획 xlsx를 읽어서 models / weeks(plan/actual) 구조로 반환."""
     from openpyxl import load_workbook
     import re as _re
 
-    wb = load_workbook(str(file_path), data_only=True)
+    wb = load_workbook(str(file_path), data_only=True, keep_links=False)
     ws = wb.active
 
     _WEEK_RE = _re.compile(r'W\s*(\d{1,2})', _re.I)
@@ -22291,8 +14399,8 @@ def parse_sales_excel(file_path):
     }
 
 
+# parsed(xlsx) + prices(만불) → 3박스 요약 문자열 + 구조화 데이터.
 def compute_sales_from_parsed(parsed, prices, today=None):
-    """parsed(xlsx) + prices(만불) → 3박스 요약 문자열 + 구조화 데이터."""
     from datetime import date as _date, datetime as _dt
 
     today = today or _date.today()
@@ -22359,8 +14467,8 @@ def compute_sales_from_parsed(parsed, prices, today=None):
     }
 
 
+# 섹션 items에서 첫 번째 .xlsx 파일의 서버 URL 추출.
 def _find_xlsx_in_section_items(items):
-    """섹션 items에서 첫 번째 .xlsx 파일의 서버 URL 추출."""
     if not items:
         return None
     for it in items:
@@ -22376,8 +14484,8 @@ def _find_xlsx_in_section_items(items):
     return None
 
 
+# /admin/manual-files/{doc_id}/{filename} → 실제 파일 경로.
 def _xlsx_url_to_local_path(url_str):
-    """/admin/manual-files/{doc_id}/{filename} → 실제 파일 경로."""
     if not url_str:
         return None
     s = str(url_str)
@@ -22391,14 +14499,10 @@ def _xlsx_url_to_local_path(url_str):
     return None
 
 
-def _is_sales_section_title(title):
-    t = re.sub(r'\s+', '', (title or ''))
-    if not t:
-        return False
-    return ('주차별' in t and ('계획' in t or '출하' in t)) or t == '주차별계획'
-
+# ============================================================
+#  매출 계산 주소
+# ============================================================
 def compute_sales_from_input(sales_input: str, today: Optional[date] = None) -> dict:
-    """외부에서 호출하는 진입점"""
     if not sales_input or not sales_input.strip():
         return {"sales_summary": "", "sales_computed_at": ""}
     parsed = _parse_sales_input(sales_input)
@@ -22413,26 +14517,20 @@ def compute_sales_from_input(sales_input: str, today: Optional[date] = None) -> 
     }
 
 
-# ============================================================
-# 매출 자동 계산 API
-# ============================================================
+# body: { division_id, card_title, section_title, sales_input } → notes.json 의 해당 section 에
+# sales_input/sales_summary/sales_computed_at 저장 → 계산 결과 반환
 @app.post("/admin/notes/section/sales_input")
 def admin_set_sales_input(payload: dict, _admin: int = Depends(get_admin_session)):
-    """
-    body: { division_id, card_title, section_title, sales_input }
-    → notes.json 의 해당 section 에 sales_input/sales_summary/sales_computed_at 저장
-    → 계산 결과 반환
-    """
     division_id = (payload.get("division_id") or "").strip()
     card_title = (payload.get("card_title") or "").strip()
     section_title = (payload.get("section_title") or "").strip()
     sales_input = payload.get("sales_input") or ""
-    
+
     if not division_id or not card_title or not section_title:
         raise HTTPException(status_code=400, detail="division_id/card_title/section_title 필요")
-    
+
     result = compute_sales_from_input(sales_input)
-    
+
     # notes.json 갱신
     data = _load_notes()
     notes_map = data.get("notes", {}) or {}
@@ -22445,7 +14543,7 @@ def admin_set_sales_input(payload: dict, _admin: int = Depends(get_admin_session
             break
     if not target_card:
         raise HTTPException(status_code=404, detail=f"카드 없음: {card_title}")
-    
+
     sections = target_card.get("sections", []) or []
     target_sec = None
     for s in sections:
@@ -22454,17 +14552,17 @@ def admin_set_sales_input(payload: dict, _admin: int = Depends(get_admin_session
             break
     if not target_sec:
         raise HTTPException(status_code=404, detail=f"섹션 없음: {section_title}")
-    
+
     target_sec["sales_input"] = sales_input
     target_sec["sales_summary"] = result["sales_summary"]
     target_sec["sales_computed_at"] = result["sales_computed_at"]
-    
+
     # 저장
     NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
     NOTES_FILE.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    
+
     return {
         "ok": True,
         "sales_summary": result["sales_summary"],
@@ -22473,26 +14571,19 @@ def admin_set_sales_input(payload: dict, _admin: int = Depends(get_admin_session
     }
 
 
+# 구조화된 sales_data → summary 계산.
 def compute_sales_from_data(sales_data: dict, today: Optional[date] = None) -> dict:
-    """구조화된 sales_data → summary 계산.
-    sales_data = {
-      "prices": {"EFEM": 65, ...},
-      "weeks": [{"week": 27, "models": {"EFEM": {"plan": 2, "actual": 2}}}, ...]
-    }
-    """
     if not isinstance(sales_data, dict):
         return {"sales_summary": "", "sales_computed_at": ""}
     prices = sales_data.get("prices") or {}
     weeks_list = sales_data.get("weeks") or []
     if not prices or not weeks_list:
         return {"sales_summary": "", "sales_computed_at": ""}
-    
+
     # sales_helpers.py 의 _compute_sales_summary 와 동일 규칙
     if today is None:
         today = date.today()
-    cur_week = today.isocalendar()[1]
-    year = today.year
-    
+
     # weeks 리스트를 dict로 변환하여 _compute_sales_summary 재활용
     parsed = {"prices": {k: float(v) for k, v in prices.items()}, "weeks": {}}
     for w in weeks_list:
@@ -22504,7 +14595,7 @@ def compute_sales_from_data(sales_data: dict, today: Optional[date] = None) -> d
             m: {"plan": int(v.get("plan", 0) or 0), "actual": int(v.get("actual", 0) or 0)}
             for m, v in models.items() if isinstance(v, dict)
         }
-    
+
     summary = _compute_sales_summary(parsed, today=today)
     return {
         "sales_summary": summary,
@@ -22512,9 +14603,9 @@ def compute_sales_from_data(sales_data: dict, today: Optional[date] = None) -> d
     }
 
 
+# 모든 section의 sales_input 재계산 (판가 정책 바뀔 때 등)
 @app.post("/admin/notes/section/sales_recompute")
 def admin_recompute_all_sales(_admin: int = Depends(get_admin_session)):
-    """모든 section의 sales_input 재계산 (판가 정책 바뀔 때 등)"""
     data = _load_notes()
     notes_map = data.get("notes", {}) or {}
     count = 0
@@ -22533,9 +14624,12 @@ def admin_recompute_all_sales(_admin: int = Depends(get_admin_session)):
     )
     return {"ok": True, "recomputed": count}
 
+# ============================================================
+#  폰 등록 · 알림 테스트
+# ============================================================
+# Flutter 앱이 앱 시작 시 FCM 토큰을 서버에 등록 ← 앱 fcm_service.dart initialize()
 @app.post("/device-tokens")
 def register_device_token(payload: dict):
-    """Flutter 앱이 앱 시작 시 FCM 토큰을 서버에 등록."""
     token = (payload or {}).get("token")
     if not token or not isinstance(token, str) or len(token) < 20:
         raise HTTPException(status_code=400, detail="invalid token")
@@ -22545,9 +14639,9 @@ def register_device_token(payload: dict):
     return {"ok": True}
 
 
+# 알람 시스템 동작 테스트용 엔드포인트.
 @app.post("/admin/fcm-test")
 def admin_fcm_test(_admin: int = Depends(get_admin_session)):
-    """알람 시스템 동작 테스트용 엔드포인트."""
     result = _send_fcm_to_all(
         title="🔔 테스트 알람",
         body="FCM 파이프라인 정상 동작 중",
@@ -22573,11 +14667,14 @@ DEV_PROCESS_STEPS = [
     ("final_approval", "최종 승인 완료", "승인"),
 ]
 
+# ============================================================
+#  공정 틀 · 빈 칸 지키기
+# ============================================================
 def _default_process() -> list:
     return [{"key": k, "name": n, "group": g, "expected": "", "actual": "", "status": ""} for k, n, g in DEV_PROCESS_STEPS]
 
+# 실제로 데이터가 들어 있는 주차 집합.
 def _known_weeks(project_key=None) -> set:
-    """실제로 데이터가 들어 있는 주차 집합. (weekly_summary + 모델 weekly_plan)"""
     try:
         data = _load_models()
     except Exception:
@@ -22598,19 +14695,13 @@ def _known_weeks(project_key=None) -> set:
     return weeks
 
 
+# 예전 프로젝트 키를 지금 키로 (havaplate → hrva_plate 등).
 def _model_key_alias(project_key: str) -> str:
     _alias = {"havaplate": "hrva_plate", "hrvaplate": "hrva_plate", "hrva-plate": "hrva_plate"}
     return _alias.get(project_key.strip().lower(), project_key.strip())
 
+# 엑셀에서 읽은 공정을 기존 입력 위에 얹는다 — 빈 칸은 덮지 않는다
 def _merge_process_keep(old, new):
-    """엑셀에서 읽은 공정을 기존 입력 위에 얹는다 — 빈 칸은 덮지 않는다.
-
-    프로세스 엑셀은 아직 안 채운 칸이 그냥 비어 있다. 그걸 그대로 덮어쓰면
-    화면에서 손으로 넣어 둔 예정일·실적일이 통째로 사라진다 (하바플레이트
-    17종이 이렇게 비었다). 엑셀에 값이 있는 칸만 반영하고, 빈 칸은 둔다.
-
-    단계 짝은 key → 이름 순으로 맞춘다. 단계 수가 달라도 있는 만큼만 얹는다.
-    """
     if not isinstance(old, list) or not old:
         return new
     by_key = {str(s.get("key") or ""): s for s in old if isinstance(s, dict)}
@@ -22628,20 +14719,8 @@ def _merge_process_keep(old, new):
     return out
 
 
+# 'FAIR 제출' 단계에 예정일·실제일을 적는다
 def _set_fair_dates(proc, expected: str = "", actual: str = "", today=None) -> list:
-    """'FAIR 제출' 단계에 예정일·실제일을 적는다.
-
-    하바플레이트 주간보고·개발현황의 두 칸이 여기로 온다.
-      고객요청일 → FAIR 제출 예정일
-      가공 완료  → FAIR 제출 실제일 (단, 오늘까지 지난 날짜일 때만)
-
-    가공 완료가 앞으로의 날짜면 아직 한 게 아니다. 예정일만 적고 진행중으로
-    둔다. 지난 날짜(오늘 포함)면 그날 한 것으로 보고 완료로 적고, 바로
-    다음 단계를 진행중으로 올린다 — 완료 밑이 계속 '대기' 면 지금 무엇을
-    하고 있는지가 화면에 안 나온다.
-
-    빈 값은 덮지 않는다 (엑셀에 아직 안 적힌 칸이 기존 입력을 지우면 안 된다).
-    """
     import datetime as _dtf
     if not isinstance(proc, list):
         return proc
@@ -22685,19 +14764,34 @@ def _set_fair_dates(proc, expected: str = "", actual: str = "", today=None) -> l
     return proc
 
 
-def _ensure_process(m: dict) -> list:
+# 단계 이름만 서 있고 날짜 · 상태가 한 칸도 없는가.
+def _dev_steps_blank(proc) -> bool:
+    if not isinstance(proc, list) or not proc:
+        return False
+    for st in proc:
+        st = st or {}
+        for k in ("expected", "actual", "status", "expected_note", "actual_note"):
+            if str(st.get(k) or "").strip():
+                return False
+    return True
+
+
+# 개발 품목의 공정 단계. 없으면 기본 13단계를 깔아 준다
+def _ensure_process(m: dict, division_id: str = "") -> list:
     proc = m.get("process")
     # process가 이미 있고 리스트면 그대로 사용
     if isinstance(proc, list) and len(proc) > 0:
         return proc
+    if division_id and division_id != "semiconductor":
+        return proc if isinstance(proc, list) else []
     # 없으면 기본값
     proc = _default_process()
     m["process"] = proc
     return proc
 
 
+# 양산 모델 weekly_plan 기반 진행률(%)
 def _ensure_mass_progress(weekly_plan, month=None):
-    """양산 모델 weekly_plan 기반 진행률(%)"""
     import datetime as _dt
     if not weekly_plan:
         return 0.0
@@ -22710,24 +14804,20 @@ def _ensure_mass_progress(weekly_plan, month=None):
     ta = sum(int(w.get("actual") or 0) for w in bucket.values())
     return round(min(100.0, ta / tp * 100), 1) if tp > 0 else 0.0
 
-
-def _month_weeks_base(y, m):
-    """week_calendar 로 위임. 규칙 사본이 갈라지면 W40 같은 사고가 난다."""
-    return _wcal.month_weeks_base(y, m)
-
-
+# ============================================================
+#  주차 · 달 계산
+# ============================================================
 def _get_month_weeks(month):
-    """YYYY-MM 월의 주차 목록. 규칙 본문은 week_calendar 에 있다."""
     return _wcal.get_month_weeks(month)
 
 
+# 'W40' → 그 주차를 소유한 'YYYY-MM'.
 def _month_of_week(week_label, year=None):
-    """'W40' → 그 주차를 소유한 'YYYY-MM'. 규칙 본문은 week_calendar 에 있다."""
     return _wcal.month_of_week(week_label, year)
 
 
+# 모델 weekly_plan / weekly_summary에 데이터가 있는 가장 최근 'YYYY-MM'.
 def _latest_data_month(project_key=None):
-    """모델 weekly_plan / weekly_summary에 데이터가 있는 가장 최근 'YYYY-MM'."""
     import datetime as _dt
     try:
         data = _load_models()
@@ -22746,40 +14836,34 @@ def _latest_data_month(project_key=None):
 # 사람이 직접 고른 상태. 추측보다 우선한다.
 _STEP_PICKED = ("완료", "진행중", "대기", "미승인", "미제출")
 
+# ============================================================
+#  공정 진행률
+# ============================================================
+def _note_says_done(t) -> bool:
+    t = str(t or "").replace(" ", "")
+    return "완료" in t and "예정" not in t and "미완료" not in t
 
+
+# 실적일이 있거나, 상태가 '완료' 거나, 칸에 '완료' 라고 적혔으면 완료다
 def _process_step_done(s) -> bool:
-    """실적일이 있거나 상태가 '완료' 면 완료로 본다."""
     s = s or {}
-    return bool(str(s.get("actual") or "").strip()) or s.get("status") == "완료"
+    if str(s.get("actual") or "").strip() or s.get("status") == "완료":
+        return True
+    # _note_says_done 과 같은 규칙. 테스트가 이 함수만 떼어 돌려서 여기 적는다.
+    for f in ("actual_note", "expected_note"):
+        t = str(s.get(f) or "").replace(" ", "")
+        if "완료" in t and "예정" not in t and "미완료" not in t:
+            return True
+    return False
 
 
+# 끝났거나 하고 있는 중.
 def _process_step_active(s) -> bool:
-    """끝났거나 하고 있는 중."""
     return _process_step_done(s) or (s or {}).get("status") == "진행중"
 
 
+# 지금 어디까지 왔는지 한 자리로 정하고, 뒤는 대기로 맞춘 사본.
 def _process_rolled(proc: list) -> list:
-    """지금 어디까지 왔는지 한 자리로 정하고, 앞은 완료 뒤는 대기로 맞춘 사본.
-
-    공정은 순서대로 간다. 그래서 '현재 위치' 한 곳만 정하면 나머지는 따라온다.
-
-        현재 위치 앞  → 완료 (지나온 자리다. 빈칸은 안 적은 것뿐)
-        현재 위치     → 그대로
-        현재 위치 뒤  → 대기 (아직 오지 않은 자리다)
-
-    현재 위치를 정하는 순서
-      1) 최종 승인이 진행중이거나 끝났으면 거기가 현재 위치다.
-         다 끝난 건이라 앞이 전부 완료가 된다.
-      2) 아니면 '진행중' 으로 골라 둔 첫 자리. BV2 를 진행중으로 바꿔 놓으면
-         그 뒤는 아직 안 한 일이므로 전부 대기로 내린다.
-      3) 그것도 없으면 마지막으로 끝난 자리.
-
-    단계 이름이나 순서에 기대지 않는다 — LAIR 과 FAIR 은 순서가 바뀌고
-    BV 는 BV1 에서 끝나기도 한다. 그런 자리는 현재 위치 앞뒤에 놓이면서
-    저절로 정리된다.
-
-    저장된 값은 건드리지 않는다. 보여줄 때만 맞춘다.
-    """
     if not proc:
         return proc
     n = len(proc)
@@ -22788,13 +14872,7 @@ def _process_rolled(proc: list) -> list:
         cur = n - 1
     else:
         for i, s in enumerate(proc):
-            # 실적일이 찍힌 자리는 '진행중' 이라고 적혀 있어도 끝난 것이다.
-            #
-            # 파워박스 Striker Oxide 는 BV2 에 실적일(9/19)을 넣고도 상태가
-            # '진행중' 으로 남아 있었다. 그 자리를 현재 위치로 잡는 바람에
-            # 뒤에 있는 Source Inspection 을 무엇으로 바꾸든 화면은 늘 '대기'
-            # 였다 — 고쳐지지 않는 것처럼 보인다.
-            # _process_current 는 이미 같은 조건으로 거른다. 둘을 맞춘다.
+            # 실적일이 찍힌 자리는 '진행중' 이라고 적혀 있어도 끝난 것이다
             if (str((s or {}).get("status") or "").strip() == "진행중"
                     and not _process_step_done(s)):
                 cur = i
@@ -22806,11 +14884,13 @@ def _process_rolled(proc: list) -> list:
     if cur < 0:
         return proc
 
+    finished = cur == n - 1 and _process_step_done(proc[-1])
     out = []
     for i, s in enumerate(proc):
         t = dict(s or {})
         if i < cur:
-            t["status"] = "완료"
+            if finished or _process_step_done(t):
+                t["status"] = "완료"
         elif i > cur:
             # 아직 오지 않은 자리. 실적일이 남아 있으면 같이 내린다 —
             # '대기' 라면서 실적일이 찍혀 있으면 어느 쪽이 맞는지 알 수 없다.
@@ -22819,15 +14899,25 @@ def _process_rolled(proc: list) -> list:
         elif _process_step_done(t):
             t["status"] = "완료"
         out.append(t)
+    # '○○ 승인' 이 끝났으면 바로 앞 '○○ 작성/제출' 도 완료
+    import re as _re
+
+    def _stem(nm, tails):
+        t = _re.sub(r"^\s*\d+\s*", "", str(nm or "")).strip()
+        for tail in tails:
+            if t.endswith(tail):
+                return t[: -len(tail)].strip().lower()
+        return None
+    for i in range(len(out) - 1):
+        a = _stem(out[i].get("name"), ("작성", "제출"))
+        b = _stem(out[i + 1].get("name"), ("승인",))
+        if a and a == b and out[i + 1].get("status") == "완료" and out[i].get("status") != "완료":
+            out[i]["status"] = "완료"
     return out
 
 
+# 완료로 맞춰진 단계 수 ÷ 전체 단계 수.
 def _process_progress(proc: list) -> int:
-    """완료로 맞춰진 단계 수 ÷ 전체 단계 수.
-
-    현재 위치 뒤는 대기로 내려가므로 진행률에 안 들어간다.
-    진행중도 끝난 게 아니라서 안 센다.
-    """
     if not proc:
         return 0
     rolled = _process_rolled(proc)
@@ -22835,8 +14925,8 @@ def _process_progress(proc: list) -> int:
     return round(done / len(rolled) * 100)
 
 
+# 모델 1개 진행률: 양산=출하/PO, 개발=프로세스 완료율 (0~100)
 def _model_progress(m: dict) -> int:
-    """모델 1개 진행률: 양산=출하/PO, 개발=프로세스 완료율 (0~100)"""
     if str(m.get('group') or '') == '양산':
         po = float(m.get('po_qty') or 0)
         sh = float(m.get('shipped_qty') or 0)
@@ -22851,8 +14941,8 @@ def _model_progress(m: dict) -> int:
         return round(done / len(rolled) * 100)
     return int(m.get('progress') or 0)
 
+# 양산(출하/PO) + 개발(프로세스) 가중 평균 진행률
 def _combined_project_progress(proj: dict) -> float:
-    """양산(출하/PO) + 개발(프로세스) 가중 평균 진행률"""
     models = (proj or {}).get('models', []) or []
     vals = []
     for m in models:
@@ -22869,8 +14959,8 @@ def _combined_project_progress(proj: dict) -> float:
     return round(sum(vals) / len(vals), 1) if vals else 0.0
 
 
+# 양산 모델: weekly_plan이 있으면 앱 표시용 요약 텍스트 생성 (앱 수정 불필요)
 def _inject_weekly_summary(m: dict) -> dict:
-    """양산 모델: weekly_plan이 있으면 앱 표시용 요약 텍스트 생성 (앱 수정 불필요)"""
     if str(m.get('group') or '') != '양산':
         return m
     wp = m.get('weekly_plan') or {}
@@ -22898,9 +14988,8 @@ def _inject_weekly_summary(m: dict) -> dict:
     m['weekly_progress'] = pct
     return m
 
+# 현재(다음) 진행 단계. 계획일·실적일·상태가 하나도 없는 단계는 아직 일정이 안 잡힌 것으로 보고 '진행중'으로 표시하지 않는다
 def _process_current(proc: list):
-    """현재(다음) 진행 단계. 계획일·실적일·상태가 하나도 없는 단계는
-    아직 일정이 안 잡힌 것으로 보고 '진행중'으로 표시하지 않는다."""
     def _done(s):
         return bool(str((s or {}).get("actual") or "").strip()) or (s or {}).get("status") == "완료"
 
@@ -22929,22 +15018,23 @@ def _process_current(proc: list):
         return "최종 승인 완료", ""
     return "", ""
 
+# 모델 1건의 진행률(%). 데이터가 없으면 None → 집계에서 제외.
 def _model_progress_value(m: dict):
-    """모델 1건의 진행률(%). 데이터가 없으면 None → 집계에서 제외.
-    - 양산: PO 수량(계획)이 있어야 집계. 출하 0이면 0%.
-    - 개발: 공정 단계에 계획일/실적일/상태 중 하나라도 입력돼야 집계.
-      (13단계 틀은 자동 생성되므로 단계 존재만으로는 데이터로 보지 않음)
-    """
     if not isinstance(m, dict):
         return None
     # 저장된 group 이 아니라 '지금 어느 단계인가'로 센다. 전환 주차가 지났는데
     # 아무도 모델을 열어 저장하지 않으면 계속 개발로 집계됐다.
     if _display_group(m) == "개발":
         proc = m.get("process") if isinstance(m.get("process"), list) else []
-        has_input = any(
-            str((s or {}).get(k) or "").strip()
-            for s in proc for k in ("expected", "actual", "status")
-        )
+        # 공정 단계 중 하나라도 계획일 · 실적일 · 상태가 적혀 있나
+        has_input = False
+        for _step in proc:
+            for _f in ("expected", "actual", "status"):
+                if str((_step or {}).get(_f) or "").strip():
+                    has_input = True
+                    break
+            if has_input:
+                break
         if not has_input:
             return None
         return _process_progress(proc)
@@ -22961,9 +15051,14 @@ def _model_progress_value(m: dict):
     return round(shipped * 100 / po)
 
 
+# 프로젝트 하나의 진행률 한 줄 (모델 진행률 평균 · 지연 수).
 def _project_progress_entry(project_key: str, proj: dict) -> dict:
-    vals = [v for v in (_model_progress_value(m) for m in (proj.get("models") or []))
-            if v is not None]
+    # 모델마다 진행률 — 셀 수 없는 모델(None)은 뺀다
+    vals = []
+    for m in (proj.get("models") or []):
+        v = _model_progress_value(m)
+        if v is not None:
+            vals.append(v)
     try:
         div_id = _cl.derive_division_from_project(project_key)
     except Exception:
@@ -22977,12 +15072,12 @@ def _project_progress_entry(project_key: str, proj: dict) -> dict:
         "progress": round(sum(vals) / len(vals)) if vals else None,
     }
 
-
+# ============================================================
+#  진행률 요약 · 개요 주소
+# ============================================================
+# 프로젝트별 진행률 요약 (앱 사업부 화면용) ← admin v2 back.onclick() · 앱 progress_service.dart fetch()
 @app.get("/projects-progress-summary")
 def get_projects_progress_summary(division_id: str = None):
-    """프로젝트별 진행률 요약 (앱 사업부 화면용).
-    데이터 없는 모델은 제외하고 계산하며, progress=None 이면 '-' 로 표시할 것.
-    division_id 를 주면 그 사업부 프로젝트만 + 가중 평균(weighted)을 함께 반환."""
     data = _load_models()
     out = {}
     for pk, proj in (data.get("projects") or {}).items():
@@ -23013,39 +15108,27 @@ def get_projects_progress_summary(division_id: str = None):
     }
 
 
+# 프로젝트 표시 이름.
 def _display_project_label(project_key: str) -> str:
-    """프로젝트 표시 이름.
-
-    PROJECT_LABELS 는 초창기 8개만 담고 있는 고정 맵이라
-    이후에 추가된 프로젝트(플레이팅 셀 / 톨론 / EOS챔버 / 페러데이 4T /
-    CURIE)는 'plating_cell' 같은 키가 그대로 화면에 노출됐다.
-    운영 설정(config/projects.json)의 라벨을 먼저 본다.
-    """
     try:
         p = _cl.get_project(project_key)
         if p and (p.get("label") or "").strip():
-            return p["label"].strip()
+            # 화면 이름만 다듬는다 (division_columns.clean_label)
+            return _dcol.clean_label(p["label"].strip())
     except Exception:
         pass
     # 여기서만 고정 맵을 본다. 다른 곳은 전부 이 함수를 거친다.
     return PROJECT_LABELS.get(project_key, project_key)
 
 
+# 앱 홈 화면용 요약 (admin/overview 와 동일) ← admin v2 renderHomeDashboard() · 앱 overview_service.dart fetch()
 @app.get("/overview")
 def get_overview(month: str = None, division_id: str = None):
-    """앱 홈 화면용 요약 (admin/overview 와 동일)."""
     return get_admin_overview(month=month, division_id=division_id)
 
 
+# 주차를 '끝난 주' 와 '남은 주' 로 가른다
 def _split_weeks_closed_open(wr: dict, month: str, today) -> tuple:
-    """주차를 '끝난 주' 와 '남은 주' 로 가른다.
-
-    월 달성률만 보면 9월 초에는 늘 20~30% 다. 아직 안 온 주차의 계획이
-    분모에 들어가 있어서다. 끝난 주만 놓고 보면 계획을 지켰는지가 보이고,
-    남은 주를 따로 보면 앞으로 얼마가 남았는지가 보인다.
-
-    끝난 주 = 그 ISO 주의 일요일이 오늘보다 앞선 주.
-    """
     closed = {"closed_weeks": 0, "closed_qty_plan": 0, "closed_qty_actual": 0,
               "closed_revenue": 0, "closed_plan_revenue": 0}
     opened = {"open_weeks": 0, "open_qty_plan": 0, "open_plan_revenue": 0}
@@ -23067,9 +15150,9 @@ def _split_weeks_closed_open(wr: dict, month: str, today) -> tuple:
     return closed, opened
 
 
+# Admin 홈 대시보드용 요약: 프로젝트별 진행률 + 해당 월 수량/매출 ← admin v2 renderHomeDashboard()
 @app.get("/admin/overview")
 def get_admin_overview(month: str = None, division_id: str = None):
-    """Admin 홈 대시보드용 요약: 프로젝트별 진행률 + 해당 월 수량/매출."""
     import datetime as _dt
     data = _load_models()
     today = _dt.date.today()
@@ -23105,12 +15188,16 @@ def get_admin_overview(month: str = None, division_id: str = None):
             # 3주가 남았는데 그 3주 계획까지 분모에 들어가 있어서다.
             # 끝난 주(일요일이 지난 주)와 남은 주를 갈라 둔다.
             _cl, _op = _split_weeks_closed_open(wr, month, today)
-            row.update(_cl); row.update(_op)
+            row.update(_cl)
+            row.update(_op)
         except Exception as _e:
             print(f"[overview] {pk} 주차 매출 계산 실패: {_e}")
         rows.append(row)
 
-    rows.sort(key=lambda r: (-(r["plan_revenue"] or 0), -(r["models_total"] or 0), r["label"]))
+    # 이 달 계획 매출 큰 곳 → 모델 많은 곳 → 이름순
+    def _by_plan_models_label(r):
+        return (-(r["plan_revenue"] or 0), -(r["models_total"] or 0), r["label"])
+    rows.sort(key=_by_plan_models_label)
 
     scored = sum(r["scored_count"] for r in rows)
     score_sum = 0
@@ -23145,9 +15232,10 @@ def get_admin_overview(month: str = None, division_id: str = None):
         "projects": rows,
     }
 
-
+# ============================================================
+#  날짜 · 진행 추세
+# ============================================================
 def _parse_any_date(v):
-    """'2026-08-13', '2026/08/13', '26-08-13', '8/13' 같은 값을 date 로."""
     import datetime as _dt, re as _re
     t = str(v or "").strip()
     if not t:
@@ -23171,15 +15259,8 @@ def _parse_any_date(v):
     return None
 
 
+# '2026-08' + 'W33' → 그 ISO 주의 일요일(주 마감일).
 def _week_end_date(month: str, week_label: str):
-    """'2026-08' + 'W33' → 그 ISO 주의 일요일(주 마감일).
-
-    연말·연초는 달의 연도와 ISO 연도가 어긋난다. 2025년 12월 보드의
-    마지막 열은 'W01' 인데 그건 2026년 1주다. 달의 연도를 그대로 쓰면
-    2025-01-05 가 나오고, 12월 한 달 내내 '이미 끝난 주' 로 잡혀서
-    시작도 안 한 주가 통째로 미달로 올라온다. _week_ord 와 같은 규칙으로
-    연도를 보정한다.
-    """
     import datetime as _dt
     try:
         y = int(str(month).split("-")[0])
@@ -23203,16 +15284,21 @@ def _week_end_date(month: str, week_label: str):
         return None
 
 
+# cutoff(date) 시점 기준 모델 진행률.
 def _model_progress_asof(m: dict, cutoff):
-    """cutoff(date) 시점 기준 모델 진행률. 데이터 없으면 None."""
     if not isinstance(m, dict):
         return None
     if _display_group(m, cutoff) == "개발":
         proc = m.get("process") if isinstance(m.get("process"), list) else []
-        has_input = any(
-            str((s or {}).get(k) or "").strip()
-            for s in proc for k in ("expected", "actual", "status")
-        )
+        # 공정 단계 중 하나라도 계획일 · 실적일 · 상태가 적혀 있나
+        has_input = False
+        for _step in proc:
+            for _f in ("expected", "actual", "status"):
+                if str((_step or {}).get(_f) or "").strip():
+                    has_input = True
+                    break
+            if has_input:
+                break
         if not has_input or not proc:
             return None
         done = 0
@@ -23255,10 +15341,9 @@ def _model_progress_asof(m: dict, cutoff):
     return round((baseline + weekly_asof) * 100 / po)
 
 
+# 진행률 추이. 주차별 실적(양산) / 공정 실적일(개발) 누적으로 과거 시점을 재구성한다 ← 앱 progress_service.dart fetch()
 @app.get("/progress-trend")
 def get_progress_trend(period: str = "week", points: int = 4, division_id: str = None):
-    """진행률 추이. 주차별 실적(양산) / 공정 실적일(개발) 누적으로 과거 시점을 재구성한다.
-    period: day(최근 7일) | week(최근 N주) | month(최근 N개월)"""
     import datetime as _dt
     today = _dt.date.today()
     cutoffs = []
@@ -23298,7 +15383,12 @@ def get_progress_trend(period: str = "week", points: int = 4, division_id: str =
 
     out = []
     for label, cutoff in cutoffs:
-        vals = [v for v in (_model_progress_asof(m, cutoff) for m in models) if v is not None]
+        # 그 날짜 기준 모델마다 진행률 — 셀 수 없는 모델(None)은 뺀다
+        vals = []
+        for m in models:
+            v = _model_progress_asof(m, cutoff)
+            if v is not None:
+                vals.append(v)
         out.append({
             "label": label,
             "date": cutoff.isoformat(),
@@ -23329,14 +15419,10 @@ _HOLD_NEGATIONS = ("드롭 안", "드롭안", "드롭 취소", "보류 해제", 
                    "보류 취소", "드롭 아님", "드롭아님", "중단 없", "홀드 해제",
                    "홀딩 해제", "홀딩해제", "홀딩 없")
 
-
+# ============================================================
+#  보류 · PO 대기 · 지연 판정
+# ============================================================
 def _model_hold(m: dict) -> str:
-    """'드롭예정' · '보류' · ''.
-
-    파워박스 VCTR-XPRSMS 는 비고에 '드롭 예정' 이라고 적혀 있었는데
-    앱이 비고를 안 읽어서, 자재 입고 예정일만 지나 보이고 그냥 지연으로
-    잡혔다. 적어둔 말이 화면까지 이어지게 한다.
-    """
     st = str((m or {}).get("status") or "").strip().replace(" ", "")
     if st in ("드롭예정", "드롭"):
         return "드롭예정"
@@ -23353,13 +15439,8 @@ def _model_hold(m: dict) -> str:
     return ""
 
 
+# 프로젝트 전체가 멈춰 있으면 '보류' · '드롭예정', 아니면 ''.
 def _project_hold(proj: dict) -> str:
-    """프로젝트 전체가 멈춰 있으면 '보류' · '드롭예정', 아니면 ''.
-
-    CUP 은 현황에 '*컵 이슈 해결될 때까지 개발 컵 또한 LAIR 작성 홀딩'
-    이라고 적혀 있는데도 모델 15종이 전부 '지연' 으로 세어졌다.
-    멈춰 세운 일정을 늦었다고 하면 숫자가 거짓말을 한다.
-    """
     st = str((proj or {}).get("hold") or "").strip().replace(" ", "")
     if st in ("진행", "해제", "없음"):
         return ""                      # admin 에서 직접 풀었다
@@ -23372,8 +15453,8 @@ def _project_hold(proj: dict) -> str:
     return kind
 
 
+# 현황 문구에서 읽어낸 (종류, 근거 문장).
 def _hold_from_note(note: str):
-    """현황 문구에서 읽어낸 (종류, 근거 문장). 없으면 ('', '')."""
     txt = str(note or "")
     low = txt.lower()
     if not low.strip():
@@ -23389,21 +15470,9 @@ def _hold_from_note(note: str):
     return "", ""
 
 
+# 현황에 적힌 보류를 프로젝트 필드로 새겨 둔다
 def _stamp_project_hold(proj: dict, note: str) -> bool:
-    """현황에 적힌 보류를 프로젝트 필드로 새겨 둔다.
-
-    문구는 주간보고를 다시 올리거나 현황을 고치다 사라질 수 있다.
-    그때 보류가 조용히 풀리면 멈춰 세운 일정이 다시 지연으로 세어진다.
-    한 번 읽어낸 보류는 필드로 남기고, 풀 때는 현황에 '홀딩 해제' 라고
-    적거나 admin 에서 상태를 '진행' 으로 바꾸면 된다.
-    """
-    # 사람이 골라 둔 건 사람만 되돌린다. 여기서 문구를 다시 읽어 덮으면
-    # '진행' 으로 바꿔놔도 서버가 뜰 때마다 보류가 되살아난다.
-    #
-    # 2026-10-22 — 'excel' 도 같이 막는다. 이 함수는 서버가 뜰 때마다
-    # 한 번씩 도는데(_stamp_hold_on_boot), 엑셀에서 상태를 '진행' 으로
-    # 바꿔 올려도 현황 글에 '홀딩' 이라는 말이 남아 있으면 다음 배포에서
-    # 조용히 보류로 되돌아갔다.
+    # 사람이 골라 둔 건 사람만 되돌린다
     if str((proj or {}).get("hold_source") or "") in ("manual", "excel"):
         return False
 
@@ -23431,20 +15500,46 @@ def _stamp_project_hold(proj: dict, note: str) -> bool:
     return changed
 
 
+# 보류라고 판단한 근거 문장 한 줄.
 def _project_hold_reason(proj: dict) -> str:
-    """보류라고 판단한 근거 문장 한 줄. 화면에 그대로 보여준다."""
     saved = str((proj or {}).get("hold_reason") or "").strip()
     if saved:
         return saved
     return _hold_from_note((proj or {}).get("status_note"))[1]
 
 
-def _model_po_wait(m: dict, disp_group: str = "") -> bool:
-    """양산으로 넘어왔는데 PO 가 아직 안 들어온 모델.
+# 최종 승인이 끝난 개발품을 며칠 동안 '완료' 로 두었다가 PO 대기로 넘길까.
+DEV_PO_WAIT_DAYS = 7
 
-    최종 승인까지 끝내고 PO 접수를 기다리는 자리다. 진행률로 보면
-    0% 라 늦은 것처럼 보이지만 우리가 늦은 게 아니다.
-    """
+
+# 최종 승인이 끝난 날 (date) — 모르면 None.
+def _dev_final_day(m: dict, proc: list):
+    # 마지막 단계가 최종 승인이다
+    last = {}
+    if proc and proc[-1]:
+        last = proc[-1]
+    for raw in (last.get("actual"), (m or {}).get("final_done_seen")):
+        hit = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", str(raw or ""))
+        if hit:
+            try:
+                return date(int(hit.group(1)), int(hit.group(2)), int(hit.group(3)))
+            except ValueError:
+                continue
+    return None
+
+
+# 최종 승인이 끝난 개발품을 PO 대기로 넘길 때가 됐나.
+def _dev_po_wait(m: dict, proc: list, today=None) -> bool:
+    if not proc or not _process_step_done(proc[-1]):
+        return False
+    day = _dev_final_day(m, proc)
+    if day is None:
+        return True
+    return ((today or date.today()) - day).days >= DEV_PO_WAIT_DAYS
+
+
+# 양산으로 넘어왔는데 PO 가 아직 안 들어온 모델.
+def _model_po_wait(m: dict, disp_group: str = "") -> bool:
     g = disp_group or _display_group(m)
     if g != "양산":
         return False
@@ -23455,9 +15550,6 @@ def _model_po_wait(m: dict, disp_group: str = "") -> bool:
 
 
 # 완료예정일이 며칠 안 남았을 때 '임박' 으로 볼 것인가.
-#
-# 7일이면 34건이 뜬다. 그 정도면 목록이 아니라 배경이 되어서 아무도 안 본다.
-# 3일로 좁히면 24건 — 크게 안 줄어드는데, 16건이 같은 날 하나에 몰려 있어서다.
 SOON_DAYS = 3
 
 
@@ -23467,34 +15559,17 @@ _DELAY_NEG = ("지연 없", "지연없", "지연 해소", "지연해소", "지�
               "지연 취소", "지연 우려 없")
 
 
+# 이슈 칸에 사람이 '지연' 이라고 적었으면 일정 문제로 본다
 def _issue_says_delay(text) -> bool:
-    """이슈 칸에 사람이 '지연' 이라고 적었으면 일정 문제로 본다.
-
-    양산품은 개발품과 달리 공정 완료예정일이 없어서, 늦었는지 따질
-    근거가 손으로 적는 status 밖에 없다. 그래서 메이저모듈 EFEM 은
-    '2대 고객 사급자재 지연 (ETA: 9/20)' 이라고 적혀 있는데도 화면에는
-    특이사항으로만 떴다. 사람이 이미 판단해서 적어 둔 것을 안 읽을
-    이유가 없다.
-    """
     t = " ".join(str(text or "").split())
     if "지연" not in t:
         return False
     return not any(neg in t for neg in _DELAY_NEG)
 
 
+# '지연' · '주의' · '정상'.
 def _model_alert(m: dict, disp_group: str = "", expected: str = "",
                  progress=None) -> str:
-    """'지연' · '주의' · '정상'.
-
-    카드의 지연/주의 개수와 목록 줄의 '지연중 · 06 BV2' 가 서로 다른 값을
-    보고 있었다. 카드는 손으로 적는 status 만 보고, 줄은 완료예정일로 따졌다.
-    그래서 목록에는 지연이 다섯인데 카드는 0 이었다.
-
-    여기서 한 번만 정하고 양쪽이 이걸 쓴다.
-      - 손으로 '지연'/'주의' 를 적어뒀으면 그게 우선
-      - 개발: 완료예정일이 지났으면 지연, SOON_DAYS 이내면 주의
-      - 진행률 100% 면 정상
-    """
     manual = str((m or {}).get("status") or "").strip()
     if manual in ("지연", "주의"):
         return manual
@@ -23511,13 +15586,7 @@ def _model_alert(m: dict, disp_group: str = "", expected: str = "",
     _proc = (m or {}).get("process")
     if isinstance(_proc, list) and _proc and _process_step_done(_proc[-1]):
         return "정상"          # 최종 승인이 끝났으면 늦고 말고가 없다
-    # 사람이 '지연' 이라고 적었으면 그것도 판정이다.
-    # 양산품은 이것 말고 늦었는지 볼 근거가 없다.
-    #
-    # 2026-10-22 — 이슈 칸만 보던 것을 비고까지 넓혔다. 모델 정보를 엑셀로만
-    # 고치게 바꾸면서 화면의 이슈 칸이 잠겼는데, 엑셀이 싣고 오는 글자 칸은
-    # 비고 하나다. 비고에 적은 '지연' 을 안 읽으면 양산품은 늦었는지 볼
-    # 근거가 아예 없어진다. _model_hold 는 이미 두 칸을 같이 읽고 있었다.
+    # 사람이 '지연' 이라고 적었으면 그것도 판정이다
     if _issue_says_delay(" ".join(str((m or {}).get(f) or "")
                                   for f in ("issues", "note"))):
         return "지연"
@@ -23538,31 +15607,73 @@ def _model_alert(m: dict, disp_group: str = "", expected: str = "",
         return "주의"
     return "정상"
 
-def _enrich_model(m: dict, proj_hold: str = "") -> dict:
-    out = {k: m.get(k) for k in ("id", "name", "group", "status", "progress", "price", "material_cost", "dev_type", "po_qty", "shipped_qty", "due_text", "issues", "note", "part_number", "weekly_plan", "weekly_progress", "weekly_summary")}
+# ============================================================
+#  모델 하나를 화면 모양으로 (_enrich_model)
+# ============================================================
+def _frame_group(m: dict, division_id: str = "") -> str:
+    g = _display_group(m)
+    if g != "개발":
+        return g
+    try:
+        want = _dcol.dev_frame(division_id)
+    except Exception:
+        want = ""
+    return want or g
+
+
+# 모델 하나를 화면에 내보낼 모양으로 — 상태 · 지연 판정 · 공정 · 보류 를 붙인다
+def _enrich_model(m: dict, proj_hold: str = "", division_id: str = "") -> dict:
+    out = {k: m.get(k) for k in ("id", "name", "group", "status", "progress", "price", "material_cost", "dev_type", "po_qty", "shipped_qty", "due_text", "issues", "note", "part_number", "weekly_plan", "weekly_progress", "weekly_summary", "dev_owner", "due_date", "due_revised", "made_date")}
     _disp = _display_group(m)
     out["display_group"] = _disp
+    # -----------------------------------------------------------
+    # 어느 '틀' 로 그릴까
+    # -----------------------------------------------------------
+    # Min: "양산 개발을 나뉘는데 개발에 들어가더라도 양산처럼 틀
+    #      똑같이 맞춰달라는거였어"
+    #
+    # 구분(display_group)과 틀(frame)은 다른 이야기다.
+    #   구분 — 목록이 양산 · 개발 두 묶음으로 나뉘는 기준. 그대로 둔다.
+    #   틀   — 그 묶음에 들어갔을 때 어떤 카드 · 어떤 상세 화면으로 보나.
+    #
+    # 아리스타 개발은 '개발' 묶음에 그대로 있되, 안에서는 양산처럼
+    # 주차별 계획 · 실적으로 본다. 공정 13단계는 반도체 것이라 PCB 에는
+    # 맞는 단계가 하나도 없다 — 들어가면 빈 단계표만 떴다.
+    out["frame"] = _frame_group(m, division_id)
     if _disp == "개발":
-        proc = _ensure_process(m)
+        proc = _ensure_process(m, division_id)
         out["process"] = proc
         out["dev_type"] = m.get("dev_type") or ""
         out["progress"] = _process_progress(proc)
         stage, expected = _process_current(proc)
         out["current_stage"] = stage
         out["current_expected"] = expected
-        out["done_steps"] = sum(1 for s in proc if str(s.get("actual") or "").strip())
+        # 상세 화면과 같은 기준 (실적일 · '완료' · 최종 승인이면 전부)
+        out["done_steps"] = sum(1 for s in _process_rolled(proc) if _process_step_done(s))
         out["total_steps"] = len(proc)
         # 최종 승인이 끝났으면 끝난 것이다. 진행률 숫자에만 기대면
         # 양산으로 넘어간 뒤 PO 기준으로 다시 세어져 '완료'에서 빠진다.
         out["finished"] = bool(proc) and _process_step_done(proc[-1])
+        # 최종 승인 뒤 1주일은 '완료', 그다음은 PO 대기 (_dev_po_wait)
+        out["dev_po_wait"] = _dev_po_wait(m, proc)
+        _fd = _dev_final_day(m, proc) if out["finished"] else None
+        out["final_day"] = _fd.isoformat() if _fd else ""
         out["alert"] = _model_alert(m, _disp, expected, out["progress"])
     else:
         # 양산으로 넘어가도 최종 승인까지 간 공정 기록은 계속 볼 수 있어야 한다.
         # progress 는 덮지 않는다 — 그건 이제 PO 대비 출하다.
         _proc = m.get("process")
-        if isinstance(_proc, list) and any(
-                str((st or {}).get(k) or "").strip()
-                for st in _proc for k in ("expected", "actual", "status")):
+        # 공정 단계 중 하나라도 계획일 · 실적일 · 상태가 적혀 있으면 그대로 싣는다
+        _proc_has_input = False
+        if isinstance(_proc, list):
+            for _step in _proc:
+                for _f in ("expected", "actual", "status"):
+                    if str((_step or {}).get(_f) or "").strip():
+                        _proc_has_input = True
+                        break
+                if _proc_has_input:
+                    break
+        if _proc_has_input:
             out["process"] = _proc
             out["done_steps"] = sum(1 for st in _proc
                                     if str((st or {}).get("actual") or "").strip())
@@ -23575,26 +15686,59 @@ def _enrich_model(m: dict, proj_hold: str = "") -> dict:
     out["hold"] = _own_hold or (proj_hold or "")
     # 프로젝트가 통째로 멈춘 것과, 이 모델만 드롭인 것은 다르다.
     # 화면에서 '보류 29줄' 을 늘어놓는 대신 안내 한 줄로 바꿀 수 있게 구분해 준다.
-    out["hold_scope"] = "model" if _own_hold else ("project" if proj_hold else "")
-    out["po_wait"] = _model_po_wait(m, _disp)
+    if _own_hold:
+        out["hold_scope"] = "model"          # 이 모델만 멈춤
+    elif proj_hold:
+        out["hold_scope"] = "project"        # 프로젝트가 통째로 멈춤
+    else:
+        out["hold_scope"] = ""
+    out["po_wait"] = _model_po_wait(m, _disp) or bool(out.get("dev_po_wait"))
     # 프로젝트가 통째로 멈춰 있으면 그 안의 모델도 늦은 게 아니다.
     if proj_hold and out.get("alert") in ("지연", "주의"):
         out["alert"] = "정상"
     return out
 
+# ============================================================
+#  홈 알림 (/home/alerts)
+# ============================================================
+def _has_week_plan(proj: dict, month: str) -> bool:
+    for m in (proj.get("models") or []):
+        if not isinstance(m, dict):
+            continue
+        bucket = ((m.get("weekly_plan") or {}).get(month)) or {}
+        for cell in bucket.values():
+            if (cell or {}).get("plan") or (cell or {}).get("actual"):
+                return True
+    return False
+
+
+_WB_CACHE = {}          # (프로젝트, 달) → (바뀐 시각, 마감주차, 미달 한 줄)
+
+
+# 그 달 **마지막 마감 주차의 미달 한 줄**만 캐시해 둔다
+def _weekly_shortfall_cached(pk: str, month: str):
+    try:
+        stamp = os.path.getmtime(MODELS_FILE)
+    except OSError:
+        stamp = 0
+    key = (pk, month)
+    got = _WB_CACHE.get(key)
+    if got and got[0] == stamp:
+        return got[1], got[2]
+    board = get_weekly_board(pk, month) or {}
+    last = ((board.get("closed_weeks") or [])[-1:] or [""])[0]
+    sh = next((x for x in (board.get("shortfalls") or [])
+               if x.get("week") == last and x.get("kind") != "참고"), None)
+    # 보드는 여기서 버린다. 들고 있으면 안 된다.
+    if len(_WB_CACHE) > 400:
+        _WB_CACHE.clear()
+    _WB_CACHE[key] = (stamp, last, sh)
+    return last, sh
+
+
+# 홈 화면 한 눈 요약 — 모델 기준 ← 앱 home_alerts_service.dart fetch()
 @app.get("/home/alerts")
 def get_home_alerts(limit: int = 12, division: str = "semiconductor"):
-    """홈 화면 한 눈 요약 — 모델 기준.
-
-    예전 홈은 /dashboard 의 주간보고 카드(RED/YELLOW)로 사업부 상태를 셌다.
-    주간보고가 없는 사업부는 아예 집계에서 빠져서 '12개 중 정상 2' 처럼
-    나왔고, 프로젝트 안에는 지연이 널려 있는데 홈은 '지연 0' 이었다.
-    여기서는 프로젝트 안에서 보는 값과 똑같은 모델 alert 를 그대로 센다.
-
-    세는 범위는 반도체사업부다. 카드에도 '(반도체 기준)' 이라고 적혀 있는데
-    실제로는 전 사업부를 세고 있었다 — 적힌 것과 세는 것이 다르면 숫자를
-    믿을 수 없다. division= 로 다른 사업부를, 빈 값으로 전사를 볼 수 있다.
-    """
     import datetime as _dth
     data = _load_models()
     div = (division or "").strip()
@@ -23687,11 +15831,7 @@ def get_home_alerts(limit: int = 12, division: str = "semiconductor"):
                 })
                 hit_projects.add(pk)
 
-            # 이슈 — 적어 둔 문제. 지연과 겹치지 않는다: 지연은 개발품 공정이
-            # 밀린 것이고, 이슈는 주로 양산품에 사람이 적어 넣은 것이다.
-            # 경영진에게는 '일정이 늦었나' 와 '문제가 있나' 둘 다 문제다.
-            # 한 모델은 한 줄이다. 위에서 지연으로 센 것을 여기서 또
-            # 이슈로 세면 같은 모델이 두 번 올라온다.
+            # 이슈 — 적어 둔 문제. 지연과 겹치지 않는다: 지연은 개발품 공정이 밀린 것이고, 이슈는 주로 양산품에 사람이 적어 넣은 것이다
             _iss = _iss0
             if _iss and not hold and not done and kind != "지연":
                 counts["issue"] += 1
@@ -23710,9 +15850,6 @@ def get_home_alerts(limit: int = 12, division: str = "semiconductor"):
                 hit_projects.add(pk)
 
             # 정상 — 문제 없이 가고 있는 것.
-            #
-            # 화면에 지연·이슈·임박만 늘어놓으면 제대로 가는 게 훨씬
-            # 많다는 사실이 어디에도 안 나온다. 260종 중 문제는 열 몇 건이다.
             if (not hold and not done and not _iss0
                     and kind not in ("지연", "주의")):
                 counts["normal"] += 1
@@ -23729,16 +15866,17 @@ def get_home_alerts(limit: int = 12, division: str = "semiconductor"):
         try:
             if _project_hold(proj):
                 continue
-            board = get_weekly_board(pk, today.strftime("%Y-%m")) or {}
+            # 주차 보드 한 장을 만드는 건 비싸다. 이 달에 주차 계획이
+            # 한 칸도 없는 프로젝트는 미달이 나올 수가 없으니 먼저 거른다.
+            if not _has_week_plan(proj, today.strftime("%Y-%m")):
+                continue
+            _last_wk, _sh = _weekly_shortfall_cached(pk, today.strftime("%Y-%m"))
         except Exception as _e:
             print(f"[home/alerts] {pk} 주차 미달 계산 실패: {_e}")
             continue
         label = _display_project_label(pk)
-        # 방금 끝난 주만 본다. 3주 전에 못 채운 것은 이미 지나간 이야기고,
-        # 마감 주차가 쌓일수록 목록이 주차 미달로만 가득 찬다.
-        _last = (board.get("closed_weeks") or [])[-1:] or [""]
-        _sh = next((x for x in (board.get("shortfalls") or [])
-                    if x.get("week") == _last[0] and x.get("kind") != "참고"), None)
+        # 방금 끝난 주만 본다. 3주 전에 못 채운 것은 이미 지나간 이야기고, 마감 주차가 쌓일수록 목록이 주차 미달로만 가득 찬다
+        _last = [_last_wk]
         if not _sh:
             continue
         # 미달은 합계 기준이라 주차당 한 건이다.
@@ -23777,9 +15915,10 @@ def get_home_alerts(limit: int = 12, division: str = "semiconductor"):
         if d > row["worst_days"]:
             row["worst_days"] = d
             row["worst_model"] = a["model"]
-    rows = sorted(by_project.values(),
-                  key=lambda r: (-(r["delayed"] + r["issue"]), -r["worst_days"],
-                                 -r["soon"]))
+    # 문제(지연 + 이슈) 많은 곳 → 가장 오래 밀린 곳 → 임박 많은 곳
+    def _by_trouble(r):
+        return (-(r["delayed"] + r["issue"]), -r["worst_days"], -r["soon"])
+    rows = sorted(by_project.values(), key=_by_trouble)
 
     # 타일별 내역. 홈의 '전체 현황' 타일을 누르면 그 종류가 어느 프로젝트에
     # 몇 건씩 있는지가 바로 아래 펼쳐진다. 전에는 타일(합계)과 목록(내역)이
@@ -23802,12 +15941,63 @@ def get_home_alerts(limit: int = 12, division: str = "semiconductor"):
             h["project_key"],
             {"key": h["project_key"], "label": h["project"], "count": 0})
         r["count"] += 1
-    by_kind = {k: sorted(v.values(), key=lambda r: (-r["count"], r["label"]))
-               for k, v in _by_kind.items()}
+    # 종류(지연 · 이슈 …)마다, 건수 많은 것부터 · 같으면 이름순
+    def _by_count_then_label(r):
+        return (-r["count"], r["label"])
+    by_kind = {}
+    for k, v in _by_kind.items():
+        by_kind[k] = sorted(v.values(), key=_by_count_then_label)
+    # -----------------------------------------------------------
+    # 사업부로 묶은 같은 내역
+    # -----------------------------------------------------------
+    # 프로젝트로 줄을 세우면 121곳이다
+    _div_label = {}
+    for _d in _cl.get_divisions(visible_only=False):
+        _div_label[str(_d.get("id") or "")] = str(_d.get("label") or _d.get("id") or "")
+    _by_div = {k: {} for k in _by_kind}
+    for k, v in _by_kind.items():
+        for r in v.values():
+            try:
+                did = _cl.derive_division_from_project(r["key"]) or ""
+            except Exception:
+                did = ""
+            if not did:
+                # 사업부를 못 찾은 프로젝트는 버리지 않는다. 숫자가
+                # 조용히 비면 합이 안 맞는 이유를 못 찾는다.
+                did, lab = "_etc", "기타"
+            else:
+                lab = _div_label.get(did, did)
+            row = _by_div[k].setdefault(did, {"key": did, "label": lab,
+                                              "count": 0, "projects": 0, "items": []})
+            row["count"] += r["count"]
+            row["projects"] += 1
+            # 사업부 줄을 누르면 펼쳐 볼 프로젝트 (어느 프로젝트에 몇 건인가)
+            row["items"].append(dict(r))
+    # -----------------------------------------------------------
+    # 프로젝트마다 걸린 모델 이름 몇 개 — 펼친 줄에 '모델 EFEM · CB 외 2' 로 보인다
+    # -----------------------------------------------------------
+    _names = {}
+    for a in alerts:
+        _names.setdefault((a["kind"], a["project_key"]), []).append(str(a.get("model") or ""))
+    for h in holds:
+        _names.setdefault(("보류", h["project_key"]), []).append(str(h.get("model") or ""))
+    # 같은 줄 세우기 — 사업부로 접은 목록 (펼친 프로젝트도 건수 많은 것부터)
+    by_kind_div = {}
+    for k, v in _by_div.items():
+        for row in v.values():
+            row["items"].sort(key=_by_count_then_label)
+            for it in row["items"]:
+                names = [x for x in _names.get((k, it["key"]), []) if x]
+                it["models"] = names[:3]
+                it["more"] = max(0, len(names) - 3)
+        by_kind_div[k] = sorted(v.values(), key=_by_count_then_label)
     # 문제(지연·이슈) 먼저, 그 안에서는 오래 밀린 것부터. 임박은 뒤로.
     _ORD = {"지연": 0, "이슈": 1}
-    alerts.sort(key=lambda a: (_ORD.get(a["kind"], 2),
-                               -(a["days"] if a["days"] is not None else -9999)))
+    def _by_kind_then_days(a):
+        kind_rank = _ORD.get(a["kind"], 2)          # 지연 0 · 이슈 1 · 나머지 2
+        days = a["days"] if a["days"] is not None else -9999
+        return (kind_rank, -days)                   # 오래 밀린 것(일수 큰 것)부터
+    alerts.sort(key=_by_kind_then_days)
     try:
         # 앱 목록 화면은 칩에 '임박 34' 라고 써 놓고 목록은 잘린 걸 보여준다.
         # 숫자와 목록이 어긋나면 그게 또 '연결성이 없다' 다. 넉넉히 준다.
@@ -23847,6 +16037,7 @@ def get_home_alerts(limit: int = 12, division: str = "semiconductor"):
         "projects_with_alert": len(hit_projects),
         "by_project": rows,
         "by_kind": by_kind,
+        "by_kind_div": by_kind_div,
         "alerts": alerts[:n],
         "alerts_total": len(alerts),
         "holds": holds[:n],
@@ -23856,78 +16047,330 @@ def get_home_alerts(limit: int = 12, division: str = "semiconductor"):
     }
 
 
+# ==== 캘린더에 띄울 일정 — 운영 자료에서 바로 모은다
+_CAL_CACHE: dict = {"key": None, "data": None}
+
+# ============================================================
+#  캘린더 — 일정 · 마감
+# ============================================================
+def _cal_date(v):
+    import re as _re
+    import datetime as _d
+    m = _re.search(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", str(v or ""))
+    if not m:
+        return None
+    try:
+        return _d.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None                          # 2026-06-31 같은 없는 날짜
+
+
+# weekly_plan['2026-11']['W46'] → 그 주 월요일.
+def _cal_week_monday(month_key: str, wk: str):
+    import datetime as _d
+    try:
+        y, mo = int(str(month_key)[:4]), int(str(month_key)[5:7])
+        n = int(str(wk).upper().lstrip("W"))
+    except (TypeError, ValueError):
+        return None
+    if mo == 12 and n == 1:
+        y += 1
+    elif mo == 1 and n >= 52:
+        y -= 1
+    try:
+        return _d.date.fromisocalendar(y, n, 1)
+    except ValueError:
+        return None
+
+
+# 단계 이름 → 캘린더 분류. 앱 필터(출하·입고·보고·승인·마일스톤)와 같은 말.
+def _cal_category(step: str) -> str:
+    t = str(step or "").upper()
+    if any(w in t for w in ("입고",)):
+        return "receiving"
+    if any(w in t for w in ("출하", "출고", "선적", "납품", "SOP")):
+        return "shipping"
+    if any(w in t for w in ("승인", "검토", "확정", "FAIR", "LAIR", "PPAP",
+                            "PRR", "TPM", "심사", "SR ")):
+        return "approval"
+    if any(w in t for w in ("보고", "리뷰", "회의")):
+        return "report"
+    return "milestone"
+
+
+# 운영 자료 → (날짜 있는 일정, 날짜 없는 지연·임박).
+def _calendar_events() -> tuple:
+    import datetime as _d
+    today = _d.date.today()
+    data = _load_models()
+    _key = (_MODELS_CACHE.get("key"), today.isoformat())
+    if _key[0] is not None and _CAL_CACHE.get("key") == _key:
+        return _CAL_CACHE["data"]
+
+    # 화면에 보이는 프로젝트만 — 꺼 둔 프로젝트(양식에서 빠진 것)는 뺀다
+    try:
+        _vis = {p.get("id"): p for p in _cl.get_projects(visible_only=True)}
+        _divl = {d.get("id"): d.get("label") for d in _cl.get_divisions(visible_only=False)}
+    except Exception:
+        _vis, _divl = {}, {}
+
+    out = []
+    undated = []
+    for pk, proj in (data.get("projects") or {}).items():
+        if _vis and pk not in _vis:
+            continue
+        models = [m for m in (proj.get("models") or []) if isinstance(m, dict)]
+        if not models:
+            continue
+        if _project_hold(proj):
+            continue
+        did = (_vis.get(pk) or {}).get("division_id") or ""
+        base = {"project_key": pk, "project": _display_project_label(pk),
+                "division_id": did, "division": _divl.get(did, did)}
+        # -----------------------------------------------------------
+        # 1) 개발 단계
+        # -----------------------------------------------------------
+        for m in models:
+            try:
+                e = _enrich_model(m, "", did)
+            except Exception:
+                continue
+            if e.get("hold"):
+                continue
+            proc = e.get("process") or []
+            cur = str(e.get("current_stage") or "")
+            alert = str(e.get("alert") or "")
+            name = e.get("name") or e.get("id") or ""
+            placed = False                   # 지연·임박을 날짜 칸에 놓았나
+            for i, st in enumerate(proc):
+                if not isinstance(st, dict):
+                    continue
+                step = str(st.get("name") or "").strip()
+                act = _cal_date(st.get("actual"))
+                exp = _cal_date(st.get("expected"))
+                if act:
+                    day, status = act, "done"
+                elif exp:
+                    day, status = exp, "planned"
+                    if step and step == cur:
+                        if alert == "지연":
+                            status = "late"
+                            placed = True
+                        elif alert == "주의":
+                            status = "soon"
+                            placed = True
+                else:
+                    continue
+                out.append(dict(base, **{
+                    "id": "step:%s:%s:%d" % (pk, e.get("id") or name, i),
+                    "date": day.isoformat(), "kind": "step",
+                    "category": _cal_category(step), "status": status,
+                    "title": "%s · %s" % (name, step) if step else name,
+                    "model": name, "step": step,
+                    "expected": exp.isoformat() if exp else "",
+                    "days": (today - exp).days if (status == "late" and exp) else None,
+                }))
+            if alert in ("지연", "주의") and not placed:
+                why = str(e.get("note") or e.get("issues") or "").strip()
+                undated.append(dict(base, **{
+                    "id": "undated:%s:%s" % (pk, e.get("id") or name),
+                    "kind": "undated", "category": "milestone",
+                    "status": "late" if alert == "지연" else "soon",
+                    "title": name + ((" · " + why.splitlines()[0][:40]) if why else ""),
+                    "model": name, "note": why,
+                }))
+        # -----------------------------------------------------------
+        # 2) 주차 계획 — 프로젝트 · 주차마다 한 줄로 묶는다.
+        # -----------------------------------------------------------
+        #    품목마다 한 줄이면 네트워크 한 주에 수십 줄이 서서 아무것도 안 보인다.
+        wk = {}
+        for m in models:
+            if _model_hold(m):
+                continue
+            for mon, weeks in (m.get("weekly_plan") or {}).items():
+                for w, c in (weeks or {}).items():
+                    plan = _as_int((c or {}).get("plan"))
+                    if plan <= 0:
+                        continue
+                    day = _cal_week_monday(mon, w)
+                    if not day:
+                        continue
+                    a = wk.setdefault((day, str(w).upper()), {"plan": 0, "actual": 0, "items": 0})
+                    a["plan"] += plan
+                    a["actual"] += _as_int((c or {}).get("actual"))
+                    a["items"] += 1
+        for (day, w), a in wk.items():
+            over = day + _d.timedelta(days=6) < today
+            out.append(dict(base, **{
+                "id": "ship:%s:%s:%s" % (pk, day.isoformat(), w),
+                "date": day.isoformat(), "kind": "ship_plan",
+                "category": "shipping",
+                # 지난 주는 '끝난 주' 로만 둔다. 미달을 여기서 따로 '지연' 으로
+                # 세면 홈 숫자와 또 갈린다 — 계획 · 실적 숫자를 그대로 보여 준다.
+                "status": "done" if over else "planned",
+                "title": "%s 출하 계획 %d대%s" % (
+                    w, a["plan"], (" · 실적 %d대" % a["actual"]) if (over or a["actual"]) else ""),
+                "week": w, "qty_plan": a["plan"], "qty_actual": a["actual"],
+                "items": a["items"],
+            }))
+
+    # 날짜 있는 일정: 날짜 → 사업부 → 프로젝트 → 제목 순
+    def _by_date(x):
+        return (x["date"], x["division"], x["project"], x["title"])
+    # 날짜 없는 일정: 지연인 것 먼저 (False 가 앞) → 사업부 → 프로젝트 → 제목
+    def _late_first(x):
+        return (x["status"] != "late", x["division"], x["project"], x["title"])
+    out.sort(key=_by_date)
+    undated.sort(key=_late_first)
+    _CAL_CACHE["key"] = _key
+    _CAL_CACHE["data"] = (out, undated)
+    return out, undated
+
+
+# 캘린더 일정. start · end(YYYY-MM-DD)로 자르고 division 으로 거른다 ← 앱 calendar_service.dart fetch()
+@app.get("/calendar/events")
+def get_calendar_events(start: str = "", end: str = "", division: str = ""):
+    ev, undated = _calendar_events()
+    s0 = str(start or "")[:10]
+    e0 = str(end or "")[:10]
+    dv = str(division or "").strip()
+    rows = [x for x in ev
+            if (not s0 or x["date"] >= s0) and (not e0 or x["date"] <= e0)
+            and (not dv or x["division_id"] == dv)]
+    und = [x for x in undated if not dv or x["division_id"] == dv]
+    cnt = {"step": 0, "ship_plan": 0, "late": 0, "soon": 0, "done": 0, "planned": 0}
+    for x in rows + und:
+        cnt[x["kind"]] = cnt.get(x["kind"], 0) + 1
+        cnt[x["status"]] = cnt.get(x["status"], 0) + 1
+    # late · soon 은 날짜 없는 것까지 더한 값이다 — 홈의 '일정 지연' 과 같아야 한다
+    return {"events": rows, "undated": und, "counts": cnt}
+
+# ============================================================
+#  모델 상세
+# ============================================================
+def _model_mix_note(models: list) -> str:
+    total = mass = dev = 0
+    for m in (models or []):
+        if not isinstance(m, dict):
+            continue
+        total += 1
+        if _display_group(m) == "개발":
+            dev += 1
+        else:
+            mass += 1
+    if not total:
+        return ""
+    return "총 %d종 중 양산 %d종, 개발 %d종" % (total, mass, dev)
+
+
+# 앱용 확장 모델 목록: dev_type, 자동 진행률, 현황(현재 단계), 완료예정일, status_note 포함
+# ← admin v2 _devProgRender() · loadStatusNote() 외
 @app.get("/projects/{project_key}/models/detail")
 def get_project_models_detail(project_key: str):
-    """앱용 확장 모델 목록: dev_type, 자동 진행률, 현황(현재 단계), 완료예정일, status_note 포함"""
     _key = _model_key_alias(project_key)
     data = _load_models()
     proj = data.get("projects", {}).get(_key, {})
     _phold = _project_hold(proj)
+    # 이 프로젝트가 어느 사업부인가 — 개발 품목을 어느 틀로 그릴지가 갈린다
+    # (아리스타는 양산 틀. _frame_group)
+    try:
+        _div = _cl.derive_division_from_project(_key) or ""
+    except Exception:
+        _div = ""
     changed = False
     enriched = []
     for m in proj.get("models", []):
         if not isinstance(m, dict):
             continue
+        # -----------------------------------------------------------
+        # 전에 깔린 반도체 13단계를 걷어낸다
+        # -----------------------------------------------------------
+        # _ensure_process 가 사업부를 안 보고 기본 13단계를 깔던 때 자료에 박힌 것들이다
+        if (_div and _div != "semiconductor"
+                and m.get("group") == "개발"
+                and _dev_steps_blank(m.get("process"))
+                and [str((x or {}).get("name") or "") for x in m["process"]]
+                    == [n for _k, n, _g in DEV_PROCESS_STEPS]):
+            m["process"] = []
+            changed = True
         if m.get("group") == "개발" and (not isinstance(m.get("process"), list) or len(m.get("process")) not in (12, 13, 14, 15)):
             changed = True
-        enriched.append(_inject_weekly_summary(_enrich_model(m, _phold)))
-    if changed:
-        _save_models(data)
+        enriched.append(_inject_weekly_summary(_enrich_model(m, _phold, _div)))
+    # -----------------------------------------------------------
+    # 읽기만 하는 길에서 저장하지 않는다
+    # -----------------------------------------------------------
+    # 여기는 GET 이다. 그런데 'changed' 가 서면 models.json 을 통째로 다시 쓰고, _save_models 는 쓰기 전에 백업 사본까지 한 장 뜬다
+    _ = changed
+    # 양산을 앞에, 개발을 뒤에 (같은 구분 안에서는 원래 순서 그대로)
     enriched.sort(key=lambda x: 0 if x.get("group") == "양산" else 1)
     return {
         "project_key": _key,
+        # 이 프로젝트에 주차 현황 보드를 띄울까. 앱이 키 목록을
+        # 들고 있던 것(_boardProjects)을 서버로 옮겼다 — 앱을 더 못 올린다.
+        # 바꾸려면 division_columns.UI 의 project_board_keys 한 줄.
+        "board": _dcol.board_on(_div, _key),
         "has_models": len(enriched) > 0,
         "total": len(enriched),
-        "status_note": proj.get("status_note") or "",
+        # 사람이 적던 현황 글 대신 모델 수를 센 한 줄.
+        "status_note": _model_mix_note(enriched),
+        "status_note_memo": proj.get("status_note") or "",
         "hold": _phold,
         "hold_reason": _project_hold_reason(proj) if _phold else "",
         "models": enriched,
     }
 
 
-# ─────────────────────────────────────────────────────────────
 # 모델 ID 에 '/' 가 들어가는 경우(예: 925-800083-711/-712) 경로 파라미터로는
 # 라우팅이 안 되므로(퍼센트 인코딩이 경로 매칭 전에 풀림), 쿼리 파라미터
 # 방식의 동일 기능 엔드포인트를 함께 제공한다.
-# ─────────────────────────────────────────────────────────────
 
+# ============================================================
+#  모델 주차 · 공정 (?model_id= 로)
+# ============================================================
+# 모델 하나의 주차별 계획·실적 (모델 id 를 ?model_id= 로).
+# ← admin v2 _wpLoadOne() · _sbEl.onclick() · loadModelWeeklyData()
 @app.get("/projects/{project_key}/model-weekly-plan")
 def get_model_weekly_plan_q(project_key: str, model_id: str, month: str = None):
-    return get_weekly_plan(project_key, model_id, month)
+    return get_model_weekly_plan(project_key, model_id, month)
 
 
+# 모델 하나의 주차별 계획·실적 고치기 (잠김) ← admin v2 _sbEl.onclick()
 @app.put("/admin/projects/{project_key}/model-weekly-plan")
 def put_model_weekly_plan_q(project_key: str, model_id: str, payload: dict,
                             _admin: int = Depends(get_admin_session)):
     return put_weekly_plan(project_key, model_id, payload, _admin)
 
 
+# 모델 하나의 개발 공정 (앱) ← admin v2 openProcessEditor() · renderProcessEditor() 외
 @app.get("/projects/{project_key}/model-process")
 def get_model_process_q(project_key: str, model_id: str):
     return get_model_process(project_key, model_id)
 
 
+# 모델 하나의 개발 공정 (admin) ← admin v2 openProcessEditor() · renderProcessEditor()
 @app.get("/admin/projects/{project_key}/model-process")
 def admin_get_model_process_q(project_key: str, model_id: str,
                               _admin: int = Depends(get_admin_session)):
     return admin_get_model_process(project_key, model_id, _admin)
 
 
+# 모델 하나의 개발 공정 고치기 (잠김) ← admin v2 openProcessEditor() · renderProcessEditor()
 @app.put("/admin/projects/{project_key}/model-process")
 def admin_put_model_process_q(project_key: str, model_id: str, payload: dict,
                               _admin: int = Depends(get_admin_session)):
     return admin_put_model_process(project_key, model_id, payload, _admin)
 
 
+# 공정 한 단계 상태 바꾸기 (잠김) ← admin v2 renderProcessEditor()
 @app.post("/admin/projects/{project_key}/model-process/step-status")
 def admin_set_process_step_status_q(project_key: str, model_id: str, payload: dict,
                                     _admin: int = Depends(get_admin_session)):
     return admin_set_process_step_status(project_key, model_id, payload, _admin)
 
 
+# 양산 모델 월별 주차별 계획/실적 조회 ← get_model_weekly_plan_q (admin v2 의 ?model_id= 길)
 @app.get("/projects/{project_key}/models/{model_id}/weekly-plan")
-def get_weekly_plan(project_key: str, model_id: str, month: str = None):
-    """양산 모델 월별 주차별 계획/실적 조회"""
+def get_model_weekly_plan(project_key: str, model_id: str, month: str = None):
     from urllib.parse import unquote
     import datetime as _dt
     model_id = unquote(model_id)
@@ -23957,7 +16400,9 @@ def get_weekly_plan(project_key: str, model_id: str, month: str = None):
             "progress": _ensure_mass_progress(target.get("weekly_plan") or {}, month)}
 
 
-# ═══════════════════════════════════════════════════════════════
+# ============================================================
+#  그룹(양산/개발) 단위 주차 합계 · PO
+# ============================================================
 # 그룹(양산/개발) 단위 주차 합계 · PO 관리
 #
 # 하바플레이트 개발은 종수가 많고 모델별 주차 계획을 따로 잡지 않는다.
@@ -23970,18 +16415,19 @@ def get_weekly_plan(project_key: str, model_id: str, month: str = None):
 #     weeks: { "W32": {plan, actual}, ... },
 #     po_history: [{date, from, to, note}]
 #   }
-# ═══════════════════════════════════════════════════════════════
 
+# 구분 글자 → '양산' 또는 '개발'.
 def _norm_group(g):
     return "개발" if str(g or "").strip() == "개발" else "양산"
 
 
+# 프로젝트의 주차 요약(weekly_summary)에서 양산/개발 묶음.
 def _group_bucket(proj, group):
     return (proj.get("weekly_summary") or {}).get(_norm_group(group)) or {}
 
 
+# 양산 주차 합계는 모델별 weekly_plan 이 정본.
 def _mass_week_totals(proj, month, weeks):
-    """양산 주차 합계는 모델별 weekly_plan 이 정본."""
     out = {w: {"plan": 0, "actual": 0} for w in weeks}
     for m in proj.get("models", []):
         bucket = (m.get("weekly_plan") or {}).get(month) or {}
@@ -23995,10 +16441,20 @@ def _mass_week_totals(proj, month, weeks):
     return out
 
 
+# 그 달에 '개발' 모델이 주차 숫자를 들고 있나.
+def _dev_models_have_weeks(proj, month) -> bool:
+    for m in proj.get("models", []):
+        if _norm_group(m.get("group")) != "개발":
+            continue
+        if (m.get("weekly_plan") or {}).get(month):
+            return True
+    return False
+
+
+# 개발 주차 합계.
 def _dev_week_totals(proj, month, weeks):
-    """개발 주차 합계. 그룹 총계가 있으면 그것, 없으면 모델 합산."""
     gw = (_group_bucket(proj, "개발").get("weeks") or {})
-    if gw:
+    if gw and not _dev_models_have_weeks(proj, month):
         return {w: {"plan": int((gw.get(w) or {}).get("plan") or 0),
                     "actual": int((gw.get(w) or {}).get("actual") or 0)} for w in weeks}
     out = {w: {"plan": 0, "actual": 0} for w in weeks}
@@ -24014,8 +16470,8 @@ def _dev_week_totals(proj, month, weeks):
     return out
 
 
+# 모델 목록에 직접 적은 PO 수량 / 실적 수량의 그룹 합계.
 def _model_qty_sums(proj, group):
-    """모델 목록에 직접 적은 PO 수량 / 실적 수량의 그룹 합계."""
     group = _norm_group(group)
     po = ship = 0
     for m in proj.get("models", []):
@@ -24026,12 +16482,25 @@ def _model_qty_sums(proj, group):
     return po, ship
 
 
+# 전 기간 주차 실적 합. 누적 실적 = base_actual + 이 값.
 def _all_actual_sum(proj, group):
-    """전 기간 주차 실적 합. 누적 실적 = base_actual + 이 값."""
     group = _norm_group(group)
     if group == "개발":
         gw = _group_bucket(proj, "개발").get("weeks") or {}
+        # 모델이 주차를 들고 있는 달이 하나라도 있으면 모델이 정본이다
+        # (_dev_week_totals 와 같은 규칙 — 두 곳이 다르면 합계가 어긋난다)
+        # 모델들이 주차 계획을 들고 있는 달 (그룹 주차가 비었으면 볼 필요 없다)
+        _model_months = set()
         if gw:
+            for _mdl in proj.get("models", []):
+                for _mo in (_mdl.get("weekly_plan") or {}):
+                    _model_months.add(_mo)
+        _bymodel = False
+        for _mon in _model_months:
+            if _dev_models_have_weeks(proj, _mon):
+                _bymodel = True
+                break
+        if gw and not _bymodel:
             return sum(int((v or {}).get("actual") or 0) for v in gw.values())
     total = 0
     for m in proj.get("models", []):
@@ -24044,9 +16513,9 @@ def _all_actual_sum(proj, group):
     return total
 
 
+# 그룹(개발) 주차 합계 조회. 모델별 조회와 같은 모양이라 화면을 그대로 재사용한다 ← admin v2 loadModelWeeklyData() · _sbEl.onclick()
 @app.get("/projects/{project_key}/group-weekly-plan")
 def get_group_weekly_plan(project_key: str, group: str = "개발", month: str = None):
-    """그룹(개발) 주차 합계 조회. 모델별 조회와 같은 모양이라 화면을 그대로 재사용한다."""
     import datetime as _dt
     _key = _model_key_alias(project_key)
     proj = (_load_models().get("projects") or {}).get(_key) or {}
@@ -24068,10 +16537,10 @@ def get_group_weekly_plan(project_key: str, group: str = "개발", month: str = 
             "progress": round(min(100.0, ta / tp * 100), 1) if tp > 0 else 0.0}
 
 
+# 그룹(개발) 주차 합계 저장 ← admin v2 _sbEl.onclick()
 @app.put("/admin/projects/{project_key}/group-weekly-plan")
 def put_group_weekly_plan(project_key: str, payload: dict, group: str = "개발",
                           month: str = None, _admin: int = Depends(get_admin_session)):
-    """그룹(개발) 주차 합계 저장."""
     import datetime as _dt
     _key = _model_key_alias(project_key)
     data = _load_models()
@@ -24092,9 +16561,9 @@ def put_group_weekly_plan(project_key: str, payload: dict, group: str = "개발"
             "progress": round(min(100.0, ta / tp * 100), 1) if tp > 0 else 0.0}
 
 
+# PO 수량 / 기초 누적 실적 / 종수 / 다음달 계획 (그룹별) ← admin v2 openBoardEditor() · onclick()
 @app.get("/projects/{project_key}/group-summary")
 def get_group_summary(project_key: str, month: str = None):
-    """PO 수량 / 기초 누적 실적 / 종수 / 다음달 계획 (그룹별)."""
     _key = _model_key_alias(project_key)
     proj = (_load_models().get("projects") or {}).get(_key) or {}
     out = {}
@@ -24116,10 +16585,10 @@ def get_group_summary(project_key: str, month: str = None):
             "po_delta_manual": _project_manual_deltas(proj, month)}
 
 
+# PO 수량 등 저장. PO 수량이 바뀌면 증감 이력을 자동으로 남긴다 ← admin v2 onclick()
 @app.put("/admin/projects/{project_key}/group-summary")
 def put_group_summary(project_key: str, payload: dict,
                       _admin: int = Depends(get_admin_session)):
-    """PO 수량 등 저장. PO 수량이 바뀌면 증감 이력을 자동으로 남긴다."""
     import datetime as _dt
     _key = _model_key_alias(project_key)
     data = _load_models()
@@ -24171,9 +16640,10 @@ def put_group_summary(project_key: str, payload: dict,
     _save_models(data)
     return {"ok": True, "project_key": _key, "changed": changed}
 
-
+# ============================================================
+#  현황 엑셀
+# ============================================================
 def _enrich_from_status(project_key: str, wb) -> dict:
-    """현황 표(1번 섹션)에서 PO증감 이력·진행중/완료 종수·그룹 누적 출하를 채운다."""
     import hrva_status_import as _hs
     sheets = _hs.parse_workbook(wb)
     if not sheets:
@@ -24219,25 +16689,20 @@ def _enrich_from_status(project_key: str, wb) -> dict:
             "ongoing_types": st.get("ongoing_types"), "done_types": st.get("done_types")}
 
 
+# 하바플레이트 주간 현황 엑셀(W6~W35 시트)을 읽어 PO 수량·출하수량을 맞춘다 ← admin v2 _pfStatusImport()
 @app.post("/admin/projects/{project_key}/status-excel")
 async def admin_import_status_excel(project_key: str,
                                     file: UploadFile = File(...),
                                     all_sheets: str = Form("1"),
                                     _admin: int = Depends(get_admin_session)):
-    """하바플레이트 주간 현황 엑셀(W6~W35 시트)을 읽어 PO 수량·출하수량을 맞춘다.
-
-    - 섹션 2~5 (모델별 표)  → 모델의 판가·PO 수량·출하수량·개발종류
-    - 섹션 1 (현황)         → 그룹 PO 수량·누적 출하·진행중/완료 종수
-    - 각 시트의 '변동' 열   → PO증감 이력 (주차별)
-    기존 모델은 그대로 두고, 엑셀에만 있는 모델은 새로 만든다.
-    """
+    _form_only("status-excel")
     import io as _io, openpyxl as _xl
     import hrva_status_import as _hs
 
     _key = _model_key_alias(project_key)
     raw = await _keep_upload(file, "/admin/projects/{project_key}/status-excel", project_key)
     try:
-        wb = _xl.load_workbook(_io.BytesIO(raw), data_only=True)
+        wb = _xl.load_workbook(_io.BytesIO(raw), data_only=True, keep_links=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"엑셀을 열 수 없습니다: {e}")
 
@@ -24249,8 +16714,9 @@ async def admin_import_status_excel(project_key: str,
     data = _load_models()
     proj = data.setdefault("projects", {}).setdefault(_key, {"models": []})
     ws_all = proj.setdefault("weekly_summary", {})
-
-    # ── PO증감 이력: 각 시트의 '변동' 을 그 주 월요일 날짜로 기록 ──
+    # -----------------------------------------------------------
+    # PO증감 이력: 각 시트의 '변동' 을 그 주 월요일 날짜로 기록
+    # -----------------------------------------------------------
     hist_weeks = []
     if use_all:
         for g in ("양산", "개발"):
@@ -24270,8 +16736,9 @@ async def admin_import_status_excel(project_key: str,
                 wrote = True
             if wrote:
                 hist_weeks.append(name)
-
-    # ── 마지막(최신) 시트로 현재 상태를 맞춘다 ──
+    # -----------------------------------------------------------
+    # 마지막(최신) 시트로 현재 상태를 맞춘다
+    # -----------------------------------------------------------
     last_w, last_name, last = sheets[-1]
     st = last.get("status") or {}
     for g in ("양산", "개발"):
@@ -24321,11 +16788,7 @@ async def admin_import_status_excel(project_key: str,
             tgt["dev_type"] = str(row["dev_type"]).upper()
         updated += 1
 
-    # 같은 파일 맨 아래의 주차표(파트번호 x 주차 계획·실적)도 같이 넣는다.
-    #
-    # 하바는 통일 양식으로 옮겨 가는 중이지만, 옮기는 동안 주차 숫자가
-    # 어디에도 안 들어가는 구간을 만들면 안 된다. 이 표는 이미 파일에
-    # 있고 모양도 우리가 읽는 그대로다 — 안 읽고 있었을 뿐이다.
+    # 같은 파일 맨 아래의 주차표(파트번호 x 주차 계획·실적)도 같이 넣는다
     _weeks_in_file = _pbx_apply_sheet_months(proj, wb[last_name]) \
         if last_name in wb.sheetnames else []
 
@@ -24345,9 +16808,10 @@ async def admin_import_status_excel(project_key: str,
         "status": st,
     }
 
-
+# ============================================================
+#  보드 줄 · 수량
+# ============================================================
 def _load_board_spec(project_key):
-    """config/boards.json 의 행 구성. 없으면 None → 예전 양산/개발 2줄 방식."""
     import json as _json
     from pathlib import Path as _Path
     try:
@@ -24359,18 +16823,8 @@ def _load_board_spec(project_key):
         return None
 
 
+# 보드 안에서 이미 품번으로 지목된 모델들.
 def _spec_claimed_models(spec) -> set:
-    """보드 안에서 이미 품번으로 지목된 모델들.
-
-    유형·구분으로 쓸어담는 행(Dep 챔버 15종, 양산19종 …)은 자기 조건에만
-    맞으면 다 가져가므로, 다른 행이 품번으로 콕 집어둔 모델까지 같이 가져가
-    두 행에 겹쳐 잡히고 PO·실적이 두 번 세어진다. 챔버에서 205(개발, 자기 행이
-    있음)의 dev_type 이 DEP챔버 라서 Dep 행에도 들어가 '15종'인데 16개가
-    잡히던 게 그 경우다.
-
-    그래서 품번으로 지목된 모델은 쓸어담기 행에서 자동으로 뺀다.
-    (boards.json 에 손으로 적어둔 exclude 는 그대로 둬도 결과가 같다.)
-    """
     out = set()
     for sec in (spec.get("sections") or []):
         for row in (sec.get("rows") or []):
@@ -24380,14 +16834,8 @@ def _spec_claimed_models(spec) -> set:
     return out
 
 
+# 행이 가리키는 모델 목록.
 def _board_row_models(proj, row, claimed=None):
-    """행이 가리키는 모델 목록.
-
-    models    품번 지정
-    dev_type  그 유형 전체
-    exclude   유형으로 묶되 그중 뺄 품번 (009 직납 = 009 유형 − 자빌)
-    claimed   다른 행이 품번으로 지목한 모델 (쓸어담기 행에서 자동 제외)
-    """
     ids = [str(x).strip() for x in (row.get("models") or []) if str(x).strip()]
     dt = str(row.get("dev_type") or "").strip().upper()
     grp = _norm_group(row.get("group")) if row.get("group") else None
@@ -24421,13 +16869,8 @@ def _board_row_models(proj, row, claimed=None):
     return out
 
 
+# 기준 주차 '다음' 주차부터의 실적 합.
 def _row_actual_after(models, base_week):
-    """기준 주차 '다음' 주차부터의 실적 합.
-
-    담당자는 '지금 37주차니까 36주차까지의 누적'을 기준 실적으로 적는다.
-    그 뒤로 나가는 실적은 주차 계획에 입력되므로 여기서 더한다.
-    기준 주차를 안 적었으면 주차 실적을 더하지 않는다(누적값만 씀).
-    """
     if not base_week:
         return 0
     try:
@@ -24446,8 +16889,8 @@ def _row_actual_after(models, base_week):
     return total
 
 
+# 그 달 주차별 계획/실적 합계.
 def _board_week_qty(models, month, weeks):
-    """그 달 주차별 계획/실적 합계."""
     out = {w: {"plan": 0, "actual": 0} for w in weeks}
     for m in models:
         bucket = (m.get("weekly_plan") or {}).get(month) or {}
@@ -24458,14 +16901,8 @@ def _board_week_qty(models, month, weeks):
     return out
 
 
+# '현황' 칸.
 def _board_row_status(models, spec_status, manual_status=None):
-    """'현황' 칸.
-
-    보드에서 직접 넣은 값 > boards.json 에 적힌 값 > 모델로 자동 판정 순.
-    자동만으로는 틀리는 경우가 있다. 205 는 FAIR 승인이 끝나 진행률이 100%
-    라서 자동으로는 '완료'가 되지만 실제로는 아직 개발 건이고, 내재화처럼
-    모델이 아직 등록 안 된 행은 근거가 없어 빈칸이 된다.
-    """
     if manual_status and str(manual_status).strip():
         return str(manual_status).strip()
     if spec_status and str(spec_status).strip():
@@ -24483,12 +16920,10 @@ def _board_row_status(models, spec_status, manual_status=None):
 _NOTE_ROLLUP_MIN = 3        # 메모가 붙은 모델이 이 개수 이상이면 나열 대신 묶는다
 _BOARD_NOTE_CACHE_PATH = _Path_hl(__file__).parent / "board_note_cache.json"
 
-
+# ============================================================
+#  보드 메모 · AI 메모
+# ============================================================
 def _note_groups(models):
-    """행에 묶인 모델들의 메모를 같은 문구끼리 묶는다.
-
-    [(문구, 종수)] 를 많은 순으로 돌려준다. 줄바꿈은 한 칸 띄어쓰기로 편다.
-    """
     acc, order = {}, []
     for m in (models or []):
         if not isinstance(m, dict):
@@ -24503,28 +16938,20 @@ def _note_groups(models):
     return sorted(((t, acc[t]) for t in order), key=lambda kv: -kv[1])
 
 
+# AI 없이 묶는 기본형: '카이저 원소재 11월말 입고 예정 10종 · 1EA 황삭 완료 1종'.
 def _note_rollup_text(groups):
-    """AI 없이 묶는 기본형: '카이저 원소재 11월말 입고 예정 10종 · 1EA 황삭 완료 1종'."""
     return " · ".join(f"{t} {c}종" for t, c in groups)
 
 
+# 요약문의 'N종' 합이 실제 종수와 같은지.
 def _note_total_ok(text, total):
-    """요약문의 'N종' 합이 실제 종수와 같은지.
-
-    AI 가 종수를 지어내면 보드 숫자와 어긋나므로, 안 맞으면 요약을 버린다.
-    """
     import re as _re
     nums = [int(x) for x in _re.findall(r"(\d+)\s*종", text or "")]
     return bool(nums) and sum(nums) == total
 
 
+# 묶음 행(Dep 챔버 15종 등)의 메모를 상태별 종수로 요약한다
 def _ai_board_note(groups):
-    """묶음 행(Dep 챔버 15종 등)의 메모를 상태별 종수로 요약한다.
-
-    모델이 열몇 개씩 묶인 행은 메모를 그대로 이으면 읽을 수가 없다.
-    '원소재 입고 대기 10종 · 조립 완료 3종' 처럼 상태별로 접어서 보여준다.
-    같은 입력이면 캐시를 쓰고, 키가 없거나 실패하면 _note_rollup_text 로 떨어진다.
-    """
     if not groups:
         return ""
     total = sum(c for _, c in groups)
@@ -24583,18 +17010,8 @@ def _ai_board_note(groups):
     return result
 
 
+# '비고' 칸.
 def _board_row_note(models, spec_note, manual_note=None, summarize=None):
-    """'비고' 칸.
-
-    보드에서 직접 넣은 값 > boards.json 에 적힌 값 > 모델에 적어둔 메모 순.
-    모델 목록의 '그 외 특이사항 · 메모'(m['note'])를 적어놓고 보드에는 안 뜬다는
-    얘기가 나와서 마지막 단계를 붙였다. '문제 · 리스크'(m['issues'])는 따로
-    이슈 화면에서 쓰는 값이라 여기로 끌어오지 않는다.
-
-    메모가 붙은 모델이 _NOTE_ROLLUP_MIN 개 이상인 묶음 행은 그대로 이으면
-    읽을 수가 없어서 상태별 종수로 접는다(summarize, 보통 _ai_board_note).
-    그보다 적으면 지금처럼 나열하고, 모델이 여럿이면 모델명을 앞에 붙인다.
-    """
     if manual_note and str(manual_note).strip():
         return str(manual_note).strip()
     if spec_note and str(spec_note).strip():
@@ -24628,8 +17045,8 @@ def _board_row_note(models, spec_note, manual_note=None, summarize=None):
     return "\n".join(lines)
 
 
+# 그 달 계획/실적 합계. 모델별 weekly_plan 을 월 소유 규칙대로 더한다
 def _board_month_qty(models, mon):
-    """그 달 계획/실적 합계. 모델별 weekly_plan 을 월 소유 규칙대로 더한다."""
     weeks = _get_month_weeks(mon)
     plan = actual = 0
     for m in models:
@@ -24641,8 +17058,8 @@ def _board_month_qty(models, mon):
     return {"plan": plan, "actual": actual}
 
 
+# 오늘 달을 마지막으로 하는 월 목록.
 def _board_months(month, span):
-    """오늘 달을 마지막으로 하는 월 목록. span=2 → ['2026-08','2026-09']."""
     y, m = int(str(month)[:4]), int(str(month)[5:7])
     out = []
     for off in range(span - 1, -1, -1):
@@ -24653,27 +17070,25 @@ def _board_months(month, span):
     return out
 
 
+# 직접 입력 칸이 '채워져 있는가'.
 def _has(d, k):
-    """직접 입력 칸이 '채워져 있는가'. 0 은 유효한 값이므로 None/빈문자만 비었다고 본다."""
     if not isinstance(d, dict):
         return False
     v = d.get(k)
     return v is not None and str(v).strip() != ""
 
-
+# ============================================================
+#  섹션 표 (_spec_board)
+# ============================================================
 def _spec_section_rows(proj, sec):
-    """섹션의 행 목록.
-
-    rows_from: "models" 면 등록된 모델 하나가 행 하나가 된다. 큐리처럼
-    엑셀이 '모델명 x 주차' 한 장으로 오는 곳은 행을 설정에 미리 적어둘 수가
-    없다 — 모델이 늘면 보드도 같이 늘어야 한다.
-
-    보이는 순서는 모델 목록 순서 그대로. 담당자가 엑셀에 적은 순서다.
-    """
     rows = list(sec.get("rows") or [])
     if str(sec.get("rows_from") or "").strip() != "models":
         return rows
-    seen = {str(x).strip() for r in rows for x in (r.get("models") or [])}
+    # 이미 줄에 적힌 모델 이름 전부
+    seen = set()
+    for _row in rows:
+        for _name in (_row.get("models") or []):
+            seen.add(str(_name).strip())
     out = list(rows)
     for m in (proj.get("models") or []):
         if not isinstance(m, dict):
@@ -24690,17 +17105,59 @@ def _spec_section_rows(proj, sec):
         out.append({"key": f"m_{mid}", "label": label, "models": [mid]})
     return out
 
-def _spec_board(project_key, proj, spec, month):
-    """boards.json 스펙대로 그린 보드 (섹션 + 행)."""
-    col_mode = spec.get("columns") or "month"
-    weeks = _get_month_weeks(month) if col_mode == "week" else []
-    y, mm = int(str(month)[:4]), int(str(month)[5:7])
-    prev_month = f"{y - 1}-12" if mm == 1 else f"{y}-{mm - 1:02d}"
-    next_month = f"{y + 1}-01" if mm == 12 else f"{y}-{mm + 1:02d}"
-    want_next = bool(spec.get("next_month"))
+# 사람이 직접 적은 값이 있으면 그것, 없으면 계산한 값.
+def _pick_manual(store, field, calculated):
+    if _has(store, field):
+        return _as_int(store[field])
+    return calculated
 
+
+# 여러 줄의 {bucket}[{key}] 안에 있는 계획·실적을 각각 더한다
+def _sum_pair(rows, bucket, key) -> dict:
+    plan_sum = 0
+    actual_sum = 0
+    for r in rows:
+        cell = (r.get(bucket) or {}).get(key) or {}
+        plan_sum += (cell.get("plan") or 0)
+        actual_sum += (cell.get("actual") or 0)
+    return {"plan": plan_sum, "actual": actual_sum}
+
+
+# boards.json 스펙대로 그린 보드 (섹션 + 행).
+def _spec_board(project_key, proj, spec, month):
+    # -----------------------------------------------------------
+    # 1. 열을 무엇으로 세울 것인가
+    # -----------------------------------------------------------
+    #    'week'  — 주차별(하바플레이트처럼 주 단위로 보는 프로젝트)
+    #    'month' — 달별(챔버처럼 달 단위로 보는 프로젝트)
+    #    둘은 열 구성이 아예 달라서 아래에서 길이 갈린다.
+    col_mode = spec.get("columns") or "month"
+    if col_mode == "week":
+        weeks = _get_month_weeks(month)
+    else:
+        weeks = []
+    # -----------------------------------------------------------
+    # 2. 앞뒤 달 (1월의 지난달은 작년 12월, 12월의 다음달은 내년 1월)
+    # -----------------------------------------------------------
+    y = int(str(month)[:4])
+    mm = int(str(month)[5:7])
+    if mm == 1:
+        prev_month = f"{y - 1}-12"
+    else:
+        prev_month = f"{y}-{mm - 1:02d}"
+    if mm == 12:
+        next_month = f"{y + 1}-01"
+    else:
+        next_month = f"{y}-{mm + 1:02d}"
+    want_next = bool(spec.get("next_month"))   # 다음달 열을 그릴지
+    # -----------------------------------------------------------
+    # 3. 달별 보드일 때 몇 달치를 보여줄지 (기본 2달)
+    # -----------------------------------------------------------
     span = int(spec.get("month_span") or 2)
-    months = [] if col_mode == "week" else _board_months(month, span)
+    if col_mode == "week":
+        months = []
+    else:
+        months = _board_months(month, span)
     manual_store = (proj.get("board_manual") or {})
     # 섹션 이름 밑에 적는 재고. 설정에 기본값을 두고, 프로젝트에 적어 둔 게
     # 있으면 그게 이긴다 — 재고는 주마다 바뀌므로 설정 파일에 묶어 두면 안 된다.
@@ -24715,13 +17172,23 @@ def _spec_board(project_key, proj, spec, month):
             key = str(row.get("key") or row.get("label") or "")
             man = manual_store.get(key) or {}
             # 행마다 직접 입력이 있으면 그 값이 정본, 없으면 모델 합계.
-            # 단일 모델 행은 모델 목록에서 넣는 게 낫고(진행률도 같이 잡힌다),
-            # '4종'·'Dep 15종' 같은 묶음 행은 보드에서 바로 넣는 게 편하다.
-            models = ([] if row.get("manual")
-                      else _board_row_models(proj, row, claimed))
-            po_m = sum(_as_int(m.get("po_qty")) for m in models)
-            act_m = sum(_as_int(m.get("shipped_qty")) for m in models)
-            po = _as_int(man["po_qty"]) if _has(man, "po_qty") else po_m
+            if row.get("manual"):
+                models = []
+            else:
+                models = _board_row_models(proj, row, claimed)
+
+            # 모델들에서 더한 값 (직접 적은 값이 없을 때 쓰는 기본값)
+            po_m = 0
+            act_m = 0
+            for m in models:
+                po_m += _as_int(m.get("po_qty"))
+                act_m += _as_int(m.get("shipped_qty"))
+
+            # 직접 적어 둔 값이 있으면 그게 이긴다
+            if _has(man, "po_qty"):
+                po = _as_int(man["po_qty"])
+            else:
+                po = po_m
             # 실적: 기준 누적(base_actual) + 기준 주차 이후 주차 실적.
             # 기준값을 안 적었으면 모델의 '실적 수량' 합계를 쓴다.
             if _has(man, "base_actual"):
@@ -24731,36 +17198,60 @@ def _spec_board(project_key, proj, spec, month):
                 act = _as_int(man["actual_total"])
             else:
                 act = act_m
-
+            # -----------------------------------------------------------
+            # 달별 칸 채우기
+            # -----------------------------------------------------------
+            #    칸마다 규칙이 같다: 직접 적은 값이 있으면 그것, 없으면
+            #    모델에서 계산한 값.
             mq = {}
             man_mon = man.get("months") or {}
             for mon in months:
-                calc = _board_month_qty(models, mon) if models else {"plan": 0, "actual": 0}
+                if models:
+                    calc = _board_month_qty(models, mon)
+                else:
+                    calc = {"plan": 0, "actual": 0}
                 mv = man_mon.get(mon) or {}
                 mq[mon] = {
-                    "plan": _as_int(mv["plan"]) if _has(mv, "plan") else calc["plan"],
-                    "actual": _as_int(mv["actual"]) if _has(mv, "actual") else calc["actual"],
+                    "plan": _pick_manual(mv, "plan", calc["plan"]),
+                    "actual": _pick_manual(mv, "actual", calc["actual"]),
                 }
+            # -----------------------------------------------------------
+            # 주차별 칸 채우기 (주차형 보드에서만)
+            # -----------------------------------------------------------
+            wq = {}
+            prev_act = 0
+            mon_plan = 0
+            mon_act = 0
+            next_plan = 0
 
-            wq, prev_act, mon_plan, mon_act, next_plan = {}, 0, 0, 0, 0
             if col_mode == "week":
                 calc_w = _board_week_qty(models, month, weeks)
                 man_w = man.get("weeks") or {}
                 for w in weeks:
                     mv = man_w.get(w) or {}
                     wq[w] = {
-                        "plan": _as_int(mv["plan"]) if _has(mv, "plan") else calc_w[w]["plan"],
-                        "actual": _as_int(mv["actual"]) if _has(mv, "actual") else calc_w[w]["actual"],
+                        "plan": _pick_manual(mv, "plan", calc_w[w]["plan"]),
+                        "actual": _pick_manual(mv, "actual", calc_w[w]["actual"]),
                     }
-                mon_plan = sum(v["plan"] for v in wq.values())
-                mon_act = sum(v["actual"] for v in wq.values())
-                pc = _board_month_qty(models, prev_month) if models else {"plan": 0, "actual": 0}
-                prev_act = (_as_int(man["prev_month_actual"])
-                            if _has(man, "prev_month_actual") else pc["actual"])
+
+                # 이번 달 합계 = 주차 칸을 다 더한 것
+                mon_plan = _sum_of(wq.values(), "plan")
+                mon_act = _sum_of(wq.values(), "actual")
+
+                # 지난달 실적
+                if models:
+                    pc = _board_month_qty(models, prev_month)
+                else:
+                    pc = {"plan": 0, "actual": 0}
+                prev_act = _pick_manual(man, "prev_month_actual", pc["actual"])
+
+                # 다음달 계획 (스펙이 그 열을 쓰겠다고 했을 때만)
                 if want_next:
-                    nc = _board_month_qty(models, next_month) if models else {"plan": 0}
-                    next_plan = (_as_int(man["next_month_plan"])
-                                 if _has(man, "next_month_plan") else nc["plan"])
+                    if models:
+                        nc = _board_month_qty(models, next_month)
+                    else:
+                        nc = {"plan": 0}
+                    next_plan = _pick_manual(man, "next_month_plan", nc["plan"])
             r = {
                 "key": key,
                 "label": row.get("label") or key,
@@ -24776,7 +17267,8 @@ def _spec_board(project_key, proj, spec, month):
                 "month_plan": mon_plan,
                 "month_actual": mon_act,
                 "next_month_plan": next_plan,
-                "base_actual": _as_int(man.get("base_actual")) if _has(man, "base_actual") else None,
+                "base_actual": (_as_int(man.get("base_actual"))
+                                if _has(man, "base_actual") else None),
                 "base_week": str(man.get("base_week") or ""),
                 "note": _board_row_note(models, row.get("note"), man.get("note"),
                                         summarize=_ai_board_note),
@@ -24786,32 +17278,50 @@ def _spec_board(project_key, proj, spec, month):
             }
             srows.append(r)
             flat.append(r)
+        # -----------------------------------------------------------
+        # 섹션 묶기
+        # -----------------------------------------------------------
+        #    재고는 프로젝트에 적어 둔 값이 먼저다. 설정 파일(boards.json)의
+        #    값은 기본값일 뿐이다 — 재고는 주마다 바뀌어서 설정에 묶어 두면
+        #    고칠 때마다 배포해야 한다.
         _sname = sec.get("name") or ""
         _stock = stock_store.get(_sname, sec.get("stock"))
-        sections.append({"name": _sname, "rows": srows,
-                         "stock": _as_int(_stock) if _stock not in (None, "") else None})
+        if _stock in (None, ""):
+            stock_val = None
+        else:
+            stock_val = _as_int(_stock)
+        sections.append({"name": _sname, "rows": srows, "stock": stock_val})
+    # -----------------------------------------------------------
+    # 합계 줄 (섹션을 가리지 않고 모든 줄을 더한다)
+    # -----------------------------------------------------------
+    total = {"label": "합계"}
+    for field in ("po_qty", "actual_total", "remaining", "prev_month_actual",
+                  "month_plan", "month_actual", "next_month_plan"):
+        total[field] = _sum_of(flat, field)
 
-    total = {
-        "label": "합계",
-        "po_qty": sum(r["po_qty"] for r in flat),
-        "actual_total": sum(r["actual_total"] for r in flat),
-        "remaining": sum(r["remaining"] for r in flat),
-        "months": {mon: {"plan": sum(r["months"][mon]["plan"] for r in flat),
-                         "actual": sum(r["months"][mon]["actual"] for r in flat)}
-                   for mon in months},
-        "weeks": {w: {"plan": sum(r["weeks"][w]["plan"] for r in flat),
-                      "actual": sum(r["weeks"][w]["actual"] for r in flat)}
-                  for w in weeks},
-        "prev_month_actual": sum(r["prev_month_actual"] for r in flat),
-        "month_plan": sum(r["month_plan"] for r in flat),
-        "month_actual": sum(r["month_actual"] for r in flat),
-        "next_month_plan": sum(r["next_month_plan"] for r in flat),
-    }
+    # 달별 칸 합계
+    total_months = {}
+    for mon in months:
+        total_months[mon] = _sum_pair(flat, "months", mon)
+    total["months"] = total_months
+
+    # 주차별 칸 합계
+    total_weeks = {}
+    for w in weeks:
+        total_weeks[w] = _sum_pair(flat, "weeks", w)
+    total["weeks"] = total_weeks
     import datetime as _dt
     _reasons = _week_reasons_of(proj, month)
-    # 월 단위 보드(챔버)는 주차 미달이라는 게 없다 — 주차형만 본다.
-    _closed, _shorts = ([], []) if col_mode != "week" else \
-        _mark_board_shortfalls(flat, total, weeks, month, _reasons)
+    # -----------------------------------------------------------
+    # 계획 미달 표시
+    # -----------------------------------------------------------
+    #    달 단위 보드(챔버)에는 '주차 미달'이라는 개념이 없다.
+    #    주차형 보드에서만 계산한다.
+    if col_mode == "week":
+        _closed, _shorts = _mark_board_shortfalls(
+            flat, total, weeks, month, _reasons)
+    else:
+        _closed, _shorts = [], []
     return {"project_key": project_key, "month": month, "layout": "sections",
             "closed_weeks": _closed, "shortfalls": _shorts,
             "week_reasons": _reasons if col_mode == "week" else {},
@@ -24826,18 +17336,13 @@ def _spec_board(project_key, proj, spec, month):
             "current_month": _dt.date.today().strftime("%Y-%m"),
             "sections": sections, "rows": flat, "total": total}
 
-
+# ============================================================
+#  미달 사유 · 보드 줄 저장 주소
+# ============================================================
+# 주차 미달 사유를 적는다 ← admin v2 saveWeekReason()
 @app.put("/admin/projects/{project_key}/week-reason")
 def admin_put_week_reason(project_key: str, payload: dict,
                           _admin: int = Depends(get_admin_session)):
-    """주차 미달 사유를 적는다.
-
-    body: {month, week, kind: '문제'|'참고', text}
-    text 가 비면 그 주의 사유를 지운다 (미입력으로 되돌린다).
-
-    2026-10-22 — 막혀 있다. 같은 자리를 엑셀의 '미달 사유' 줄도 쓴다.
-    두 군데서 적으면 올릴 때마다 서로 덮어쓴다. 엑셀 하나로 모았다.
-    """
     _write_off("week-reason")
     import datetime as _dt, re as _re
     _key = _model_key_alias(project_key)
@@ -24877,9 +17382,9 @@ def admin_put_week_reason(project_key: str, payload: dict,
             "reasons": _week_reasons_of(proj, month)}
 
 
+# 보드 행별 직접 입력값 (PO수량·실적·월·비고) ← admin v2 _wbOpenRowEditor() · onclick()
 @app.get("/projects/{project_key}/board-rows")
 def get_board_rows(project_key: str):
-    """보드 행별 직접 입력값 (PO수량·실적·월·비고)."""
     _key = _model_key_alias(project_key)
     proj = (_load_models().get("projects") or {}).get(_key) or {}
     spec = _load_board_spec(_key)
@@ -24890,14 +17395,10 @@ def get_board_rows(project_key: str):
             "stock": proj.get("board_stock") or {}}
 
 
+# 보드 행별 직접 입력값 저장 ← admin v2 onclick()
 @app.put("/admin/projects/{project_key}/board-rows")
 def put_board_rows(project_key: str, payload: dict,
                    _admin: int = Depends(get_admin_session)):
-    """보드 행별 직접 입력값 저장.
-
-    빈 문자열로 보내면 그 칸은 '직접 입력 없음'이 되어 모델 합계로 돌아간다.
-    (0 은 유효한 값이라 지우기와 구분해야 한다)
-    """
     _key = _model_key_alias(project_key)
     data = _load_models()
     proj = data.setdefault("projects", {}).setdefault(_key, {"models": []})
@@ -24955,33 +17456,22 @@ def put_board_rows(project_key: str, payload: dict,
     return {"ok": True, "project_key": _key, "rows": len(store)}
 
 
-# ── 블룸 일 보드 ──────────────────────────────────────────────────────
-#
-# 반도체와 코드를 공유하지 않는다. 반도체는 '주차 x 모델' 한 겹인데
-# 블룸은 '날짜 x 품목 x 공정(NCT/조립/출하)' 세 겹이고 매일 실적이 들어온다.
-# 하나로 묶으면 양쪽 다 망가진다.
-#
-# 저장 위치: projects.<key>.daily_board
-#   {title, report_date, prior_label, sheet, dates:[...], notes:[...],
-#    items:[{item, code, wait_ship, wait_part,
-#            steps:[{step, group, wip, month_plan, month_actual,
-#                    prior_plan, prior_actual, note,
-#                    days:{'YYYY-MM-DD': {plan, actual}}}]}]}
-#
-# 같은 달 파일을 매일 올린다. 그래서 통째로 덮지 않고 날짜 단위로 합친다.
-# 새 파일에 없는 날짜·품목·공정은 지우지 않고 그대로 둔다 — 파일이 한 번
-# 잘못 와도 그 전에 쌓인 게 날아가면 안 된다.
+# ============================================================
+#  블룸 일 보드
+# ============================================================
+# 반도체와 코드를 공유하지 않는다. 반도체는 '주차 x 모델' 한 겹인데 블룸은 '날짜 x 품목 x 공정(NCT/조립/출하)' 세 겹이고 매일 실적이 들어온다
 
 _BLOOM_DIFF_CAP = 60
 
-
+# ============================================================
+#  블룸 보드 합치기 · 접기
+# ============================================================
 def _bloom_pick(new_v, old_v):
-    """새 값이 비어 있으면 옛 값을 지킨다. 0 은 유효한 값이다."""
     return old_v if new_v is None or new_v == "" else new_v
 
 
+# 품목·공정에서 숫자가 적힌 마지막 날 — 둘 중 어느 쪽이 새 것인지 가른다
 def _bloom_last_day(x) -> str:
-    """품목·공정에서 숫자가 적힌 마지막 날 — 둘 중 어느 쪽이 새 것인지 가른다."""
     steps = x.get("steps") if isinstance(x, dict) and "steps" in x else [x]
     last = ""
     for st in steps or []:
@@ -24991,9 +17481,8 @@ def _bloom_last_day(x) -> str:
     return last
 
 
+# 같은 공정이 이름만 달리 두 번 있으면 (NCT(박장) / NCT(박닌)) 하나로.
 def _bloom_fold_steps(steps):
-    """같은 공정이 이름만 달리 두 번 있으면 (NCT(박장) / NCT(박닌)) 하나로.
-    옛 것 위에 새 것을 덮는다 — 날짜 칸은 합치고, 나머지는 새 값이 있으면 새 값."""
     import bloom_daily_import as _bd
     groups, order = {}, []
     for st in steps or []:
@@ -25019,8 +17508,8 @@ def _bloom_fold_steps(steps):
     return out
 
 
+# 'Corva KPE' 와 'Corva KPE (117품목)' 처럼 이름만 다른 같은 품목을 하나로.
 def _bloom_fold(items):
-    """'Corva KPE' 와 'Corva KPE (117품목)' 처럼 이름만 다른 같은 품목을 하나로."""
     import bloom_daily_import as _bd
     groups, order = {}, []
     for it in items or []:
@@ -25043,8 +17532,8 @@ def _bloom_fold(items):
     return out
 
 
+# (합쳐진 보드, 무엇이 바뀌는지).
 def _bloom_merge(old: dict, parsed: dict):
-    """(합쳐진 보드, 무엇이 바뀌는지)."""
     import bloom_daily_import as _bd
 
     old = old if isinstance(old, dict) else {}
@@ -25052,7 +17541,9 @@ def _bloom_merge(old: dict, parsed: dict):
             "days_added": 0, "day_changes": [], "month_changes": []}
 
     # 품목은 '(N품목)' 꼬리를 뗀 이름으로, 공정은 괄호(공장)를 뗀 이름으로 맞춘다
-    _ik = lambda i: _norm_label(_bd.clean_item(i.get("item")))  # noqa: E731
+    # 품목 이름을 다듬은 글자 — 옛 것과 새 것을 같은 품목끼리 맞출 때 쓴다
+    def _ik(i):
+        return _norm_label(_bd.clean_item(i.get("item")))
     old_items = {_ik(i): i for i in _bloom_fold(old.get("items"))}
     new_items = {_ik(i): i for i in _bloom_fold(parsed.get("items"))}
     keys = list(new_items) + [k for k in old_items if k not in new_items]
@@ -25070,7 +17561,8 @@ def _bloom_merge(old: dict, parsed: dict):
 
         entry = dict(ol or {})
         entry["item"] = name
-        for f in ("code", "wait_ship", "wait_part"):
+        # owner(고객사)도 같이 담는다
+        for f in ("code", "owner", "wait_ship", "wait_part"):
             entry[f] = _bloom_pick(nu.get(f), (ol or {}).get(f))
 
         old_steps = {_bd.step_key(s.get("step")): s
@@ -25119,6 +17611,12 @@ def _bloom_merge(old: dict, parsed: dict):
         merged.append(entry)
 
     merged = [m for m in merged if isinstance(m, dict)]
+    # 품목들의 공정에 나오는 날짜 전부 (앞에서부터)
+    _days = set()
+    for _item in merged:
+        for _step in (_item.get("steps") or []):
+            for _d in ((_step or {}).get("days") or {}):
+                _days.add(_d)
     board = {
         "title": _bloom_pick(parsed.get("title"), old.get("title")) or "",
         "sheet": _bloom_pick(parsed.get("sheet"), old.get("sheet")) or "",
@@ -25129,23 +17627,14 @@ def _bloom_merge(old: dict, parsed: dict):
         # 금액은 그 달 누계 한 장이다. 새 파일에 있으면 바꾸고, 없으면 두던 것
         "money": parsed.get("money") or old.get("money"),
         "items": merged,
-        "dates": sorted({d for i in merged for s in (i.get("steps") or [])
-                         for d in ((s or {}).get("days") or {})}),
+        "dates": sorted(_days),
     }
     return board, diff
 
-
+# ============================================================
+#  블룸 요약 · 품목 · 챗봇 답
+# ============================================================
 def _bloom_with_month_totals(board: dict) -> dict:
-    """'월 합계' 가 비어 있으면 날짜 칸을 더해서 채운 사본.
-
-    파일마다 '9월 합계' 열이 있기도 하고 없기도 하다. 없는 달은
-    month_plan / month_actual 이 통째로 None 이라, 날짜별 계획·실적이
-    21일치 들어 있어도 월간 보기가 텅 빈 채로 보였다.
-
-    저장된 값은 건드리지 않는다 — 엑셀에 없는 숫자를 보드에 적어 두면
-    다음에 진짜 합계가 올라올 때 무엇이 사람이 적은 값인지 알 수 없다.
-    화면에 내보낼 때만 더해서 채운다.
-    """
     items = []
     for it in (board.get("items") or []):
         if not isinstance(it, dict):
@@ -25188,12 +17677,8 @@ def _bloom_with_month_totals(board: dict) -> dict:
     return out
 
 
+# 그 날 공정별 계획/실적 합계 + 직전에 실적이 있던 날.
 def _bloom_summary(board: dict, date: str = ""):
-    """그 날 공정별 계획/실적 합계 + 직전에 실적이 있던 날.
-
-    실적 칸이 비어 있는 것과 0 은 다르다. 계획은 있는데 실적이 하나도
-    안 적혔으면 pending=True — 오전에 화면이 0% 로 보이면 안 된다.
-    """
     dates = board.get("dates") or []
     if not dates:
         return {}
@@ -25241,14 +17726,11 @@ def _bloom_summary(board: dict, date: str = ""):
 
 
 # 블룸은 품목 하나가 프로젝트 하나다 (YFP · Corva KPE · SL7 …).
-# 엑셀은 한 장으로 오므로 원본은 bloom_main 한 곳에 두고, 품목 프로젝트는
-# 거기서 자기 몫만 잘라 본다. 갈라 저장하면 다음 업로드 때 합치는 일이
-# 또 생기고, 한 번 어긋나면 되돌리기 어렵다.
 _BLOOM_STORE = "bloom_main"
 
 
+# 그 프로젝트가 맡은 품목 이름. 품목 프로젝트가 아니면 빈 문자열.
 def _bloom_item_of(project_key: str) -> str:
-    """그 프로젝트가 맡은 품목 이름. 품목 프로젝트가 아니면 빈 문자열."""
     try:
         p = _cl.get_project(project_key) or {}
     except Exception:
@@ -25256,23 +17738,28 @@ def _bloom_item_of(project_key: str) -> str:
     return str(p.get("bloom_item") or "").strip()
 
 
+# 품목 하나만 남긴 보드. 날짜·요약도 그 품목 기준으로 다시 낸다
 def _bloom_slice(board: dict, item: str) -> dict:
-    """품목 하나만 남긴 보드. 날짜·요약도 그 품목 기준으로 다시 낸다."""
     import bloom_daily_import as _bd
     want = _norm_label(_bd.clean_item(item))
     items = [i for i in (board.get("items") or [])
              if isinstance(i, dict) and _norm_label(_bd.clean_item(i.get("item"))) == want]
     out = dict(board)
     out["items"] = items
-    out["dates"] = sorted({d for i in items for st in (i.get("steps") or [])
-                           for d in ((st or {}).get("days") or {})})
+    # 품목들의 공정에 나오는 날짜 전부 (앞에서부터)
+    _days = set()
+    for _item in items:
+        for _step in (_item.get("steps") or []):
+            for _d in ((_step or {}).get("days") or {}):
+                _days.add(_d)
+    out["dates"] = sorted(_days)
     # 금액 시트는 품목 이름이 다르다 ('CORVA EFM KPE' ↔ 'Corva KPE') —
     # 억지로 맞추면 틀린 숫자가 붙는다. 품목 화면에서는 빼고 전체 화면에만 둔다.
     out.pop("money", None)
     return out
 
+# 블룸 프로젝트 하나가 볼 보드 (품목 프로젝트면 자기 몫만).
 def _bloom_board_for(project_key: str):
-    """블룸 프로젝트 하나가 볼 보드 (품목 프로젝트면 자기 몫만)."""
     _key = _model_key_alias(project_key)
     _item = _bloom_item_of(_key)
     _store = _BLOOM_STORE if _item else _key
@@ -25285,8 +17772,8 @@ def _bloom_board_for(project_key: str):
     return board, _item
 
 
+# 그 날 품목별 계획/실적 합계.
 def _bloom_item_totals(board: dict, day: str):
-    """그 날 품목별 계획/실적 합계."""
     out = []
     for it in (board.get("items") or []):
         plan = act = 0
@@ -25306,11 +17793,8 @@ def _bloom_item_totals(board: dict, day: str):
     return out
 
 
+# 블룸 질문 즉답. 모델이 없는 프로젝트라 일 보고 보드를 직접 읽는다
 def _bloom_chat_answer(project_key: str, text: str) -> str:
-    """블룸 질문 즉답. 모델이 없는 프로젝트라 일 보고 보드를 직접 읽는다.
-
-    챗봇은 경영진이 쓴다. 숫자 한 줄 + 막힌 곳 한 줄이면 충분하다.
-    """
     board, item = _bloom_board_for(project_key)
     if not board:
         return ""
@@ -25398,27 +17882,45 @@ def _bloom_chat_answer(project_key: str, text: str) -> str:
 
     return "\n".join(lines)
 
-
+# ============================================================
+#  일 보고 보드 주소
+# ============================================================
+# 블룸 일 보드. Admin 도 앱도 이걸 읽는다 ← admin v2 renderDailyBoard() · 앱 bloom_service.dart board()
 @app.get("/projects/{project_key}/daily-board")
 def get_daily_board(project_key: str, date: str = "", month: str = ""):
-    """블룸 일 보드. Admin 도 앱도 이걸 읽는다.
-
-    month  'YYYY-MM'. 없으면 가장 최근 달. 10월이 되어도 9월 계획 대비
-           실적을 볼 수 있어야 해서 달을 고를 수 있게 뒀다.
-    """
     _key = _model_key_alias(project_key)
     _item = _bloom_item_of(_key)
-    _store = _BLOOM_STORE if _item else _key
+    # -----------------------------------------------------------
+    # 일 보고는 블룸만의 것이 아니다
+    # -----------------------------------------------------------
+    # 전에는 저장 자리를 bloom_main 으로 못박아 둬서, ESS 프로젝트
+    # (SDI · 플루언스 · EPC POWER)에서는 일 보고 보드가 아예 안 떴다.
+    # 어느 자리에 담기는지는 _DAILY_STORE 가 안다 — 거기서 받는다.
+    _div = _daily_board_division(_key)
+    _store = (_daily_store_key(_div) or _key) if (_item or _div) else _key
     proj = (_load_models().get("projects") or {}).get(_store) or {}
     allm = _bloom_store_months(proj)
     months = sorted(allm)
-    pick = month if month in allm else (months[-1] if months else "")
+    # 고른 달이 있으면 그 달, 없으면 가장 최근 달, 그것도 없으면 빈 글자
+    if month in allm:
+        pick = month
+    elif months:
+        pick = months[-1]
+    else:
+        pick = ""
     board = allm.get(pick)
     if isinstance(board, dict) and _item:
         board = _bloom_slice(board, _item)
+    elif isinstance(board, dict) and _div and _store != _key:
+        # 품목 이름 안에 프로젝트 이름이 든 줄만. 없으면 빈 보드.
+        board = _daily_slice_by_project(board, _key)
     if not isinstance(board, dict) or not board.get("items"):
+        # 자료가 아예 없는 것과, 자료는 있는데 이 프로젝트 이름이 거기
+        # 없는 것은 다르다. 화면이 다른 말을 할 수 있게 갈라 준다.
+        _had = bool(allm.get(pick, {}).get("items")) if isinstance(allm.get(pick), dict) else False
         return {"project_key": _key, "has_board": False, "items": [], "dates": [],
-                "months": months, "month": pick}
+                "months": months, "month": pick,
+                "no_match": bool(_had and (_item or _div))}
     import datetime as _dt
     board = _bloom_with_month_totals(board)
     out = dict(board)
@@ -25429,6 +17931,20 @@ def get_daily_board(project_key: str, date: str = "", month: str = ""):
     out["month"] = pick
     out["today"] = _dt.date.today().strftime("%Y-%m-%d")
     out["summary"] = _bloom_summary(board, date)
+    # -----------------------------------------------------------
+    # 지난 주는 주 단위로 접고, 이번 주만 날짜로 편다
+    # -----------------------------------------------------------
+    # 한 달치를 날짜 그대로 그리면 열이 서른 개가 넘어 아무도 못 읽는다
+    try:
+        import daily_view as _dv
+        cols = _dv.build_columns(out.get("dates") or [], out.get("today"), pick)
+        out["columns"] = cols
+        for _it in (out.get("items") or []):
+            for _st in (_it.get("steps") or []):
+                _st["cells"] = _dv.fold_row(_st.get("days") or {}, cols)
+    except Exception as e:
+        print("[daily-board] 열 접기 실패: %s" % e)
+        out["columns"] = []
     return out
 
 
@@ -25436,24 +17952,16 @@ def get_daily_board(project_key: str, date: str = "", month: str = ""):
 # 요청마다 통째로 다시 읽는다 — 무한정 쌓으면 그 값을 치르게 된다.
 _BLOOM_KEEP_MONTHS = 5
 
-
+# ============================================================
+#  블룸 달별 저장
+# ============================================================
 def _bloom_month_of(board: dict) -> str:
-    """그 보드가 어느 달 것인가. **날짜**가 기준이다 — 제목은 못 믿는다.
-
-    9월 시트의 제목도 '블룸 계획 대비 실적 보고(10/01)' 이라 적혀 있다.
-    마지막으로 손댄 날이 제목에 남은 것이라, 제목으로 달을 잡으면 9월
-    자료가 10월 자리로 들어간다.
-    """
     ds = (board or {}).get("dates") or []
     return str(ds[0])[:7] if ds else ""
 
 
+# {'2026-09': 보드, '2026-10': 보드} — 지난 달 + 이번 달.
 def _bloom_store_months(proj: dict) -> dict:
-    """{'2026-09': 보드, '2026-10': 보드} — 지난 달 + 이번 달.
-
-    이번 달은 daily_board 에 그대로 있다. 그걸 읽는 곳이 여럿이라
-    (챗봇·매출 집계·RAG) 자리를 안 옮긴다. 지난 달만 따로 쌓는다.
-    """
     out = {}
     prev = proj.get("daily_board_months")
     if isinstance(prev, dict):
@@ -25468,18 +17976,15 @@ def _bloom_store_months(proj: dict) -> dict:
     return out
 
 
+# 파일에 든 달 전부. {'2026-09': parsed, ...}
 def _bloom_parse_months(raw: bytes) -> dict:
-    """파일에 든 달 전부. {'2026-09': parsed, ...}
-
-    금액 실적 시트는 파일에 한 장뿐이라 **가장 늦은 달**에만 붙인다.
-    """
     import io as _io
 
     import openpyxl as _xl
 
     import bloom_daily_import as _bd
     try:
-        wb = _xl.load_workbook(_io.BytesIO(raw), data_only=True)
+        wb = _xl.load_workbook(_io.BytesIO(raw), data_only=True, keep_links=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"엑셀을 열 수 없습니다: {e}")
 
@@ -25513,13 +18018,8 @@ def _bloom_parse_months(raw: bytes) -> dict:
     return out
 
 
+# 달별로 합친다 → ({'2026-09': 보드}, {'2026-09': diff}, 최신달).
 def _bloom_apply_months(proj: dict, months_in: dict):
-    """달별로 합친다 → ({'2026-09': 보드}, {'2026-09': diff}, 최신달).
-
-    저장은 안 한다 — 미리보기와 저장이 **같은 계산**을 쓰게 하려고
-    여기서 끊었다. 미리보기에 보인 숫자와 저장되는 숫자가 다르면
-    무엇을 보고 눌렀는지 알 수 없게 된다.
-    """
     store = _bloom_store_months(proj)
     diffs = {}
     for mon in sorted(months_in):
@@ -25531,8 +18031,8 @@ def _bloom_apply_months(proj: dict, months_in: dict):
     return store, diffs, (keep[-1] if keep else "")
 
 
+# 화면에 '어느 달이 얼마나 바뀌는지' 한 줄씩.
 def _bloom_months_brief(store: dict, diffs: dict):
-    """화면에 '어느 달이 얼마나 바뀌는지' 한 줄씩."""
     out = []
     for mon in sorted(store):
         b, d = store[mon], (diffs.get(mon) or {})
@@ -25547,13 +18047,14 @@ def _bloom_months_brief(store: dict, diffs: dict):
     return out
 
 
+# 블룸 일 보고 엑셀을 읽어 보드 자료로.
 def _bloom_parse_upload(raw: bytes):
     # openpyxl / BytesIO 는 main.py 최상단에 없다. 쓰는 함수마다 직접 가져온다.
     import io as _io
     import openpyxl as _xl
     import bloom_daily_import as _bd
     try:
-        wb = _xl.load_workbook(_io.BytesIO(raw), data_only=True)
+        wb = _xl.load_workbook(_io.BytesIO(raw), data_only=True, keep_links=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"엑셀을 열 수 없습니다: {e}")
     parsed = _bd.parse_daily(wb)
@@ -25571,10 +18072,133 @@ def _bloom_parse_upload(raw: bytes):
     return parsed
 
 
+# 두 사업부는 보고 자료가 **날마다** 들어온다
+
+#: 사업부 → 일 보고 자료를 담아 두는 자리(가짜 프로젝트 키)
+_DAILY_STORE = {
+    "bloom": _BLOOM_STORE,      # 'bloom_main' — 예전부터 쓰던 자리
+    "ess": "ess_main",
+}
+
+# ============================================================
+#  일 보고 올리기 (사업부 · 블룸)
+# ============================================================
+def _daily_store_key(division_id: str) -> str:
+    return _DAILY_STORE.get(str(division_id or "").strip().lower(), "")
+
+
+# 담을 자리가 없으면 여기서 끊는다
+def _daily_need_store(division_id: str) -> str:
+    key = _daily_store_key(division_id)
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail=("%s 사업부는 일 보고 자료를 받지 않습니다. "
+                    "받으려면 _DAILY_STORE 에 자리를 만들어야 합니다." % division_id))
+    return key
+
+
+# 올린 일 보고 자료가 무엇을 바꾸는지 먼저 보여준다 ← admin v2 _dailySend()
+@app.post("/admin/divisions/{division_id}/daily/preview")
+async def admin_division_daily_preview(
+    division_id: str,
+    file: UploadFile = File(...),
+    _admin: int = Depends(get_admin_session),
+):
+    store_key = _daily_need_store(division_id)
+    raw = await _keep_upload(file, "/admin/divisions/{division_id}/daily/preview",
+                             division_id)
+    months_in = _bloom_parse_months(raw)
+
+    proj = (_load_models().get("projects") or {}).get(store_key) or {}
+    store, diffs, latest = _bloom_apply_months(proj, months_in)
+    return {
+        "ok": True,
+        "division_id": division_id,
+        "store_key": store_key,
+        "file_name": file.filename or "",
+        "months": _bloom_months_brief(store, diffs),
+        "latest_month": latest,
+    }
+
+
+# 미리보기에서 확인한 내용을 저장한다 ← admin v2 _dailySend()
+@app.post("/admin/divisions/{division_id}/daily/apply")
+async def admin_division_daily_apply(
+    division_id: str,
+    file: UploadFile = File(...),
+    _admin: int = Depends(get_admin_session),
+):
+    store_key = _daily_need_store(division_id)
+    raw = await _keep_upload(file, "/admin/divisions/{division_id}/daily/apply",
+                             division_id)
+    months_in = _bloom_parse_months(raw)
+
+    data = _load_models()
+    proj = data.setdefault("projects", {}).setdefault(store_key, {"models": []})
+    store, diffs, latest = _bloom_apply_months(proj, months_in)
+
+    # 이번 달은 daily_board 에 그대로 둔다 — 챗봇·매출 집계가 그 자리를
+    # 읽고 있어서 옮기면 같이 고쳐야 한다. 지난 달만 따로 쌓는다.
+    if latest:
+        proj["daily_board"] = store.get(latest) or {}
+    past = {}
+    for mon, board in store.items():
+        if mon != latest:
+            past[mon] = board
+    proj["daily_board_months"] = past
+
+    _save_models(data)
+    print("[일 보고] %s '%s': %d개 달 저장 (최신 %s)"
+          % (division_id, file.filename or "", len(store), latest))
+    return {
+        "ok": True,
+        "division_id": division_id,
+        "store_key": store_key,
+        "file_name": file.filename or "",
+        "months": _bloom_months_brief(store, diffs),
+        "latest_month": latest,
+    }
+
+
+# 일 보고 자료를 **접어서** 내보낸다 ← 앱 daily_board_card.dart _pickMonth()
+@app.get("/divisions/{division_id}/daily-view")
+def get_division_daily_view(division_id: str, month: str = "", today: str = ""):
+    import daily_view as _dv
+
+    store_key = _daily_store_key(division_id)
+    if not store_key:
+        return {"division_id": division_id, "columns": [], "rows": [],
+                "total": [], "months": []}
+
+    proj = (_load_models().get("projects") or {}).get(store_key) or {}
+    # -----------------------------------------------------------
+    # 1. 어느 달을 볼 것인가
+    # -----------------------------------------------------------
+    boards = _bloom_store_months(proj)
+    if not boards:
+        return {"division_id": division_id, "columns": [], "rows": [],
+                "total": [], "months": []}
+    mon = str(month or "").strip()
+    if mon not in boards:
+        # 기본은 '이번 달' 이다
+        import datetime as _d4
+        _now = (today or "")[:7] or _d4.date.today().strftime("%Y-%m")
+        mon = _now if _now in boards else sorted(boards)[-1]
+    # -----------------------------------------------------------
+    # 2. 접는다 (어느 달을 보는지도 알려 준다)
+    # -----------------------------------------------------------
+    view = _dv.build(boards[mon], today or None, mon)
+    view["division_id"] = division_id
+    view["month"] = mon
+    view["months"] = sorted(boards)
+    return view
+
+
+# 저장하지 않고 무엇이 바뀌는지만 보여준다 ← admin v2 fl.onchange()
 @app.post("/admin/projects/{project_key}/bloom-daily/preview")
 async def admin_bloom_daily_preview(project_key: str, file: UploadFile = File(...),
                                     _admin: int = Depends(get_admin_session)):
-    """저장하지 않고 무엇이 바뀌는지만 보여준다."""
     # 엑셀은 품목 전체가 한 장이다. 어느 품목 화면에서 올리든 원본은 한 곳에.
     _key = _BLOOM_STORE if _bloom_item_of(_model_key_alias(project_key)) \
         else _model_key_alias(project_key)
@@ -25594,10 +18218,10 @@ async def admin_bloom_daily_preview(project_key: str, file: UploadFile = File(..
             "diff": diffs.get(newest) or {}}
 
 
+# 합쳐서 저장한다 ← admin v2 _bdConfirm()
 @app.post("/admin/projects/{project_key}/bloom-daily")
 async def admin_bloom_daily_apply(project_key: str, file: UploadFile = File(...),
                                   _admin: int = Depends(get_admin_session)):
-    """합쳐서 저장한다."""
     _key = _BLOOM_STORE if _bloom_item_of(_model_key_alias(project_key)) \
         else _model_key_alias(project_key)
     months_in = _bloom_parse_months(await _keep_upload(file, "/admin/projects/{project_key}/bloom-daily", project_key))
@@ -25628,21 +18252,13 @@ async def admin_bloom_daily_apply(project_key: str, file: UploadFile = File(...)
             "months": _bloom_months_brief(store, diffs),
             "diff": diff}
 
-# ─────────────────────────────────────────────────────────────
 # 주차 미달과 그 사유
-#
-# "계획 대비 실적이 안 나오면 이슈가 있는 거 아닐까?"
-#
-# 맞다. 다만 끝난 주차에만 해당한다 — 아직 오지 않은 주의 실적 0 은
-# 미달이 아니라 아직 안 온 것이다. 그리고 미달이 늘 문제인 것도 아니다:
-# 엔클로저는 매출을 맞추려고 일부러 덜 출하하기도 한다. 그래서 사유에
-# '문제' / '참고' 를 달고, 참고로 표시된 주는 문제로 세지 않는다.
-# 사유가 아예 없으면 '사유 미입력' — 그건 문제 쪽이다.
 _WEEK_REASON_KINDS = ("문제", "참고")
 
-
+# ============================================================
+#  주차 미달과 그 사유
+# ============================================================
 def _week_reasons_of(proj: dict, month: str) -> dict:
-    """{'W37': {'kind': '참고', 'text': '...', 'at': '...'}}"""
     store = proj.get("week_reasons")
     if not isinstance(store, dict):
         return {}
@@ -25662,8 +18278,8 @@ def _week_reasons_of(proj: dict, month: str) -> dict:
     return out
 
 
+# 마감된 주차 = 그 ISO 주의 일요일이 오늘보다 앞선 주.
 def _closed_week_labels(month: str, weeks: list, today=None) -> list:
-    """마감된 주차 = 그 ISO 주의 일요일이 오늘보다 앞선 주."""
     import datetime as _dtc
     today = today or _dtc.date.today()
     out = []
@@ -25674,21 +18290,9 @@ def _closed_week_labels(month: str, weeks: list, today=None) -> list:
     return out
 
 
+# 마감된 주차에서 합계가 계획에 못 미치면 표시를 달고 목록으로 돌려준다
 def _mark_board_shortfalls(rows: list, total: dict, weeks: list, month: str,
                            reasons: dict, today=None) -> tuple:
-    """마감된 주차에서 합계가 계획에 못 미치면 표시를 달고 목록으로 돌려준다.
-
-    미달은 '합계' 기준이다. 품목별로 따지지 않는다.
-    하바플레이트 W37 이 그 경우다 — 양산이 19대 모자랐는데 개발이 그만큼
-    더 나가서 합계(97 → 117)는 넘겼다. 행마다 빨갛게 칠하면 설명할 것도
-    없는 주에 사유를 적으라고 조르게 된다.
-
-    칸에 붙는 것
-      closed  그 주가 끝났는지 (앱은 안 끝난 주의 실적을 '·' 로 그린다)
-      short   합계가 모자란 수량 (계획 - 실적). 끝난 주의 합계 행에만.
-
-    돌려주는 것은 (마감 주차 목록, 미달 목록). 미달은 주차당 한 건이다.
-    """
     closed = set(_closed_week_labels(month, weeks, today))
 
     # 행은 '끝난 주인지' 만 달아 준다. 빨간 칸은 합계에만.
@@ -25730,17 +18334,534 @@ def _mark_board_shortfalls(rows: list, total: dict, weeks: list, month: str,
     return sorted(closed), shorts
 
 
+# 여러 줄에서 같은 칸을 더한다
+def _sum_of(items, field) -> int:
+    total = 0
+    for it in items:
+        total += (it.get(field) or 0)
+    return total
+
+
+# 주차 묶음에서 이번 달 주차만 남긴다
+def _only_these_weeks(week_map, weeks) -> dict:
+    out = {}
+    for w in weeks:
+        out[w] = week_map[w]
+    return out
+
+
+# ============================================================
+#  블룸 프로젝트 한 개의 주차 현황 보드
+# ============================================================
+# 공정 한 줄의 날짜 자료를 주차 칸으로 묶는다 → {'W41': {plan, actual}}
+def _bloom_step_weeks(step: dict, weeks: list, month: str) -> dict:
+    import datetime as _dt
+    out = {w: {"plan": 0, "actual": 0} for w in weeks}
+    for ds, cell in ((step or {}).get("days") or {}).items():
+        if not isinstance(cell, dict):
+            continue
+        try:
+            d = _dt.date.fromisoformat(str(ds)[:10])
+        except Exception:
+            continue
+        w = "W%02d" % d.isocalendar()[1]
+        if w not in out:
+            continue
+        for fld in ("plan", "actual"):
+            v = cell.get(fld)
+            if v is not None:
+                try:
+                    out[w][fld] += int(v)
+                except Exception:
+                    pass
+    return out
+
+
+# 두 사업부는 자료가 날마다 들어오고, 프로젝트 안에 모델(품번)이 없거나 있어도 주차 계획을 따로 안 적는다
+_DAILY_BOARD_ROWS = {
+    "bloom": ("NCT", "조립", "출하"),
+    "ess": ("제관/용접", "조립", "출하"),
+}
+
+# '이전 데이터' 칸의 열 이름. 주차 이름('W41')이 아니라서 마감 주차로도,
+# 미달 주차로도 세지 않는다 — 날짜가 없으니 언제 끝난 주인지 알 수 없다.
+_DAILY_PRIOR_COL = "이전"
+
+# ============================================================
+#  일 보고로 그리는 프로젝트 보드 — 블룸 · ESS
+# ============================================================
+def _daily_slice_by_project(board: dict, project_key: str):
+    try:
+        p = _cl.get_project(project_key) or {}
+    except Exception:
+        return None
+    names = [p.get("label"), p.get("badge_label"), project_key]
+    names.extend(p.get("aliases") or [])
+    keys = [_norm_label(str(n)) for n in names if n]
+    keys = [k for k in keys if len(k) >= 2]
+    if not keys:
+        return None
+    # -----------------------------------------------------------
+    # 고객사 칸이 있으면 그걸 먼저 본다
+    # -----------------------------------------------------------
+    # ESS 일 보고에는 품목 왼쪽에 **고객사** 열이 따로 있다 (SDI · 플루언스 · EPC POWER).
+    picked = []
+    for it in (board.get("items") or []):
+        own = _norm_label(str((it or {}).get("owner") or ""))
+        nm = _norm_label(str((it or {}).get("item") or ""))
+        hay = own or nm
+        if any(k in hay for k in keys) or (own and any(k in nm for k in keys)):
+            picked.append(it)
+    out = dict(board)
+    out["items"] = picked          # 한 줄도 못 골랐으면 빈 보드다
+    return out
+
+
+# 그 프로젝트가 일 보고로 보드를 그리는 사업부인가.
+def _daily_board_division(project_key: str) -> str:
+    try:
+        p = _cl.get_project(project_key) or {}
+    except Exception:
+        return ""
+    d = str(p.get("division_id") or "").strip().lower()
+    return d if d in _DAILY_BOARD_ROWS else ""
+
+
+# 그 공정이 어느 줄인가 ('NCT(박닌)' → 'NCT').
+def _daily_step_group(step: dict, rows: tuple) -> str:
+    g = str((step or {}).get("group") or "").strip()
+    if g:
+        return g
+    # group 이 비어 있으면 공정 이름에서 찾는다 ('조립(박장)' → '조립')
+    name = str((step or {}).get("step") or "")
+    for want in rows:
+        if want in name:
+            return want
+    return name.strip()
+
+
+# '구분' 열에 세울 공정 — 일 보고의 '공정구분' 칸에 적힌 그대로.
+def _daily_report_rows(board, fallback: tuple) -> tuple:
+    order = []
+    for it in ((board or {}).get("items") or []):
+        for st in ((it or {}).get("steps") or []):
+            if not isinstance(st, dict):
+                continue
+            g = _daily_step_group(st, fallback)
+            if g and g not in order:
+                order.append(g)
+    return tuple(order) or tuple(fallback)
+
+
+# 그 프로젝트가 맡은 품목 자료만 골라낸다
+def _daily_board_items(division_id: str, project_key: str, board: dict) -> list:
+    items = [it for it in (board.get("items") or []) if isinstance(it, dict)]
+    # -----------------------------------------------------------
+    # 블룸 — 프로젝트 하나가 품목 하나
+    # -----------------------------------------------------------
+    item = _bloom_item_of(project_key)
+    if item:
+        import bloom_daily_import as _bd
+        want = _norm_label(_bd.clean_item(item))
+        return [it for it in items
+                if _norm_label(_bd.clean_item(it.get("item"))) == want]
+    # -----------------------------------------------------------
+    # ESS — 고객사 칸으로 고른다
+    # -----------------------------------------------------------
+    idx = _df_owner_index(division_id)
+    return [it for it in items
+            if _df_find_project(it.get("owner") or "", idx) == project_key]
+
+
+# 품목 단위로 쌓여 있는 재고 → {'wait_ship':.., 'wait_part':..}
+def _daily_stock_of(items: list) -> dict:
+    out = {}
+    for fld in ("wait_ship", "wait_part"):
+        vals = []
+        for it in items:
+            v = (it or {}).get(fld)
+            if v is not None:
+                try:
+                    vals.append(int(v))
+                except Exception:
+                    pass
+        out[fld] = sum(vals) if vals else None
+    return out
+
+
+# 품목들을 공정별로 더해 보드 행을 만든다
+def _daily_board_rows(items: list, rows_want: tuple, weeks: list,
+                      month: str, prev_by_group: dict) -> list:
+    # -----------------------------------------------------------
+    # 1. 공정별로 품목 자료를 모은다
+    # -----------------------------------------------------------
+    bucket = {}          # 줄이름 → [(공정 이름, 공정 자료), ...]
+    for it in items:
+        for st in (it.get("steps") or []):
+            if isinstance(st, dict):
+                g = _daily_step_group(st, rows_want)
+                bucket.setdefault(g, []).append(st)
+    # -----------------------------------------------------------
+    # 2. 늘 세울 줄 + 못 보던 공정은 뒤에 붙인다
+    # -----------------------------------------------------------
+    #    조용히 빠뜨리면 그 숫자가 어디로 갔는지 아무도 못 찾는다.
+    order = list(rows_want) + [g for g in bucket if g not in rows_want]
+
+    out = []
+    for g in order:
+        steps = bucket.get(g) or []
+        if not steps:
+            # 자료에 없는 공정 — 줄은 세우되 칸은 비운다 (0 아님)
+            out.append({
+                "group": g, "label": g,
+                "po_qty": None, "remaining": None, "next_month_plan": None,
+                "actual_total": None, "prev_month_actual": None,
+                "month_plan": None, "month_actual": None,
+                "wip": None, "wait_ship": None, "wait_part": None,
+                "weeks": {w: {"plan": None, "actual": None} for w in weeks},
+            })
+            continue
+
+        # 줄 이름은 자료에 적힌 그대로 ('NCT(박닌)' — 어디서 하는지가 붙어
+        # 있어 쓸모가 있다). 품목마다 다르면 (ESS) 줄 이름만 쓴다.
+        names = {str(st.get("step") or "").strip() for st in steps}
+        names.discard("")
+        label = names.pop() if len(names) == 1 else g
+
+        m_plan = sum(int(st.get("month_plan") or 0) for st in steps)
+        m_act = sum(int(st.get("month_actual") or 0) for st in steps)
+        wk = {w: {"plan": 0, "actual": 0} for w in weeks}
+        for st in steps:
+            one = _bloom_step_weeks(st, weeks, month)
+            for w in weeks:
+                wk[w]["plan"] += one[w]["plan"]
+                wk[w]["actual"] += one[w]["actual"]
+
+        # 공정 재고 — 그 공정에 지금 걸려 있는 것. 공정마다 따로 적혀 와서
+        # 줄마다 값이 있다. 한 품목도 안 적혀 있으면 빈 칸(0 아님).
+        wips = [int(st["wip"]) for st in steps if st.get("wip") is not None]
+
+        # '이전 데이터' 칸 — ESS 보고자료에는 '10월05일 이전 데이터' 처럼 날짜별로 안 적고 한 칸에 몰아 둔 기간이 있다
+        for fld, key in (("plan", "prior_plan"), ("actual", "prior_actual")):
+            vals = [int(st[key]) for st in steps if st.get(key) is not None]
+            if vals and _DAILY_PRIOR_COL in wk:
+                wk[_DAILY_PRIOR_COL][fld] = sum(vals)
+
+        out.append({
+            "group": g,
+            "label": label,
+            # 일 보고에 없는 숫자 — 0 이 아니라 아예 비워 둔다
+            "po_qty": None,
+            "remaining": None,
+            "next_month_plan": None,
+            "actual_total": m_act,
+            "prev_month_actual": prev_by_group.get(g, 0),
+            "month_plan": m_plan,
+            "month_actual": m_act,
+            "wip": sum(wips) if wips else None,
+            # 출하대기·구매품대기는 품목 단위라 공정 줄에는 안 붙는다
+            "wait_ship": None,
+            "wait_part": None,
+            "weeks": wk,
+        })
+    return out
+
+
+# 지난달 그 프로젝트의 공정별 실적.
+def _daily_prev_by_group(division_id: str, project_key: str,
+                         rows_want: tuple, prev_month: str) -> dict:
+    store = _daily_store_key(division_id)
+    if not store:
+        return {}
+    proj = (_load_models().get("projects") or {}).get(store) or {}
+    board = (_bloom_store_months(proj) or {}).get(prev_month)
+    if not isinstance(board, dict):
+        return {}
+    board = _bloom_with_month_totals(board)
+    out = {}
+    for it in _daily_board_items(division_id, project_key, board):
+        for st in (it.get("steps") or []):
+            if not isinstance(st, dict):
+                continue
+            g = _daily_step_group(st, rows_want)
+            try:
+                out[g] = out.get(g, 0) + int(st.get("month_actual") or 0)
+            except Exception:
+                pass
+    return out
+
+
+# 일 보고로 그리는 프로젝트 보드.
+def _daily_project_board(project_key: str, month: str):
+    import datetime as _dt
+    _key = _model_key_alias(project_key)
+    division = _daily_board_division(_key)
+    if not division:
+        return None
+    rows_want = _DAILY_BOARD_ROWS[division]
+
+    store = _daily_store_key(division)
+    proj = (_load_models().get("projects") or {}).get(store) or {}
+    allm = _bloom_store_months(proj)
+
+    y, mm = int(month[:4]), int(month[5:7])
+    prev = "%d-12" % (y - 1) if mm == 1 else "%d-%02d" % (y, mm - 1)
+    nxt = "%d-01" % (y + 1) if mm == 12 else "%d-%02d" % (y, mm + 1)
+    # -----------------------------------------------------------
+    # 1. 그 프로젝트 몫의 품목 자료를 꺼낸다
+    # -----------------------------------------------------------
+    board = allm.get(month)
+    items = []
+    if isinstance(board, dict):
+        board = _bloom_with_month_totals(board)
+        items = _daily_board_items(division, _key, board)
+
+    # '구분' 줄은 일 보고에 적힌 공정이다. 그 달 자료가 없으면 가장 최근
+    # 달 일 보고의 공정을 쓴다 (다음 달 보드가 빈 줄 없이 서게).
+    _src = board if isinstance(board, dict) else next(
+        (allm[k] for k in sorted(allm, reverse=True)
+         if isinstance(allm[k], dict)), None)
+    rows_want = _daily_report_rows(_src, rows_want)
+    # -----------------------------------------------------------
+    # 1-1. 어떤 주차를 열로 세울까
+    # -----------------------------------------------------------
+    # 보통은 그 달이 가진 주차다 (_get_month_weeks → 10월이면 W41~W44).
+    weeks = list(_get_month_weeks(month))
+    extra = set()
+    for it in items:
+        for st in (it.get("steps") or []):
+            for ds in ((st or {}).get("days") or {}):
+                if str(ds)[:7] != month:
+                    continue
+                try:
+                    import datetime as _d2
+                    d = _d2.date.fromisoformat(str(ds)[:10])
+                except Exception:
+                    continue
+                w = "W%02d" % d.isocalendar()[1]
+                if w not in weeks:
+                    extra.add(w)
+    weeks = sorted(set(weeks) | extra)
+    # -----------------------------------------------------------
+    # 1-2. '이전 데이터' 칸이 있으면 맨 앞에 한 칸
+    # -----------------------------------------------------------
+    #    ESS 보고자료의 '10월05일 이전 데이터' 같은 칸이다. 날짜가 없어
+    #    주차에 못 넣는데, 빼면 주차를 다 더해도 월 합계가 안 맞는다.
+    # 공정 중 하나라도 '이전 데이터' 칸(prior_plan · prior_actual)을 들고 있나
+    _has_prior = False
+    for _it in items:
+        for _st in (_it.get("steps") or []):
+            if not isinstance(_st, dict):
+                continue
+            if _st.get("prior_plan") is not None or _st.get("prior_actual") is not None:
+                _has_prior = True
+                break
+        if _has_prior:
+            break
+    if _has_prior:
+        weeks = [_DAILY_PRIOR_COL] + weeks
+
+    # 일 보고 자료가 이 프로젝트와 아예 상관없으면 (ESS 인데 고객사 칸에
+    # 한 번도 안 나온 프로젝트) 옛 방식으로 보낸다 — 모델 주차 계획이
+    # 적혀 있을 수 있는데 그걸 빈 표로 덮으면 안 된다.
+    if not items and not any(
+            _daily_board_items(division, _key, _bloom_with_month_totals(b))
+            for b in allm.values() if isinstance(b, dict)):
+        # 블룸은 모델이 없어서 옛 방식이 빈 표다 — 빈 공정 표를 보낸다
+        if not _bloom_item_of(_key):
+            return None
+    # -----------------------------------------------------------
+    # 2. 공정 줄을 만든다 (자료가 없어도 줄은 선다)
+    # -----------------------------------------------------------
+    prev_by_group = _daily_prev_by_group(division, _key, rows_want, prev)
+
+    # 품목을 묶어서 보여 줄 것인가
+    #
+    #   블룸 — 프로젝트 하나가 품목 하나다. 품목 이름이 이미 화면 제목에
+    #          있으니 한 번 더 쓰면 같은 글자가 두 번 뜬다. 평평한 표.
+    #   ESS  — 프로젝트 하나가 품목을 여럿 맡는다 (SDI → SBB 1.5 · SBB 1.7
+    #          · SBB 2.0). 다 더해 세 줄로 접으면 어느 품목이 밀렸는지가
+    #          안 보인다. 품목마다 묶음(section)을 만들어 그 안에 공정을
+    #          세운다.
+    use_sections = division != "bloom"
+
+    sections = []
+    if use_sections:
+        for it in items:
+            srows = _daily_board_rows([it], rows_want, weeks, month,
+                                      prev_by_group)
+            # 출하대기 · 구매품대기는 품목에 붙는 숫자다. 묶음의 첫 줄에만
+            # 적는다 — 줄마다 적으면 공정마다 그만큼 있는 것처럼 보이고,
+            # 보는 사람이 더해 버린다.
+            stock = _daily_stock_of([it])
+            if srows:
+                srows[0]["wait_ship"] = stock.get("wait_ship")
+                srows[0]["wait_part"] = stock.get("wait_part")
+            sections.append({
+                "name": str(it.get("item") or "").strip() or "(이름 없음)",
+                "rows": srows,
+            })
+        # 섹션마다 나뉜 줄을 한 줄로 이어 붙인다
+        rows = []
+        for _sec in sections:
+            for _row in _sec["rows"]:
+                rows.append(_row)
+    else:
+        rows = _daily_board_rows(items, rows_want, weeks, month, prev_by_group)
+    # -----------------------------------------------------------
+    # 3. 합계 줄 — 열마다 모든 공정을 더한다
+    # -----------------------------------------------------------
+    total = {"po_qty": None, "remaining": None, "next_month_plan": None}
+    # 출하대기 · 구매품대기는 품목 단위라 더할 공정이 없다. 프로젝트가
+    # 맡은 품목을 더해 합계 줄에만 적는다.
+    total.update(_daily_stock_of(items))
+    for f in ("actual_total", "prev_month_actual", "month_plan", "month_actual",
+              "wip"):
+        # 빈 줄(None)은 빼고 더한다. 한 줄도 안 적혀 있으면 합계도 빈 칸.
+        vals = [r[f] for r in rows if r.get(f) is not None]
+        total[f] = sum(vals) if vals else None
+    total["weeks"] = {}
+    for w in weeks:
+        plans = [r["weeks"][w]["plan"] for r in rows
+                 if r["weeks"][w]["plan"] is not None]
+        acts = [r["weeks"][w]["actual"] for r in rows
+                if r["weeks"][w]["actual"] is not None]
+        total["weeks"][w] = {
+            "plan": sum(plans) if plans else None,
+            "actual": sum(acts) if acts else None,
+        }
+
+    try:
+        cur_week = "W%02d" % _dt.date.today().isocalendar()[1]
+    except Exception:
+        cur_week = None
+
+    _reasons = _week_reasons_of(proj, month)
+    _closed, _shorts = _mark_board_shortfalls(rows, total, weeks, month, _reasons)
+    # -----------------------------------------------------------
+    # 3-1. 줄이 하나뿐이면 '합계' 줄만 남긴다
+    # -----------------------------------------------------------
+    #    '출하 10' 바로 밑에 '합계 10' 이 똑같이 한 번 더 찍히면, 읽는
+    #    사람은 두 숫자가 다른 것인 줄 알고 한참 들여다본다. 줄이 하나면
+    #    그 줄을 합계 자리에 올리고 이름만 공정 이름으로 바꿔 단다.
+    total_label = "합계"
+    if len(rows) == 1:
+        total_label = rows[0]["label"]
+        rows = []
+    # -----------------------------------------------------------
+    # 4. 앱이 그리지 말아야 할 열
+    # -----------------------------------------------------------
+    # PO수량 · 잔량 · 다음달 계획 · PO증감 은 일 보고 자료에 없는 숫자다
+    hide = ["po_qty", "remaining", "next_month_plan", "po_delta"]
+    if not (total.get("prev_month_actual") or 0):
+        hide.append("prev_month_actual")
+
+    out = {"project_key": _key, "month": month, "weeks": weeks,
+            "prev_month": prev, "next_month": nxt,
+            "current_week": cur_week, "po_delta": {},
+            "closed_weeks": _closed, "shortfalls": _shorts,
+            "week_reasons": _reasons,
+            "hide_cols": hide, "total_label": total_label,
+            # -----------------------------------------------------------
+            # 재고 열 (반도체·자동차에는 없는 열이라 여기서만 보낸다)
+            # -----------------------------------------------------------
+            #    공정재고 — 공정마다 적혀 와서 줄마다 값이 있다
+            #    출하대기 · 구매품대기 — 품목 단위라 합계 줄에만 값이 있다
+            "stock_cols": [
+                {"field": "wip", "label": "공정\n재고"},
+                {"field": "wait_ship", "label": "출하\n대기"},
+                {"field": "wait_part", "label": "구매품\n대기"},
+            ],
+            # 합계가 공정을 다 더한 값이라는 걸 화면에 한 줄로 적어 준다.
+            # 안 적으면 '72대 나갔다' 로 읽힌다 (실제 출하는 40).
+            "note": ("구분은 일 보고의 공정입니다. 합계는 공정을 더한 값이라"
+                     " 출하량이 아닙니다 — 나간 수량은 '출하' 줄입니다."
+                     " 출하대기·구매품대기는 품목 단위라 품목마다 한 번만"
+                     " 적습니다."
+                     if len(rows) > 1 else ""),
+            "rows": rows, "total": total}
+
+    if use_sections:
+        # 품목 묶음 표로 그린다 (앱의 _sectionTable).
+        #   layout   묶음 표를 쓰라는 뜻
+        #   columns  'week' — 달이 아니라 주차로 열을 세운다
+        #   현황 · 비고 열은 일 보고에 없는 칸이라 끈다
+        out["layout"] = "sections"
+        out["columns"] = "week"
+        out["show_status"] = False
+        out["show_note"] = False
+        out["sections"] = sections
+    return out
+
+# ============================================================
+#  주차 현황 보드 (프로젝트 · 사업부)
+# ============================================================
+def _weekly_filtered(project_key: str, proj: dict) -> dict:
+    try:
+        div = (_cl.get_project(project_key) or {}).get("division_id") or ""
+        want = _dcol.weekly_only(div)
+    except Exception:
+        div, want = "", {}
+    if not want:
+        return proj
+    keep = _weekly_match(proj, want)
+    # -----------------------------------------------------------
+    # 안 맞으면 어디까지 봐 주나
+    # -----------------------------------------------------------
+    # 한 프로젝트에 맞는 줄이 없다고 거르기를 포기하면 안 된다 — 아리스타 27개 중 렉이 있는 건 일곱뿐이라, 나머지 스물은 샷시 숫자를 그대로 띄우게 된다
+    if not keep and not _weekly_rule_live(div, want):
+        return proj
+    out = dict(proj)
+    out["models"] = keep
+    return out
+
+
+# 그 조건에 맞는 모델만.
+def _weekly_match(proj: dict, want: dict) -> list:
+    keep = []
+    for m in (proj.get("models") or []):
+        if not isinstance(m, dict):
+            continue
+        for field, vals in want.items():
+            if str(m.get(field) or "").strip() in vals:
+                keep.append(m)
+                break
+    return keep
+
+
+# 그 사업부 어딘가에 조건에 맞는 줄이 하나라도 있나.
+def _weekly_rule_live(division_id: str, want: dict) -> bool:
+    try:
+        data = _load_models()
+        for p in _cl.get_projects(division_id=division_id, visible_only=False):
+            pid = p.get("id")
+            if not pid:
+                continue
+            proj = (data.get("projects") or {}).get(pid) or {}
+            if _weekly_match(proj, want):
+                return True
+    except Exception as e:
+        print("[weekly] 조건 확인 실패 %s: %s" % (division_id, e))
+    return False
+
+
+# 엑셀로 올리던 '주차별 계획 원본' 표를 데이터에서 계산해 돌려준다 ← admin v2 renderWeeklyBoard() · 앱 division_board_service.dart 외
 @app.get("/projects/{project_key}/weekly-board")
 def get_weekly_board(project_key: str, month: str = None):
-    """엑셀로 올리던 '주차별 계획 원본' 표를 데이터에서 계산해 돌려준다.
-
-    열 구성: PO수량 / 누적실적 / 잔량 / 지난달 / 이번달 주차별(계획·실적) /
-             이번달 합계 / 다음달 계획 / PO증감
-    """
     import datetime as _dt
     _key = _model_key_alias(project_key)
     proj = (_load_models().get("projects") or {}).get(_key) or {}
     month = (month or "").strip() or _dt.date.today().strftime("%Y-%m")
+    # -----------------------------------------------------------
+    # 여기서는 거르지 않는다
+    # -----------------------------------------------------------
+    # 한 번 _weekly_filtered 를 여기에 걸었다가, 아리스타 프로젝트 (Baja-Peninsula-90W 등)의 보드가 통째로 0 이 됐다
+
+    # 블룸·ESS 는 일 보고로 그린다 — '구분' 열이 공정이다.
+    # (양산/개발로 그리면 두 줄 다 0 이 뜬다. 그 구분이 자료에 없다.)
+    _bl = _daily_project_board(_key, month)
+    if _bl is not None:
+        return _bl
 
     # 프로젝트별 행 구성이 정의돼 있으면 그대로 그린다 (챔버 등).
     # 없으면 예전처럼 양산/개발 두 줄 (하바플레이트).
@@ -25749,25 +18870,51 @@ def get_weekly_board(project_key: str, month: str = None):
         return _spec_board(_key, proj, _spec, month)
 
     weeks = _get_month_weeks(month)
+    # -----------------------------------------------------------
+    # 지난달 · 다음달이 몇 월인지
+    # -----------------------------------------------------------
+    #    표에 '지난달 실적'과 '다음달 계획' 열이 있어서 앞뒤 달이 필요하다.
+    #    1월의 지난달은 작년 12월, 12월의 다음달은 내년 1월이다.
+    y = int(month[:4])
+    mm = int(month[5:7])
+    if mm == 1:
+        prev = f"{y - 1}-12"
+    else:
+        prev = f"{y}-{mm - 1:02d}"
+    if mm == 12:
+        nxt = f"{y + 1}-01"
+    else:
+        nxt = f"{y}-{mm + 1:02d}"
 
-    y, mm = int(month[:4]), int(month[5:7])
-    prev = f"{y - 1}-12" if mm == 1 else f"{y}-{mm - 1:02d}"
-    nxt = f"{y + 1}-01" if mm == 12 else f"{y}-{mm + 1:02d}"
+    # 그 달 주차별 합계 {'W41': {'plan':.., 'actual':..}, ...}
+    def _group_week_totals(group, mon):
+        wk = _get_month_weeks(mon)
+        if group == "양산":
+            return _mass_week_totals(proj, mon, wk)
+        return _dev_week_totals(proj, mon, wk)
 
+    # 그 달 실적을 한 숫자로 (주차별 실적을 다 더한다).
     def month_actual(group, mon):
-        wk = _get_month_weeks(mon)
-        t = _mass_week_totals(proj, mon, wk) if group == "양산" else _dev_week_totals(proj, mon, wk)
-        return sum(v["actual"] for v in t.values())
+        t = _group_week_totals(group, mon)
+        total = 0
+        for v in t.values():
+            total += v["actual"]
+        return total
 
+    # 그 달 계획을 한 숫자로 (주차별 계획을 다 더한다).
     def month_plan(group, mon):
-        wk = _get_month_weeks(mon)
-        t = _mass_week_totals(proj, mon, wk) if group == "양산" else _dev_week_totals(proj, mon, wk)
-        return sum(v["plan"] for v in t.values())
+        t = _group_week_totals(group, mon)
+        total = 0
+        for v in t.values():
+            total += v["plan"]
+        return total
 
     rows = []
     for g in ("양산", "개발"):
+        # b = 그 구분(양산/개발)에 사람이 직접 적어 둔 값 묶음
         b = _group_bucket(proj, g)
-        wk = _mass_week_totals(proj, month, weeks) if g == "양산" else _dev_week_totals(proj, month, weeks)
+        # wk = 그 구분의 이번 달 주차별 계획·실적
+        wk = _group_week_totals(g, month)
         # PO 수량은 그룹 단위로 직접 입력한 값이 정본 (없으면 모델별 합계).
         # 누적 실적은 모델 목록의 '실적 수량' 합계가 정본 (없으면 전 기간 주차 실적).
         base = int(b.get("base_actual") or 0)
@@ -25775,10 +18922,23 @@ def get_weekly_board(project_key: str, month: str = None):
         po = int(b.get("po_qty") or 0) or m_po
         actual_total = (int(b.get("shipped_qty") or 0) or m_ship
                         or (base + _all_actual_sum(proj, g)))
-        nxt_plan = month_plan(g, nxt) or int(b.get("next_month_plan") or 0)
+        # -----------------------------------------------------------
+        # 다음달 계획
+        # -----------------------------------------------------------
+        #    다음달 주차에 적힌 계획을 먼저 쓰고, 그게 0이면 사람이
+        #    따로 적어 둔 '다음달 계획' 칸을 쓴다.
+        nxt_plan = month_plan(g, nxt)
+        if not nxt_plan:
+            nxt_plan = int(b.get("next_month_plan") or 0)
+        # -----------------------------------------------------------
+        # 줄 이름
+        # -----------------------------------------------------------
+        #    개발은 몇 종이 진행 중이고 몇 종이 끝났는지를 이름에 같이 적는다.
+        #    표에 열을 더 만들지 않고 한눈에 보이게 하려는 것이다.
         label = g
         if g == "개발":
-            on, done = int(b.get("ongoing_types") or 0), int(b.get("done_types") or 0)
+            on = int(b.get("ongoing_types") or 0)
+            done = int(b.get("done_types") or 0)
             if on or done:
                 label = f"개발 ({on}종 진행중 / {done}종 완료)"
         rows.append({
@@ -25788,34 +18948,62 @@ def get_weekly_board(project_key: str, month: str = None):
             "actual_total": actual_total,
             "remaining": po - actual_total,
             "prev_month_actual": month_actual(g, prev),
-            "weeks": {w: wk[w] for w in weeks},
-            "month_plan": sum(v["plan"] for v in wk.values()),
-            "month_actual": sum(v["actual"] for v in wk.values()),
+            "weeks": _only_these_weeks(wk, weeks),
+            "month_plan": _sum_of(wk.values(), "plan"),
+            "month_actual": _sum_of(wk.values(), "actual"),
             "next_month_plan": nxt_plan,
         })
+    # -----------------------------------------------------------
+    # 합계 줄 만들기
+    # -----------------------------------------------------------
+    #    양산 줄과 개발 줄을 칸마다 더한다.
+    total = {"label": "합계"}
+    for field in ("po_qty", "actual_total", "remaining", "prev_month_actual",
+                  "month_plan", "month_actual", "next_month_plan"):
+        total[field] = _sum_of(rows, field)
 
-    total = {
-        "label": "합계",
-        "po_qty": sum(r["po_qty"] for r in rows),
-        "actual_total": sum(r["actual_total"] for r in rows),
-        "remaining": sum(r["remaining"] for r in rows),
-        "prev_month_actual": sum(r["prev_month_actual"] for r in rows),
-        "weeks": {w: {"plan": sum(r["weeks"][w]["plan"] for r in rows),
-                      "actual": sum(r["weeks"][w]["actual"] for r in rows)} for w in weeks},
-        "month_plan": sum(r["month_plan"] for r in rows),
-        "month_actual": sum(r["month_actual"] for r in rows),
-        "next_month_plan": sum(r["next_month_plan"] for r in rows),
-    }
-    # PO증감은 양산/개발을 나누지 않고 합계 한 벌만 (엑셀 표기와 동일)
+    # 주차 칸은 계획·실적 두 개라 따로 더한다
+    total_weeks = {}
+    for w in weeks:
+        plan_sum = 0
+        actual_sum = 0
+        for r in rows:
+            plan_sum += r["weeks"][w]["plan"]
+            actual_sum += r["weeks"][w]["actual"]
+        total_weeks[w] = {"plan": plan_sum, "actual": actual_sum}
+    total["weeks"] = total_weeks
+    # -----------------------------------------------------------
+    # PO증감 이력
+    # -----------------------------------------------------------
+    # PO 수량이 중간에 바뀐 기록이다
     _hist = []
     for g in ("양산", "개발"):
         _hist.extend((_group_bucket(proj, g).get("po_history") or []))
+    _seen_log = set()
+    for _m in (proj.get("models") or []):
+        if not isinstance(_m, dict):
+            continue
+        for _e in (_m.get("po_log") or []):
+            if not isinstance(_e, dict) or not _e.get("date"):
+                continue
+            # 같은 모델이 두 벌로 들어와 있어도 한 번만 센다
+            _k = (_m.get("id"), _e.get("date"), _e.get("from"), _e.get("to"))
+            if _k in _seen_log:
+                continue
+            _seen_log.add(_k)
+            _hist.append(_e)
     po_delta = _po_delta_summary(_hist, month, _project_manual_deltas(proj, month))
-
+    # -----------------------------------------------------------
+    # 이번 주가 몇 번째 주인가 (화면에서 빨간 테두리를 두를 열)
+    # -----------------------------------------------------------
     try:
         cur_week = "W%02d" % _dt.date.today().isocalendar()[1]
     except Exception:
         cur_week = None
+    # -----------------------------------------------------------
+    # 계획을 못 채운 주와 그 사유
+    # -----------------------------------------------------------
+    #    _reasons = {'W42': '고객사 라인 점검으로 …'} — 사람이 엑셀에 적는다
     _reasons = _week_reasons_of(proj, month)
     _closed, _shorts = _mark_board_shortfalls(rows, total, weeks, month, _reasons)
     return {"project_key": _key, "month": month, "weeks": weeks,
@@ -25826,8 +19014,80 @@ def get_weekly_board(project_key: str, month: str = None):
             "rows": rows, "total": total}
 
 
+# 사업부 화면에 띄울 주차 현황 보드 ← 앱 division_board_service.dart
+@app.get("/divisions/{division_id}/weekly-board")
+def get_division_weekly_board(division_id: str, month: str = ""):
+    import datetime as _dt2
+    mon = (month or "").strip() or _dt2.date.today().strftime("%Y-%m")
+    # -----------------------------------------------------------
+    # 앞뒤 달 (표에 '지난달 실적' · '다음달 계획' 열이 있다)
+    # -----------------------------------------------------------
+    # 이걸 안 실어 보냈더니 잔량과 W41 사이 열의 머리글이
+    # 비어서, 아무 이름도 없는 빈 칸이 하나 서 있었다. 열은 그려지는데
+    # 무엇인지 알 길이 없으면 '이게 뭐지' 를 매번 묻게 된다.
+    _y, _m = int(mon[:4]), int(mon[5:7])
+    prev = "%d-12" % (_y - 1) if _m == 1 else "%d-%02d" % (_y, _m - 1)
+    nxt = "%d-01" % (_y + 1) if _m == 12 else "%d-%02d" % (_y, _m + 1)
+    want = _dcol.weekly_only(division_id)
+    data = _load_models()
+    live = _weekly_rule_live(division_id, want) if want else False
+
+    rows = []
+    weeks = _get_month_weeks(mon)
+    for p in _cl.get_projects(division_id=division_id, visible_only=False):
+        pid = p.get("id")
+        if not pid:
+            continue
+        proj = (data.get("projects") or {}).get(pid) or {}
+        if want and live and not _weekly_match(proj, want):
+            continue                 # 조건에 안 맞는 프로젝트는 줄을 안 세운다
+        b = get_weekly_board(pid, mon)
+        tot = (b or {}).get("total") or {}
+        if not tot:
+            continue
+        rows.append({
+            "group": str(p.get("label") or pid),
+            "label": str(p.get("label") or pid),
+            "project_key": pid,
+            "po_qty": tot.get("po_qty") or 0,
+            "base_actual": tot.get("base_actual") or 0,
+            "actual_total": tot.get("actual_total") or 0,
+            "remaining": tot.get("remaining") or 0,
+            "prev_month_actual": tot.get("prev_month_actual") or 0,
+            "weeks": tot.get("weeks") or {},
+            "month_plan": tot.get("month_plan") or 0,
+            "month_actual": tot.get("month_actual") or 0,
+            "next_month_plan": tot.get("next_month_plan") or 0,
+        })
+        weeks = (b or {}).get("weeks") or weeks
+
+    total = {}
+    for field in ("po_qty", "base_actual", "actual_total", "remaining",
+                  "prev_month_actual", "month_plan", "month_actual",
+                  "next_month_plan"):
+        total[field] = sum(int(r.get(field) or 0) for r in rows)
+    tw = {}
+    for w in weeks:
+        tw[w] = {
+            "plan": sum(int(((r.get("weeks") or {}).get(w) or {}).get("plan") or 0) for r in rows),
+            "actual": sum(int(((r.get("weeks") or {}).get(w) or {}).get("actual") or 0) for r in rows),
+        }
+    total["weeks"] = tw
+
+    try:
+        cur_week = "W%02d" % _dt2.date.today().isocalendar()[1]
+    except Exception:
+        cur_week = None
+    return {"division_id": division_id, "month": mon, "weeks": weeks,
+            "prev_month": prev, "next_month": nxt,
+            "current_week": cur_week, "rows": rows, "total": total,
+            "closed_weeks": [], "shortfalls": [], "week_reasons": {},
+            "po_delta": None}
+
+# ============================================================
+#  PO 증감
+# ============================================================
 def _month_of_week_key(week_no, ref_month):
-    """주차 번호가 어느 달에 속하는지. 월별 주차 배정 규칙(_get_month_weeks)을 그대로 쓴다."""
     tag = "W%02d" % int(week_no)
     try:
         y, m = int(str(ref_month)[:4]), int(str(ref_month)[5:7])
@@ -25846,12 +19106,8 @@ def _month_of_week_key(week_no, ref_month):
     return None
 
 
+# PO증감 입력 칸. 지난 6개월은 월 단위, 이번 달은 주차 단위로 고정한다
 def _delta_periods(month):
-    """PO증감 입력 칸. 지난 6개월은 월 단위, 이번 달은 주차 단위로 고정한다.
-
-    10월이 되면 W36~W40 은 자동으로 '9월' 한 줄로 접히고
-    W41, W42 … 가 새로 열린다. 사용자가 기간을 직접 만들 필요가 없다.
-    """
     y, m = int(str(month)[:4]), int(str(month)[5:7])
     out = []
     for off in range(6, 0, -1):
@@ -25864,8 +19120,8 @@ def _delta_periods(month):
     return out
 
 
+# 직접 입력한 PO증감. 예전에 그룹별로 저장된 값도 합쳐서 한 벌로 돌려준다
 def _project_manual_deltas(proj, month=None):
-    """직접 입력한 PO증감. 예전에 그룹별로 저장된 값도 합쳐서 한 벌로 돌려준다."""
     import re as _re
     rows = proj.get("po_delta_manual")
     if not (isinstance(rows, list) and rows):
@@ -25910,13 +19166,8 @@ def _project_manual_deltas(proj, month=None):
     return [{"period": k, "delta": v} for k, v in sorted(out.items())]
 
 
+# PO 증감 요약.
 def _po_delta_summary(history, month, manual=None):
-    """PO 증감 요약.
-
-    지난 달까지는 월 단위, 이번 달은 주차 단위로 보여준다.
-    (9월이면 '9월: N' 이 아니라 'W36: N / W37: N')
-    엑셀에서 읽은 이력(history)과 직접 입력한 값(manual)을 합친다.
-    """
     import datetime as _dt
     # 직접 입력한 표가 있으면 그게 정본이다. 엑셀에서 읽은 이력과 더하면
     # 같은 기간이 두 번 세어져(3월 619 + 1,321 = 1,940) 입력값과 안 맞는다.
@@ -25924,15 +19175,31 @@ def _po_delta_summary(history, month, manual=None):
         history = []
     by_month, by_week = {}, {}
     for h in history or []:
-        try:
-            d = _dt.date.fromisoformat(str(h.get("date"))[:10])
-        except Exception:
-            continue
         if h.get("delta") is not None:
             delta = int(h.get("delta") or 0)
         else:
             delta = int(h.get("to") or 0) - int(h.get("from") or 0)
         if not delta:
+            continue
+        # -----------------------------------------------------------
+        # 양식이 '몇 주차 자료' 인지 적어 보냈으면 그걸 믿는다
+        # -----------------------------------------------------------
+        # 올린 날짜로 주차를 세면, W43 양식을 다음 주 월요일에 올렸을 때
+        # W44 에 숫자가 선다. 그 주엔 아무 일도 안 일어났는데 보는 사람은
+        # "이번 주에 PO 가 늘었네" 로 읽는다. 양식이 말하는 주차가 맞다.
+        _wk = str(h.get("week") or "").strip().upper()
+        if _wk:
+            _mon = _wcal.month_of_week(_wk) or ""
+            if _mon == month:
+                by_week[_wk] = by_week.get(_wk, 0) + delta
+            elif _mon:
+                by_month[_mon] = by_month.get(_mon, 0) + delta
+            continue
+
+        # 주차를 안 적어 보낸 옛 기록은 날짜로 센다
+        try:
+            d = _dt.date.fromisoformat(str(h.get("date"))[:10])
+        except Exception:
             continue
         mk = f"{d.year}-{d.month:02d}"
         if mk == month:
@@ -25975,11 +19242,13 @@ def _po_delta_summary(history, month, manual=None):
         "weeks": [{"key": k, "delta": v} for k, v in sorted(by_week.items()) if v],
     }
 
-
+# ============================================================
+#  모델 주차 계획 저장 (잠김)
+# ============================================================
+# 월별 주차별 계획/실적 저장
 @app.put("/admin/projects/{project_key}/models/{model_id}/weekly-plan")
 def put_weekly_plan(project_key: str, model_id: str, payload: dict,
                     _admin: int = Depends(get_admin_session)):
-    """월별 주차별 계획/실적 저장"""
     from urllib.parse import unquote
     import datetime as _dt
     model_id = unquote(model_id)
@@ -26005,7 +19274,9 @@ def put_weekly_plan(project_key: str, model_id: str, payload: dict,
         bucket[w] = {"plan": int(wp.get("plan") or 0), "actual": int(wp.get("actual") or 0)}
     cur[month] = bucket
     target["weekly_progress"] = _ensure_mass_progress(cur, month)
-    # ── 앱 표시용 필드 자동 반영 (po_qty/shipped_qty/due_text) ──
+    # -----------------------------------------------------------
+    # 앱 표시용 필드 자동 반영 (po_qty/shipped_qty/due_text)
+    # -----------------------------------------------------------
     _plan_total = sum(v["plan"] for v in bucket.values())
     _act_total = sum(v["actual"] for v in bucket.values())
     if _plan_total > 0 or _act_total > 0:
@@ -26016,13 +19287,7 @@ def put_weekly_plan(project_key: str, model_id: str, payload: dict,
     return {"ok": True, "model_id": model_id, "month": month, "progress": target["weekly_progress"]}
 
 
-# ─── 단계별 표준 소요 (주) ───────────────────────────────
-#
-# '자재 입고부터 최종 승인까지 평균 석 달' 을 단계로 쪼개 보여준다.
-# 실적일로 내고 싶었지만 파워박스는 실적일이 단계당 2~5건뿐이고,
-# 계획일은 대부분 +7 / +14 로 찍혀 있어 실제 리드타임이 아니다
-# (계획일 기준 자재입고→최종승인 중앙값이 5주 — 석 달의 절반도 안 된다).
-# 그래서 기본값을 넣어 두고 admin 에서 고친다.
+# ─ 단계별 표준 소요 (주) ───────────────────────────────
 PROCESS_LEAD_DEFAULT = {
     "powerbox": {
         "FA PO": 0, "자재 발주": 1, "자재 입고": 4,
@@ -26038,32 +19303,79 @@ PROCESS_LEAD_DEFAULT = {
 }
 
 
+# ─ 사업부 단위 표준 소요 ──────────────────────────────
+_AUTO_LEAD_MONTHS = {
+    "SDI":        [6, 12, 4, 8, 10, 12],
+    "현대차":      [4, 6, 6, 8, 10, 12],
+    "LG마그나":    [12, 1, 2, 2, 1, 1],
+    "LGE":        [3, 12, 8, 8, 8, 1],
+    "Schaeffler": [6, 8, 10, 12, 14],
+    "Stellantis": [11, 14, 17, 19, 21],
+}
+
+# 고객사 묶음 → 프로젝트 키. 한 묶음이 여러 프로젝트다 (현대차는
+# KEFICO · MOBIS · 영화테크가 다 같은 절차를 쓴다).
+_AUTO_LEAD_PROJECTS = {
+    "SDI": ["automotive_sdi_hungary", "automotive_sdi_kr", "automotive_sdi_mlbw",
+            "automotive_sdi_austria", "automotive_sdi_usa", "automotive_sdi_ppe"],
+    "현대차": ["automotive_kefico_kr", "automotive_kefico_india",
+             "automotive_kefico_vn", "automotive_hyundai_mobis",
+             "automotive_hyundai_jg", "automotive_younghwa_tech",
+             "auto_kefico"],
+    "LG마그나": ["automotive_lg_magna"],
+    "LGE": ["automotive_lge_vn", "automotive_lge_kr"],
+    # 'Schaeffler' 와 'Schaefller' 두 프로젝트로 나뉘어 있다. 하나로
+    # 합치기 전까지는 둘 다 같은 값을 쓴다.
+    "Schaeffler": ["automotive_schaeffler", "automotive_schaefller",
+                   "auto_schaeffler"],
+    "Stellantis": ["automotive_stellantis", "auto_stellantis"],
+}
+
+# 프로젝트 키 → 자리별 소요(개월).
+PROCESS_LEAD_MONTHS_BY_PROJECT = {
+    pk: months
+    for group, months in _AUTO_LEAD_MONTHS.items()
+    for pk in _AUTO_LEAD_PROJECTS.get(group, [])
+}
+
+# ============================================================
+#  단계 이름 · 소요 개월 · CDR/PRR
+# ============================================================
+def _lead_by_position(project_key: str, steps: list) -> dict:
+    months = PROCESS_LEAD_MONTHS_BY_PROJECT.get(project_key) or []
+    out = {}
+    for i, name in enumerate(steps or []):
+        if i >= len(months):
+            break
+        m = months[i]
+        # 1개월 = 4.345주 (52.14 ÷ 12). 반올림해도 되돌리면 같은 달수다.
+        out[name] = (int(round(m * 4.345)), "%d개월" % m)
+    return out
+
+
+PROCESS_LEAD_BY_DIVISION = {
+    "bloom": {
+        "PO 발주": 2, "PO 접수": 2,
+        "PRP": 3,
+        "최종 승인": 0,
+    },
+}
+
+
+# '04 CB' → 'CB'. 엑셀마다 번호를 붙이기도 하고 안 붙이기도 한다
 def _canon_step(name: str) -> str:
-    """'04 CB' → 'CB'. 엑셀마다 번호를 붙이기도 하고 안 붙이기도 한다."""
     t = str(name or "").strip()
     if len(t) > 3 and t[:2].isdigit():
         t = t[3:].strip()
     return t
 
 
-# ─── 파워박스 공정 13·14번 자리를 한 틀로 ─────────────────────────
-#
-# 모델이 두 틀로 갈라져 있었다.
-#   CDR 틀 26종  … 12 FAIR 승인 · 13 CDR · 14 최종 승인
-#   PRR 틀 22종  … 12 FAIR 승인 · 13 PRR 작성 · 14 PRR 승인 · 15 최종 승인
-# 같은 자리(FAIR 승인 다음, 최종 승인 앞)다. 작성/승인을 따로 보려고
-# 두 칸으로 맞춘다 (Min 2026-09-21, 안 B).
-#   … 12 FAIR 승인 · 13 CDR/PRR 작성 · 14 CDR/PRR 승인 · 15 최종 승인
-# CDR 틀은 CDR 날짜를 '승인' 칸으로 옮기고 '작성' 칸은 비워 둔다
-# (승인이 끝나면 _process_rolled 가 앞 칸을 완료로 그린다).
-#
-# 번호가 붙은 파워박스 틀('01 FA PO')만 본다. 기본 13단계 틀로 들어간
-# 모델(CONGA SPDB · VDP Aux)은 가공 · LAP TEST 가 있는 다른 틀이라 안 건드린다.
+# ─ 파워박스 공정 13·14번 자리를 한 틀로 ─────────────────────────
 _CDR_PRR_PROJECTS = {"powerbox"}
 
 
+# 바꾼 사본, 바꿀 게 없으면 None.
 def _unify_cdr_prr(proc: list):
-    """바꾼 사본, 바꿀 게 없으면 None."""
     import re as _re
     if not proc or not _re.match(r"^\d{2}\s", str((proc[0] or {}).get("name") or "")):
         return None
@@ -26094,9 +19406,8 @@ def _unify_cdr_prr(proc: list):
     return out
 
 
+# 이 프로젝트가 실제로 쓰는 단계 이름.
 def _project_steps(proj: dict) -> list:
-    """이 프로젝트가 실제로 쓰는 단계 이름. 모델마다 틀이 달라질 수 있어
-    가장 많이 쓰이는 것을 고른다. 하나도 없으면 기본 13단계."""
     from collections import Counter
     sigs = Counter()
     for m in (proj or {}).get("models") or []:
@@ -26108,13 +19419,12 @@ def _project_steps(proj: dict) -> list:
         return list(sigs.most_common(1)[0][0])
     return [n for _k, n, _g in DEV_PROCESS_STEPS]
 
-
+# ============================================================
+#  공정 주소
+# ============================================================
+# 앱 칩 줄 — 단계 이름 + 표준 소요(주) ← admin v2 leadBtn.onclick() · 앱 model_list_screen.dart _loadSteps()
 @app.get("/projects/{project_key}/process-steps")
 def get_process_steps(project_key: str):
-    """앱 칩 줄 — 단계 이름 + 표준 소요(주).
-
-    weeks 가 None 이면 아직 안 정한 것이라 칩에 아무것도 안 붙인다.
-    """
     _key = _model_key_alias(project_key)
     data = _load_models()
     proj = (data.get("projects") or {}).get(_key) or {}
@@ -26124,8 +19434,24 @@ def get_process_steps(project_key: str):
     if not isinstance(lead, dict) or not lead:
         lead = PROCESS_LEAD_DEFAULT.get(_key) or {}
         src = "default" if lead else "none"
+    if not lead:
+        # 프로젝트에 없으면 사업부 값을 쓴다 (블룸 — 프로젝트 15개가
+        # 같은 세 단계를 쓴다).
+        _div = _cl.derive_division_from_project(_key)
+        lead = PROCESS_LEAD_BY_DIVISION.get(_div or "") or {}
+        src = "division" if lead else "none"
+    # 자리로 맞춘 값이 있으면 그게 먼저다 (자동차 — 고객사마다 단계
+    # 이름이 달라서 이름으로는 못 맞춘다).
+    bypos = _lead_by_position(_key, steps)
+    if bypos:
+        src = "고객사별"
+
     out = []
     for n in steps:
+        if n in bypos:
+            w, label = bypos[n]
+            out.append({"name": n, "weeks": w, "label": label})
+            continue
         v = lead.get(n)
         if v is None:
             v = lead.get(_canon_step(n))
@@ -26133,15 +19459,18 @@ def get_process_steps(project_key: str):
             v = int(v) if v is not None and str(v).strip() != "" else None
         except (TypeError, ValueError):
             v = None
-        out.append({"name": n, "weeks": v})
+        # label 은 앱이 칩에 그대로 적는 글자다. 주 단위 값은 '2주'.
+        # 안 정한 단계는 label 도 빈 글자라 칩에 아무것도 안 붙는다.
+        out.append({"name": n, "weeks": v,
+                    "label": ("%d주" % v) if isinstance(v, int) else ""})
     total = sum(x["weeks"] for x in out if isinstance(x.get("weeks"), int))
     return {"project_key": _key, "source": src, "steps": out, "total_weeks": total}
 
 
+# 단계별 표준 소요(주) 저장. 빈 값은 '안 정함' 으로 둔다 ← admin v2 onclick()
 @app.put("/admin/projects/{project_key}/process-lead")
 async def admin_set_process_lead(project_key: str, request: Request,
                                  _admin: int = Depends(get_admin_session)):
-    """단계별 표준 소요(주) 저장. 빈 값은 '안 정함' 으로 둔다."""
     payload = await request.json()
     lead_in = (payload or {}).get("lead") or {}
     if not isinstance(lead_in, dict):
@@ -26173,9 +19502,9 @@ async def admin_set_process_lead(project_key: str, request: Request,
             "total_weeks": sum(lead.values())}
 
 
+# 앱용 개발 승인 프로세스 조회
 @app.get("/projects/{project_key}/models/{model_id}/process")
 def get_model_process(project_key: str, model_id: str):
-    """앱용 개발 승인 프로세스 조회"""
     from urllib.parse import unquote
     model_id = unquote(model_id)
     _key = _model_key_alias(project_key)
@@ -26185,14 +19514,22 @@ def get_model_process(project_key: str, model_id: str):
         if isinstance(m, dict) and (m.get("id") or "").lower() == model_id.lower():
             if m.get("group") != "개발":
                 raise HTTPException(status_code=400, detail="개발 모델만 프로세스가 있습니다.")
-            _ensure_process(m)
-            _save_models(data)
+            try:
+                _d = _cl.derive_division_from_project(_key) or ""
+            except Exception:
+                _d = ""
+            # 여기도 GET 이다. 기본 단계를 깔아 주려고 models.json 을 통째로 다시 쓰고 있었다 — 앱이 품목 하나를 열 때마다 큰 파일을 쓴 셈이다
+            _ensure_process(m, _d)
             # 저장은 엑셀이 적은 그대로, 보여줄 때만 최종 승인 기준으로 채운다
-            proc = _process_rolled(m.get("process") or [])
-            done = sum(1 for s in proc
+            _rolled = _process_rolled(m.get("process") or [])
+            proc = _ds_show_notes(_rolled)
+            # 세는 건 글자를 채우기 전 것으로 한다. 채운 사본은 '카이저 입고
+            # 필요' 같은 글자가 실적 자리에 들어가 있어서, 그걸로 세면
+            # 안 끝난 단계가 끝난 것으로 잡힌다.
+            done = sum(1 for s in _rolled
                        if (str(s.get("actual") or "").strip() or str(s.get("status") or "") == "완료")
                        and str(s.get("status") or "") not in ("미승인", "미제출"))
-            stage, expected = _process_current(proc)
+            stage, expected = _process_current(_rolled)
             return {
                 "model_id": model_id,
                 "model_name": m.get("name") or model_id,
@@ -26200,28 +19537,25 @@ def get_model_process(project_key: str, model_id: str):
                 "steps": proc,
                 "done": done,
                 "total": len(proc),
-                "progress": _process_progress(proc),
+                "progress": _process_progress(_rolled),
                 "current_stage": stage,
                 "current_expected": expected,
                 "issues": m.get("issues") or "",
             }
     raise HTTPException(status_code=404, detail="모델을 찾을 수 없습니다.")
 
+# admin v2 'Process 입력' 화면용 조회 (앱용과 같은 형식).
 @app.get("/admin/projects/{project_key}/models/{model_id}/process")
 def admin_get_model_process(project_key: str, model_id: str,
                             _admin: int = Depends(get_admin_session)):
-    """admin v2 'Process 입력' 화면용 조회 (앱용과 같은 형식)."""
     return get_model_process(project_key, model_id)
 
 
+# 공정 단계 하나의 상태만 바꾼다 (표의 상태 드롭다운) ← admin v2 procInput.onchange() · _pfProcess()
 @app.post("/admin/projects/{project_key}/models/{model_id}/process/step-status")
 def admin_set_process_step_status(project_key: str, model_id: str, payload: dict,
                                   _admin: int = Depends(get_admin_session)):
-    """공정 단계 하나의 상태만 바꾼다 (표의 상태 드롭다운).
-    payload = {step_key, status}  status: '' | '대기' | '진행중' | '완료' | '미승인' | '미제출'
-    '완료'로 바꿨는데 실적일이 비어 있으면 오늘 날짜를 채워 진행률에 반영되게 한다."""
     from urllib.parse import unquote
-    import datetime as _dt
     model_id = unquote(model_id)
     step_key = str(payload.get("step_key") or "").strip()
     status = str(payload.get("status") or "").strip()
@@ -26266,12 +19600,10 @@ def admin_set_process_step_status(project_key: str, model_id: str, payload: dict
     }
 
 
+# admin v2 'Process 입력' 저장.
 @app.put("/admin/projects/{project_key}/models/{model_id}/process")
 def admin_put_model_process(project_key: str, model_id: str, payload: dict,
                             _admin: int = Depends(get_admin_session)):
-    """admin v2 'Process 입력' 저장.
-    payload = {dev_type, steps:[{key, expected, actual, status}, ...]}
-    단계 이름·순서는 서버가 가진 것을 유지하고 입력값만 덮어쓴다."""
     from urllib.parse import unquote
     model_id = unquote(model_id)
     _key = _model_key_alias(project_key)
@@ -26320,31 +19652,28 @@ def admin_put_model_process(project_key: str, model_id: str, payload: dict,
     }
 
 
-# ── 파워박스 프로세스 엑셀: 시트별 템플릿 ──
+# ============================================================
+#  파워박스 프로세스 엑셀: 시트별 템플릿
+# ============================================================
 _PB_SHEET_STEPS = {
     'majormodule': ['FA PO','자재 발주','자재 입고','CB','BV1','BV2','Source Inspection','FAIR 작성','FAIR 승인','PRR 작성','PRR 승인','최종 승인'],
     'pbx':  ['FA PO','자재 발주','자재 입고','CB','BV1','BV2','LA 입고','LAIR 작성','LAIR 승인','Source Inspection','FAIR 작성','FAIR 승인','PRR','최종 승인'],
     'ema':  ['FA PO','자재 발주','자재 입고','CB','BV1','BV2','LA 입고','LAIR 작성','LAIR 승인','Source Inspection','FAIR 작성','FAIR 승인','CDR','최종 승인'],
 }
 
-def _pb_cell_str(v):
-    import datetime as _dt
-    if v is None: return ''
-    if isinstance(v, (_dt.datetime, _dt.date)): return v.strftime('%Y-%m-%d')
-    s = str(v).strip()
-    if s.startswith('='): return ''   # 수식은 무시
-    return s
-
+# ============================================================
+#  파워박스 판가 엑셀
+# ============================================================
+# 파워박스 판가/재료비 엑셀 업로드 (PBX/MajorModule/EMA 시트 자동 인식)
 @app.post("/admin/projects/{project_key}/price-import-xlsx")
 async def admin_price_import_xlsx(project_key: str, file: UploadFile = File(...), _admin: int = Depends(get_admin_session)):
-    """파워박스 판가/재료비 엑셀 업로드 (PBX/MajorModule/EMA 시트 자동 인식)"""
     if project_key != "powerbox":
         raise HTTPException(status_code=400, detail="파워박스 프로젝트에서만 사용 가능합니다.")
     import io
     import openpyxl
     try:
         raw = await _keep_upload(file, "/admin/projects/{project_key}/price-import-xlsx", project_key)
-        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, keep_links=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"엑셀 읽기 실패: {e}")
 
@@ -26415,7 +19744,13 @@ async def admin_price_import_xlsx(project_key: str, file: UploadFile = File(...)
             pr = num(r[col_pr]) if col_pr is not None and col_pr < len(r) else 0
             mc = num(r[col_mc]) if col_mc is not None and col_mc < len(r) else 0
             if not dvt:
-                dvt = "PBX" if sheet_name == "PBX" else ("EMA" if sheet_name == "EMA" else "HVM")
+                # 시트 이름이 곧 구분이다 (PBX · EMA), 나머지는 양산(HVM)
+                if sheet_name == "PBX":
+                    dvt = "PBX"
+                elif sheet_name == "EMA":
+                    dvt = "EMA"
+                else:
+                    dvt = "HVM"
 
             target = None
             for m in proj["models"]:
@@ -26455,21 +19790,22 @@ _STEP_NA = {'na', 'n/a', '-', '--', 'tbd', '미정', '해당없음', '없음', '
 # 예전 임포터가 비고에 적어 두던 모양: '10 FAIR Approval: Not yet · 11 LAP Test: Not yet'
 _AUTO_NOTE_RE = re.compile(r'^\s*\d{2}\s+[^:]+:[^·]+(·\s*\d{2}\s+[^:]+:[^·]+)*\s*$')
 
-
+# ============================================================
+#  공정 엑셀 한 번에 올리기 · 주차 요약 · 되살리기
+# ============================================================
 def _looks_auto_note(note) -> bool:
-    """비고가 사람 글이 아니라 예전 업로드가 적어 둔 단계 나열인가."""
     t = str(note or '').strip()
     return bool(t) and bool(_AUTO_NOTE_RE.match(t))
 
 
+# 날짜면 'YYYY-MM-DD', 아니면 빈칸.
 def _step_date(raw: str) -> str:
-    """날짜면 'YYYY-MM-DD', 아니면 빈칸. 날짜 칸에 글자를 넣지 않는다."""
     import process_import as _pi
     return _pi._as_date(raw) or ''
 
 
+# 실적 칸 → (실적일, 상태).
 def _step_actual(raw: str):
-    """실적 칸 → (실적일, 상태)."""
     t = (raw or '').strip()
     if not t:
         return '', ''
@@ -26482,21 +19818,17 @@ def _step_actual(raw: str):
     return '', '완료'
 
 
+# 통합 업로드: MajorModule/PBX/EMA 시트 자동 인식, 프로세스+가격 한번에 ← admin v2 procInput.onchange() · _pfProcess()
 @app.post("/admin/projects/{project_key}/import-xlsx")
 @app.post("/admin/projects/{project_key}/process/import-xlsx")
 async def admin_import_unified(project_key: str, file: UploadFile = File(...),
                                _admin: int = Depends(get_admin_session)):
-    """통합 업로드: MajorModule/PBX/EMA 시트 자동 인식, 프로세스+가격 한번에
-
-    관리자 확인이 빠져 있었다 — 로그인 없이 모델 데이터를 바꿀 수 있었다.
-    다른 업로드 라우트와 같은 것을 건다.
-    """
     import io, openpyxl, re as _re
     data = _load_models()
     applied, skipped = [], []
     raw = await _keep_upload(file, "/admin/projects/{project_key}/process/import-xlsx", project_key)
-    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
-    
+    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, keep_links=False)
+
     # 시트 이름 → 프로젝트. 단계는 엑셀 1행 머리글에서 읽는다.
     # 단계 수와 순서가 시트마다 다르고(파워박스 15, EMA 14, 메이저모듈 12)
     # 앞으로도 바뀐다 — 여기 적어 두면 엑셀이 바뀔 때마다 어긋난다.
@@ -26516,22 +19848,27 @@ async def admin_import_unified(project_key: str, file: UploadFile = File(...),
         'cdr': 'CDR', 'final approval': '최종 승인',
         'final approval complete': '최종 승인', 'machining (assy)': '가공',
     }
-    
-    def _pn(s): return _re.sub(r'\s+', '', str(s or '')).strip()
+
+    def _pn(s):
+        return _re.sub(r'\s+', '', str(s or '')).strip()
     def _cs(v):
         import datetime
-        if v is None: return ''
-        if isinstance(v, (datetime.datetime, datetime.date)): return v.strftime('%Y-%m-%d')
+        if v is None:
+            return ''
+        if isinstance(v, (datetime.datetime, datetime.date)):
+            return v.strftime('%Y-%m-%d')
         s = str(v).strip()
         return '' if s.startswith('=') else s
-    
+
     import process_import as _pi
 
     for skey, cfg in _PB.items():
         ws = next((wb[n] for n in wb.sheetnames if n.strip().lower() == skey), None)
-        if not ws: continue
+        if not ws:
+            continue
         proj = data.get('projects', {}).get(cfg['proj'])
-        if not proj: continue
+        if not proj:
+            continue
 
         # 계획·실적 열은 1행 머리글에서 찾는다. 자리를 번호로 세면
         # 'Model' 열이 있는 시트(PBX·MajorModule)와 없는 시트(EMA)가
@@ -26555,19 +19892,30 @@ async def admin_import_unified(project_key: str, file: UploadFile = File(...),
         models = proj.get('models', [])
         for r in range(head_row + 2, ws.max_row + 1):
             pn = _pn(ws.cell(r, pn_col).value)
-            if not pn or pn.lower() in ('total', '합계'): continue
+            if not pn or pn.lower() in ('total', '합계'):
+                continue
             m = next((x for x in models if _pn(x.get('part_number')) == pn or _pn(x.get('id')) == pn), None)
-            if not m: skipped.append(f"{skey}:{pn}"); continue
+            if not m:
+                skipped.append(f"{skey}:{pn}")
+                continue
             steps, done = [], 0
             for i, (no, en, pc, ac) in enumerate(sheet_steps):
                 planned = _step_date(_cs(ws.cell(r, pc).value) if pc >= 1 else '')
                 actual, status = _step_actual(_cs(ws.cell(r, ac).value) if ac >= 1 else '')
-                if status == '완료': done += 1
+                if status == '완료':
+                    done += 1
                 name = _STEP_KO.get(en.strip().lower(), en.strip())
+                # 단계 묶음 — 앞 3단계는 발주, 끝 5단계는 승인, 그 사이는 제작·검사
+                if i < 3:
+                    _grp = '발주'
+                elif i < n_steps - 5:
+                    _grp = '제작·검사'
+                else:
+                    _grp = '승인'
                 steps.append({
                     'key': f'step_{i+1}',
                     'name': f'{no:02d} {name}',
-                    'group': '발주' if i < 3 else ('제작·검사' if i < n_steps - 5 else '승인'),
+                    'group': _grp,
                     'expected': planned, 'actual': actual, 'status': status,
                 })
             # 엑셀의 빈 칸이 이미 적어 둔 날짜를 지우면 안 된다.
@@ -26584,15 +19932,20 @@ async def admin_import_unified(project_key: str, file: UploadFile = File(...),
                     m['progress'] = _process_progress(_u)
             # 개발 일정표에 올라온 모델이다. 양산으로 잡혀 있으면 바로잡는다.
             m['group'] = '개발'
-            if cfg['dt']: m['dev_type'] = cfg['dt']
+            if cfg['dt']:
+                m['dev_type'] = cfg['dt']
             applied.append(f"{skey}:{pn}")
             if price_col:
                 _pv = _as_money(_cs(ws.cell(r, price_col).value), None)
-                if _pv is not None: m['price'] = _pv
+                if _pv is not None:
+                    m['price'] = _pv
             if cost_col:
                 _mv = _as_money(_cs(ws.cell(r, cost_col).value), None)
-                if _mv is not None: m['material_cost'] = _mv
-    # ── 위 시트(pbx/ema/majormodule)가 하나도 안 걸리면 일반 Process Schedule 형식으로 처리 ──
+                if _mv is not None:
+                    m['material_cost'] = _mv
+    # -----------------------------------------------------------
+    # 위 시트(pbx/ema/majormodule)가 하나도 안 걸리면 일반 Process Schedule 형식으로 처리
+    # -----------------------------------------------------------
     if not applied:
         import process_import as _pi
         parsed = _pi.parse_process_schedule(wb)
@@ -26628,10 +19981,8 @@ async def admin_import_unified(project_key: str, file: UploadFile = File(...),
             m['progress'] = _process_progress(proc)
             if m.get('group') != '개발':
                 m['group'] = '개발'
-            # 비고는 사람이 적는 칸이다. 엑셀 칸에 'Not yet' · 'In stock' 같은
-            # 글자가 있다고 해서 그걸 모아 비고에 적지 않는다 — 40종이 전부
-            # 단계 상태 나열로 덮여 정작 적어 둔 메모가 묻힌다.
-            # 그 글자들은 단계 상태(대기·진행중)로 이미 반영돼 있다.
+            # 비고는 사람이 적는 칸이다. 엑셀 칸에 'Not yet' · 'In stock' 같은 글자가 있다고 해서 그걸 모아 비고에 적지 않는다 — 40종이 전부 단계 상태
+            # 나열로 덮여 정작 적어 둔 메모가 묻힌다
             if _looks_auto_note(m.get('note')):
                 m['note'] = ''       # 예전 업로드가 적어 둔 것만 지운다
             applied.append(pn)
@@ -26641,10 +19992,9 @@ async def admin_import_unified(project_key: str, file: UploadFile = File(...),
     return {'ok': True, 'applied': len(applied), 'skipped': len(skipped), 'detail': {'applied': applied[:10], 'skipped': skipped[:10]}}
 
 
+# 하바플레이트 주차별 현황 엑셀 업로드 (양산/개발 총량 구조).
 @app.post("/admin/projects/{project_key}/weekly-summary-import")
 async def admin_import_weekly_summary(project_key: str, file: UploadFile = File(...), _admin: int = Depends(get_admin_session)):
-    """하바플레이트 주차별 현황 엑셀 업로드 (양산/개발 총량 구조).
-    행5=양산, 행6=개발 / F~M열 = W32~W35 계획·실적 / P열=다음달 계획"""
     import io, openpyxl
     if project_key != "hrva_plate":
         raise HTTPException(status_code=400, detail="현재 하바플레이트만 지원합니다.")
@@ -26653,7 +20003,7 @@ async def admin_import_weekly_summary(project_key: str, file: UploadFile = File(
     if not proj:
         raise HTTPException(status_code=404, detail="프로젝트 없음")
     raw = await _keep_upload(file, "/admin/projects/{project_key}/weekly-summary-import", project_key)
-    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, keep_links=False)
     ws = wb.worksheets[0]
 
     def _num(v):
@@ -26681,6 +20031,7 @@ async def admin_import_weekly_summary(project_key: str, file: UploadFile = File(
     return {"ok": True, "summary": {k: {"po": v["po_qty"], "done": v["actual_total"]} for k, v in summary.items() if isinstance(v, dict)}}
 
 
+# 백업 models.json 에서 개발 공정(process) 입력만 골라 현재 데이터에 되살린다
 @app.post("/admin/projects/{project_key}/process-restore")
 async def admin_restore_process(
     project_key: str,
@@ -26688,9 +20039,6 @@ async def admin_restore_process(
     dry_run: bool = Form(default=False),
     _admin: int = Depends(get_admin_session),
 ):
-    """백업 models.json 에서 개발 공정(process) 입력만 골라 현재 데이터에 되살린다.
-    모델 ID 로 매칭하며, 계획일/실적일/상태가 하나라도 채워진 공정만 복구한다.
-    다른 필드(판가·PO·주차 등)는 건드리지 않는다."""
     raw = await _keep_upload(file, "/admin/projects/{project_key}/process-restore", project_key)
     try:
         backup = json.loads(raw.decode("utf-8"))
@@ -26744,7 +20092,10 @@ async def admin_restore_process(
         "dry_run": bool(dry_run),
     }
 
-
+# ============================================================
+#  주간 보고 엑셀(W##.xlsx)
+# ============================================================
+# 주간 보고 엑셀(W##.xlsx) 한 장으로 모델·판가·PO·출하·비고·주차별 계획을 한 번에 반영.
 @app.post("/admin/projects/{project_key}/report-import")
 async def admin_import_weekly_report(
     project_key: str,
@@ -26753,20 +20104,13 @@ async def admin_import_weekly_report(
     dry_run: bool = Form(default=False),
     _admin: int = Depends(get_admin_session),
 ):
-    """주간 보고 엑셀(W##.xlsx) 한 장으로 모델·판가·PO·출하·비고·주차별 계획을 한 번에 반영.
-
-    - 시트: W 번호가 가장 큰 것을 자동 선택 (sheet 로 지정 가능)
-    - 모델: 엑셀 기준으로 교체. 기존 공정(process)·이슈(issues)는 모델 ID 로 승계
-    - 주차: 엑셀에 있는 월만 갱신하고, 엑셀에 없는 월의 기존 데이터는 보존
-    - dry_run=true 면 저장하지 않고 변경 예정 내역만 돌려준다
-    """
     import io as _io
     import openpyxl
     import hrva_import as _imp
 
     raw = await _keep_upload(file, "/admin/projects/{project_key}/report-import", project_key)
     try:
-        wb = openpyxl.load_workbook(_io.BytesIO(raw), data_only=True)
+        wb = openpyxl.load_workbook(_io.BytesIO(raw), data_only=True, keep_links=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"엑셀을 열 수 없습니다: {e}")
 
@@ -26778,13 +20122,8 @@ async def admin_import_weekly_report(
     return _apply_report_workbook(project_key, parsed, dry_run=dry_run)
 
 
+# 엑셀에서 빠지면 지워도 되는 모델인지.
 def _is_rpm_model(m: dict) -> bool:
-    """엑셀에서 빠지면 지워도 되는 모델인지.
-
-    RPM 개발품은 주 단위로 들고 나서 이력을 붙들 이유가 없다.
-    반대로 양산(HVM)과 HVM 개발품은 엑셀에 안 보여도 절대 지우지 않는다
-    (주차별 계획·개발 공정 이력이 같이 날아가기 때문).
-    """
     if not isinstance(m, dict):
         return False
     if _norm_group(m.get("group")) != "개발":
@@ -26792,19 +20131,8 @@ def _is_rpm_model(m: dict) -> bool:
     return "RPM" in str(m.get("dev_type") or "").upper()
 
 
+# 개발현황 엑셀(dev_status_import)을 모델에 반영한다
 def _apply_dev_status(project_key: str, parsed: dict, dry_run: bool = False) -> dict:
-    """개발현황 엑셀(dev_status_import)을 모델에 반영한다.
-
-    하바플레이트 '260919_하바플레이트 개발현황.xlsx' 같은 파일.
-    모델 등록 양식과 열 이름이 겹쳐서 일반 파서에 맡기면 'PO 잔량' 이
-    'PO 수량' 을 덮고 개발품이 양산으로 들어간다 — 그래서 따로 읽는다.
-
-      · 모델명(= 파트넘버) 으로 맞추고, 없으면 개발품으로 새로 만든다
-      · '가공 완료' 날짜 → 개발 공정 '가공 (조립)' 단계 계획일
-        (앱의 '완료예정' · 지연/집중관리 판정이 이 날짜로 돈다)
-      · '고객요청일' 이 'PO 취소' 면 상태를 '드롭예정' 으로
-      · 판가 · 개발종류 · PO 수량 · 출하수량 · 비고
-    """
     key = str(project_key or "").strip()
     data = _load_models()
     proj = (data.setdefault("projects", {})).setdefault(key, {"models": []})
@@ -26875,6 +20203,8 @@ def _apply_dev_status(project_key: str, parsed: dict, dry_run: bool = False) -> 
                 m["status"] = "정상"
             released.append(nm)
 
+    # 양산을 앞에, 개발을 뒤에 (같은 구분 안에서는 원래 순서 그대로)
+
     models.sort(key=lambda x: 0 if x.get("group") == "양산" else 1)
     if not dry_run:
         _save_models(data)
@@ -26884,10 +20214,8 @@ def _apply_dev_status(project_key: str, parsed: dict, dry_run: bool = False) -> 
             "sheet": parsed.get("sheet"), "rows": len(parsed.get("rows") or [])}
 
 
+# 주간 보고 엑셀 파싱 결과를 models.json 에 병합한다
 def _apply_report_workbook(project_key: str, parsed: dict, dry_run: bool = False) -> dict:
-    """주간 보고 엑셀 파싱 결과를 models.json 에 병합한다.
-    엑셀을 정본으로 교체하되 기존 공정(process)/이슈(issues)는 ID 로 승계하고,
-    엑셀에 없는 월의 주차 데이터는 그대로 둔다."""
     new_models = parsed.get("models") or []
     if not new_models:
         raise HTTPException(status_code=400, detail="모델 블록을 찾지 못했습니다. 시트 구조를 확인해주세요.")
@@ -26931,8 +20259,15 @@ def _apply_report_workbook(project_key: str, parsed: dict, dry_run: bool = False
             _skind = nm.get("stage_date_kind") or ""
             _step_key = {"FAIR": "fair_write", "LAIR": "lair_write"}.get(_stage)
             if _step_key and _sdate:
-                _filled = any(str((st or {}).get(k) or "").strip()
-                              for st in proc for k in ("expected", "actual", "status"))
+                # 공정 단계 중 하나라도 계획일 · 실적일 · 상태가 적혀 있나
+                _filled = False
+                for _step in proc:
+                    for _f in ("expected", "actual", "status"):
+                        if str((_step or {}).get(_f) or "").strip():
+                            _filled = True
+                            break
+                    if _filled:
+                        break
                 if not _filled:
                     for st in proc:
                         if st.get("key") != _step_key:
@@ -26973,6 +20308,7 @@ def _apply_report_workbook(project_key: str, parsed: dict, dry_run: bool = False
             continue
         kept.append(mid)
         merged.append(_old)
+    # 양산을 앞에, 개발을 뒤에 (같은 구분 안에서는 원래 순서 그대로)
     merged.sort(key=lambda m: 0 if m.get("group") == "양산" else 1)
 
     result = {
@@ -27012,27 +20348,15 @@ def _apply_report_workbook(project_key: str, parsed: dict, dry_run: bool = False
     return result
 
 
-# ─────────────────────────────────────────────────────────────
 # 모델의 '구분·판가 이력' (phases)
-#
-# 개발품으로 나가다가 도중에 양산으로 넘어가는 모델이 있다. 예) Mahabali MPD
-# 는 W35 까지 개발품($138,470)으로 출하되다가 W36 부터 양산품으로 바뀐다.
-# 모델에 group/price 를 하나씩만 두면 구분을 바꾸는 순간 과거 주차까지
-# 새 판가로 소급 계산돼 8월 매출이 통째로 흔들린다.
-#
-# 그래서 시점별 구간을 배열로 둔다.
-#   "phases": [
-#     {"from": "2026-W01", "group": "개발", "price": 138470},
-#     {"from": "2026-W36", "group": "양산", "price":  96000}
-#   ]
-# 주차마다 from <= 그 주차 인 마지막 구간의 구분/판가를 쓴다.
-# phases 가 없으면 모델의 현재 group/price 를 그대로 쓴다(기존 동작 유지).
-# ─────────────────────────────────────────────────────────────
 
+# ============================================================
+#  판가 이력 · 구분(양산/개발)
+# ============================================================
 def _week_ord(month: str, week) -> int:
-    """('2026-08','W36') → 202636. 연말/연초 주차는 ISO 연도로 보정."""
     try:
-        y = int(str(month)[:4]); mm = int(str(month)[5:7])
+        y = int(str(month)[:4])
+        mm = int(str(month)[5:7])
     except Exception:
         return 0
     try:
@@ -27046,8 +20370,8 @@ def _week_ord(month: str, week) -> int:
     return y * 100 + w
 
 
+# '2026-W36' → 202636.
 def _phase_ord(v) -> int:
-    """'2026-W36' → 202636. 못 읽으면 None."""
     import re as _re
     m = _re.match(r"^\s*(\d{4})\s*[-/]?\s*[Ww]?\s*(\d{1,2})\s*$", str(v or ""))
     if not m:
@@ -27055,8 +20379,8 @@ def _phase_ord(v) -> int:
     return int(m.group(1)) * 100 + int(m.group(2))
 
 
+# 저장/조회용 정규화. from 오름차순, 잘못된 항목은 버린다
 def _norm_phases(v):
-    """저장/조회용 정규화. from 오름차순, 잘못된 항목은 버린다."""
     if not isinstance(v, list):
         return []
     out = []
@@ -27087,27 +20411,16 @@ def _norm_phases(v):
 _PHASE_EPOCH = "2000-W01"      # '처음부터' 를 뜻하는 구간 시작점
 
 
+# 오늘이 속한 주차를 구간 시작점 형식으로.
 def _this_week_tag(ref=None) -> str:
-    """오늘이 속한 주차를 구간 시작점 형식으로."""
     import datetime as _dtw
     iso = (ref or _dtw.date.today()).isocalendar()
     return "%04d-W%02d" % (int(iso[0]), int(iso[1]))
 
 
+# 판가·재료비가 바뀌었으면 구간으로 남긴다
 def _apply_price_change(entry: dict, old: dict, mode: str,
                         sent: dict = None) -> dict:
-    """판가·재료비가 바뀌었으면 구간으로 남긴다.
-
-    mode 'from_now'  이번 주부터 새 구간. 지난 주차 매출은 그대로.
-    mode 'retro'     지금 적용 중인 구간의 값을 덮는다 (입력 오류 정정).
-
-    sent 은 화면이 실제로 보낸 원본 dict. 이게 중요한 이유: ESS 프로젝트는
-    모델 표에 판가·재료비 칸 자체가 없어서 저장할 때 늘 0 을 보낸다. 보낸
-    0 을 '판가를 0 으로 고쳤다' 로 읽으면, ESS 모델을 한 번 저장하는 것만으로
-    판가 이력이 통째로 0 이 된다. 그래서 '칸이 있었던' 항목만 비교한다.
-
-    바뀐 게 없으면 아무것도 안 한다. 반환은 화면에 보여줄 요약.
-    """
     def _money(v):
         try:
             return max(0, _as_money(v))
@@ -27179,9 +20492,8 @@ def _apply_price_change(entry: dict, old: dict, mode: str,
             "price": [old_p, new_p], "material_cost": [old_c, new_c]}
 
 
+# 그 주차에 유효한 구간 {group, price, material_cost}.
 def _phase_row_at(m: dict, month: str, week) -> dict:
-    """그 주차에 유효한 구간 {group, price, material_cost}.
-    이력이 없으면 모델의 현재 값 (기존 동작 그대로)."""
     def _money(v):
         try:
             return max(0, _as_money(v))
@@ -27212,28 +20524,19 @@ def _phase_row_at(m: dict, month: str, week) -> dict:
             "material_cost": base["material_cost"] if _c is None else _c}
 
 
+# 그 주차의 재료비.
 def _phase_cost_at(m: dict, month: str, week):
-    """그 주차의 재료비."""
     return _phase_row_at(m, month, week)["material_cost"]
 
 
+# 그 주차에 유효한 (구분, 판가).
 def _phase_at(m: dict, month: str, week):
-    """그 주차에 유효한 (구분, 판가). phases 가 없으면 모델의 현재 값."""
     r = _phase_row_at(m, month, week)
     return r["group"], r["price"]
 
 
+# 오늘 기준으로 '보이는' 구분.
 def _display_group(m: dict, ref=None) -> str:
-    """오늘 기준으로 '보이는' 구분.
-
-    '개발→양산 W37' 이력이 있는데 이번 주가 W38 이면 구분 칸에 양산으로
-    보여야 한다. 저장된 group 은 개발 그대로 둔다 — 진행률은 계속 공정
-    단계로 세고, 지난 주차 매출도 그때 구분/판가로 남아야 한다.
-    바뀌는 건 '지금 어느 단계인가' 하나뿐이다.
-
-    ref 를 주면 그 날짜 기준. 과거 추이를 그릴 때는 '그때' 무엇이었는지를
-    써야 한다 — 오늘 기준으로 세면 지난달 그래프가 통째로 바뀐다.
-    """
     base = "개발" if (m or {}).get("group") == "개발" else "양산"
     ph = _norm_phases((m or {}).get("phases"))
     if not ph:
@@ -27250,38 +20553,85 @@ def _display_group(m: dict, ref=None) -> str:
     # 첫 구간보다 앞이면 아직 이력이 시작되기 전 — 첫 구간을 쓴다
     return (hit or ph[0])["group"]
 
-
+# ============================================================
+#  주차별 매출 · 일 보고 매출
+# ============================================================
 def _dev_weeks_from_models(dev_model_weeks, dev_group):
-    """개발 주차값을 '모델별 입력'에서 읽을지, '그룹 총계'에서 읽을지.
-
-    모델별로 0 이 아닌 값이 하나라도 있으면 모델이 정본이다.
-
-    weekly_summary['개발'] 은 하바플레이트처럼 개발을 그룹 총계로만 관리하는
-    프로젝트를 위한 값이다. 예전에는 이게 있기만 하면 무조건 그쪽을 썼는데,
-    파워박스처럼 개발도 모델별로 입력하는 프로젝트에서는 옛 주간보고에서 들어온
-    0 짜리 그룹 총계가 모델 값을 통째로 덮었다. 853-043648-115 는 9월 W36 실적
-    1대가 저장돼 있는데도 매출·수량 집계에서 0 으로 잡혀, 파워박스 9월 실적이
-    52대 대신 51대로 나왔다.
-
-    하바플레이트는 개발 모델 40종에 주차 칸만 있고 값은 전부 0 이라
-    이 규칙에서도 그대로 그룹 총계를 쓴다.
-    """
     if not (dev_group or {}).get("weeks"):
         return True
     return any((v or {}).get("plan") or (v or {}).get("actual")
                for v in (dev_model_weeks or {}).values())
 
 
+# ============================================================
+#  일 보고 사업부의 매출
+# ============================================================
+# 그 프로젝트 모델들의 판가 평균.
+def _daily_unit_price(proj: dict) -> float:
+    out = []
+    for m in (proj.get("models") or []):
+        try:
+            v = float(str(m.get("price") or 0).replace(",", "").strip() or 0)
+        except Exception:
+            v = 0.0
+        if v > 0:
+            out.append(v)
+    return (sum(out) / len(out)) if out else 0.0
+
+
+# 일 보고 자료의 '출하' 줄 → {주차: {plan, actual}}
+def _daily_ship_weeks(project_key: str, month: str) -> dict:
+    import datetime as _d3
+    _key = _model_key_alias(project_key)
+    _div = _daily_board_division(_key)
+    if not _div:
+        return {}
+    _item = _bloom_item_of(_key)
+    _store = _daily_store_key(_div) or _key
+    proj = (_load_models().get("projects") or {}).get(_store) or {}
+    allm = _bloom_store_months(proj)
+    board = allm.get(month)
+    if not isinstance(board, dict):
+        return {}
+    if _item:
+        board = _bloom_slice(board, _item)
+    elif _store != _key:
+        board = _daily_slice_by_project(board, _key)
+    if not isinstance(board, dict):
+        return {}
+
+    out = {}
+    for it in (board.get("items") or []):
+        for st in (it.get("steps") or []):
+            if _daily_step_group(st, _DAILY_BOARD_ROWS.get(_div, ())) != "출하":
+                continue
+            for ds, cell in ((st.get("days") or {}).items()):
+                try:
+                    d = _d3.date.fromisoformat(str(ds)[:10])
+                except Exception:
+                    continue
+                if d.strftime("%Y-%m") != month:
+                    continue
+                w = "W%02d" % d.isocalendar()[1]
+                slot = out.setdefault(w, {"plan": None, "actual": None})
+                for k in ("plan", "actual"):
+                    v = (cell or {}).get(k)
+                    if v is None:
+                        continue
+                    slot[k] = (slot[k] or 0) + int(v)
+    return out
+
+
+# 주차별 현황+매출: 양산 = 모델별 weekly_plan 실적 합산 x 각 모델 판가 개발 = weekly_summary 그룹 실적 x $3,400 고정 (모델별
+# 주차 데이터 없음) ← admin v2 renderRevenueCard() · 앱 api_service.dart fetchWeeklyRevenue()
 @app.get("/projects/{project_key}/weekly-revenue")
 def get_weekly_revenue(project_key: str, month: str = None):
-    """주차별 현황+매출:
-    양산 = 모델별 weekly_plan 실적 합산 x 각 모델 판가
-    개발 = weekly_summary 그룹 실적 x $3,400 고정 (모델별 주차 데이터 없음)"""
     import datetime as _dt
     data = _load_models()
     _key = _model_key_alias(project_key)
     proj = data.get("projects", {}).get(_key)
-    if not proj: return {"detail": "프로젝트 없음"}
+    if not proj:
+        return {"detail": "프로젝트 없음"}
     ws_data = proj.get("weekly_summary") or {}
     if not month:
         month = _dt.date.today().strftime("%Y-%m")
@@ -27293,16 +20643,42 @@ def get_weekly_revenue(project_key: str, month: str = None):
         all_weeks = _get_month_weeks(month)
     else:
         # month 없으면 weekly_summary 기준
-        all_weeks = sorted({w for grp in ("양산", "개발") if grp in ws_data
-                            for w in (ws_data[grp].get("weeks") or {})})
+        # 양산 · 개발 두 묶음에 나오는 주차 전부
+        _week_set = set()
+        for _grp in ("양산", "개발"):
+            if _grp not in ws_data:
+                continue
+            for _w in (ws_data[_grp].get("weeks") or {}):
+                _week_set.add(_w)
+        all_weeks = sorted(_week_set)
         if not all_weeks:
             all_weeks = _get_month_weeks(month)
-
-    # ── 모델별 주차 실적 x 그 주차에 유효한 판가 ──
+    # -----------------------------------------------------------
+    # 모델별 주차 실적 x 그 주차에 유효한 판가
+    # -----------------------------------------------------------
     # 한 모델이 달 중간에 개발→양산으로 넘어가면 주차마다 다른 그룹/판가로 잡힌다.
     yang_weeks = {w: {"plan": 0, "actual": 0, "revenue": 0, "plan_revenue": 0} for w in all_weeks}
     dev_model_weeks = {w: {"plan": 0, "actual": 0, "revenue": 0, "plan_revenue": 0} for w in all_weeks}
     yang_models_used, dev_models_used = [], []
+    # -----------------------------------------------------------
+    # 일 보고 사업부면 수량을 거기서 받는다 (판가는 양식 그대로)
+    # -----------------------------------------------------------
+    _daily_div = _daily_board_division(_key)
+    _daily_price = 0.0
+    if _daily_div:
+        _dq = _daily_ship_weeks(_key, month)
+        _daily_price = _daily_unit_price(proj)
+        for w in all_weeks:
+            c = _dq.get(w) or {}
+            p = int(c.get("plan") or 0)
+            a = int(c.get("actual") or 0)
+            if not p and not a:
+                continue
+            yang_weeks[w]["plan"] += p
+            yang_weeks[w]["actual"] += a
+            yang_weeks[w]["plan_revenue"] += int(round(p * _daily_price))
+            yang_weeks[w]["revenue"] += int(round(a * _daily_price))
+
     for m in proj.get("models", []):
         bucket = (m.get("weekly_plan") or {}).get(month) or {}
         if not bucket:
@@ -27342,8 +20718,9 @@ def get_weekly_revenue(project_key: str, month: str = None):
                   "actual": sum(v["actual"] for v in yang_weeks.values()),
                   "revenue": sum(v["revenue"] for v in yang_weeks.values()),
                   "plan_revenue": sum(v["plan_revenue"] for v in yang_weeks.values())}
-
-    # ── 개발 ──
+    # -----------------------------------------------------------
+    # 개발
+    # -----------------------------------------------------------
     # 1) 개발 모델에 주차 값이 들어와 있으면 그걸 정본으로 쓴다 (파워박스 등).
     #    단가는 모델 판가가 있으면 그걸, 없으면 $3,400 고정단가.
     # 2) 모델 쪽이 비어 있고 weekly_summary['개발'] 그룹 총계만 있으면 그걸 쓴다
@@ -27409,24 +20786,15 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
 
-# ── 기동할 때 한 번 지나가는 정리 ──────────────────────────────────────
-#
-# 예전 임포터가 비고에 적어 두던 단계 나열을 지운다.
-#   '10 FAIR Approval: Not yet · 11 LAP Test: Not yet'
-# 비고는 사람이 적는 칸이고, 저 내용은 이미 단계 상태로 들어가 있다.
-#
-# 사람이 적은 메모는 건드리지 않는다 — _looks_auto_note 가 모양으로 가른다.
-# 한 번 지우고 나면 다음 기동에는 걸리는 게 없어 아무 일도 하지 않는다.
-# _save_models 가 덮어쓰기 전에 백업을 남기므로 되돌릴 수단도 있다.
-# 반도체사업부의 '주차별 계획 원본'(엑셀을 올려 이미지로 붙여 둔 것)을 뗀다.
-# 주차 현황 보드가 그 자리를 대신하므로 원본은 더 볼 일이 없다.
-# 챔버만 남긴다.
-#
-# 주의: 여기서 지우는 건 프로젝트에 붙은 weekly_plan(photo_ref) 하나다.
-# 모델마다 들고 있는 weekly_plan(월·주차별 계획·실적)은 다른 값이고 건드리지 않는다.
+# ============================================================
+#  기동할 때 한 번 지나가는 정리
+# ============================================================
+# 예전 임포터가 비고에 적어 두던 단계 나열을 지운다
 _PLAN_KEEP = {"chamber"}
 
-
+# ============================================================
+#  서버 켤 때 한 번 도는 정리
+# ============================================================
 def _cleanup_plan_originals() -> None:
     try:
         import config_loader as _c
@@ -27459,6 +20827,7 @@ def _cleanup_plan_originals() -> None:
         print(f"[cleanup] 주차별 계획 원본 정리 실패(무시하고 계속): {e}")
 
 
+# 서버 켤 때 — 자동으로 붙었던 옛 메모 정리.
 def _cleanup_auto_notes() -> None:
     try:
         data = _load_models()
@@ -27476,20 +20845,17 @@ def _cleanup_auto_notes() -> None:
         print(f"[cleanup] 비고 정리 실패(무시하고 계속): {e}")
 
 
-# ── 큐리 버스바 되살리기 (1회) ────────────────────────────────────
-#
-# 내가 잘못 만든 마이그레이션이 버스바 품번 11개(560D~570D)를 한 모델로
-# 합치면서 지워버렸다. 담당자는 모델 목록에는 품번별로 다 두고 보드에서만
-# 한 줄로 묶어 본다. _save_models 가 덮어쓰기 직전에 남긴 자동 백업에서
-# 큐리 모델 목록만 되돌린다.
-#
-# 한 번만 돈다. 이미 품번이 있으면 아무것도 하지 않는다.
+# ============================================================
+#  큐리 버스바 되살리기 (1회)
+# ============================================================
+# 내가 잘못 만든 마이그레이션이 버스바 품번 11개(560D~570D)를 한 모델로 합치면서 지워버렸다
 
 _CURIE_KEY = "spacex"
 _CURIE_PN_RE = __import__("re").compile(r"^5[5-7]\dD$", __import__("re").I)
 _CURIE_RESTORE_KEY = "curie_busbar_restored"
 
 
+# 서버 켤 때 — CURIE 버스바 품목을 백업에서 되살린다 (한 번만).
 def _restore_curie_busbar() -> None:
     import glob
     import json as _json
@@ -27539,12 +20905,8 @@ def _restore_curie_busbar() -> None:
         print(f"[curie] 버스바 되살리기 실패(무시하고 계속): {e}")
 
 
+# 현황 문구에 적힌 보류를 프로젝트 필드로 한 번 새겨 둔다
 def _stamp_holds_once() -> None:
-    """현황 문구에 적힌 보류를 프로젝트 필드로 한 번 새겨 둔다.
-
-    문구는 주간보고를 다시 올리거나 현황을 고치다 사라진다. 그때 보류가
-    조용히 풀리면 멈춰 세운 일정이 다시 지연으로 세어진다 (CUP 15종).
-    """
     try:
         data = _load_models()
         hit = []
@@ -27560,15 +20922,10 @@ def _stamp_holds_once() -> None:
         print(f"[hold] 보류 새기기 실패(무시하고 계속): {e}")
 
 
-# ── 모델 상태 '진행' 을 '정상' 으로 (한 번) ────────────────────────
-#
-# '진행' 은 지금 쓰는 상태(MODEL_STATUSES)에 없는 옛 값이다. 예전 엑셀
-# 가져오기가 남긴 것으로, 지연/집중관리 판정에서는 '정상' 과 똑같이 셌다.
-# admin 드롭다운에만 따로 보여서 '둘이 뭐가 다르냐' 가 됐다.
-# (2026-09-21 기준 파워박스 36종 · 메이저모듈 1종. Min 확인 후 바꿈)
-#
-# 모델의 status 만 본다. 공정 단계의 '진행중' 은 다른 값이라 안 건드린다.
-# 한 번 바꾸고 나면 걸리는 게 없어 다음 기동부터는 아무 일도 안 한다.
+# ============================================================
+#  모델 상태 '진행' 을 '정상' 으로 (한 번)
+# ============================================================
+# 서버 켤 때 — 옛 상태 글자 정리.
 def _cleanup_legacy_status() -> None:
     try:
         data = _load_models()
@@ -27595,6 +20952,7 @@ _restore_curie_busbar()
 _cleanup_legacy_status()
 
 
+# 서버 켤 때 — 파워박스 CDR/PRR 공정을 한 틀로 맞춘다
 def _cleanup_cdr_prr() -> None:
     try:
         data = _load_models()
@@ -27620,9 +20978,8 @@ def _cleanup_cdr_prr() -> None:
 _cleanup_cdr_prr()
 
 
+# 이미 저장된 블룸 보드에 'Corva KPE' / 'Corva KPE (117품목)' 가 따로 쌓인 것을 한 번 합친다
 def _cleanup_bloom_dupes() -> None:
-    """이미 저장된 블룸 보드에 'Corva KPE' / 'Corva KPE (117품목)' 가 따로
-    쌓인 것을 한 번 합친다. 합칠 게 없으면 파일을 건드리지 않는다."""
     try:
         import bloom_daily_import as _bd
         data = _load_models()
@@ -27641,8 +20998,13 @@ def _cleanup_bloom_dupes() -> None:
                     all(i.get("item") == f.get("item") for i, f in zip(items, folded)):
                 continue
             b["items"] = folded
-            b["dates"] = sorted({d for i in folded for st in (i.get("steps") or [])
-                                 for d in ((st or {}).get("days") or {})})
+            # 접은 품목들의 공정에 나오는 날짜 전부
+            _days = set()
+            for _item in folded:
+                for _step in (_item.get("steps") or []):
+                    for _d in ((_step or {}).get("days") or {}):
+                        _days.add(_d)
+            b["dates"] = sorted(_days)
             changed += 1
         if changed:
             _save_models(data)
@@ -27655,28 +21017,64 @@ _cleanup_bloom_dupes()
 _stamp_holds_once()
 
 
-# ─────────────────────────────────────────────────────────────
-# 매출 — 사업부 전체. 실적과 예상은 출처가 다르다.
-#
-# 실적은 주간보고 '1. 계획 대비 실적 (수정본) Actual FCST' 시트가 원본이다.
-# 줄마다 실적, 열마다 W1~W52, 맨 아래 [합 계] 블록에 보고서 묶음까지 그대로.
-#
-# 예상은 사람이 넣는다. 한동안 주간보고의 '실행계획' 열을 그 달 계획으로
-# 썼는데, 그 열은 작년에 짜 둔 숫자다. 9월만 봐도 주간보고 $1,964만 대
-# 실제 예상 $2,422만이었다. 금액 하나만 넣어도 되고 Estimate 파일을
-# 올려도 된다.
-# ─────────────────────────────────────────────────────────────
+# -----------------------------------------------------------
+# 고객사 묶음을 자료로 옮겨 적기 — 딱 한 번
+# -----------------------------------------------------------
+# 묶음은 이제 양식의 묶음 칸이 정한다 (division_columns.customer_group).
+_GROUP_SEED_FILE = DATA_DIR / "customer_groups_seeded.json"
+
+
+# 지금 있는 고객사의 묶음을 자료(customer_group)에 한 번 적는다
+def _seed_customer_groups() -> None:
+    if _GROUP_SEED_FILE.exists():
+        return
+    try:
+        data = _load_models()
+        projects = data.setdefault("projects", {})
+        n = 0
+        for div in list(_dcol.CUSTOMER_GROUPS):
+            for p in _cl.get_projects(division_id=div, visible_only=False):
+                pid = p.get("id")
+                if not pid:
+                    continue
+                proj = projects.get(pid)
+                if isinstance(proj, dict) and proj.get("customer_group"):
+                    continue            # 엑셀로 이미 들어온 값이 있다
+                grp = _dcol.seed_group(div, pid, p.get("label") or "")
+                if not grp:
+                    continue            # 아리스타 — 구분 1 이 정한다
+                projects.setdefault(pid, {"models": []})
+                projects[pid]["customer_group"] = list(grp)
+                projects[pid]["customer_group_src"] = "seed"
+                n += 1
+        if n:
+            _save_models(data)
+        _GROUP_SEED_FILE.write_text(json.dumps(
+            {"at": datetime.now().isoformat(timespec="seconds"), "count": n},
+            ensure_ascii=False), encoding="utf-8")
+        print("[묶음] 지금 있는 고객사 %d곳의 묶음을 자료에 적었습니다 (한 번만)" % n)
+    except Exception as e:
+        print("[묶음] 옮겨 적기 실패(다음에 다시): %s" % e)
+
+
+_seed_customer_groups()
+
+
+# 매출 — 사업부 전체. 실적과 예상은 출처가 다르다
 REVENUE_FILE = DATA_DIR / "revenue.json"
 
-# ── 사장님 지시사항 ─────────────────────────────────────────────
-#
+# ============================================================
+#  사장님 지시사항
+# ============================================================
 # 앱 홈 맨 위 노란 카드. 전사 공통이라 사업부와 상관없이 한 벌이다.
 # 줄마다 기한(날짜까지 · 기한 없음 · 매일 · 매주)과 등록일을 따로 가진다.
 import home_orders as _ho
 
 ORDERS_FILE = DATA_DIR / "home_orders.json"
 
-
+# ============================================================
+#  수주
+# ============================================================
 def _orders_load() -> dict:
     try:
         return _ho.load(ORDERS_FILE)
@@ -27684,18 +21082,18 @@ def _orders_load() -> dict:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# 앱 홈이 읽는다 — 완료는 빼고, 급한 것부터 ← admin v2 saveOrders()
 @app.get("/home/orders")
 def get_home_orders():
-    """앱 홈이 읽는다 — 완료는 빼고, 급한 것부터."""
     data = _orders_load()
     items = _ho.for_app(data.get("items"))
     return {"items": items, "count": len(items),
             "updated_at": data.get("updated_at", "")}
 
 
+# admin 편집 화면 — 완료한 줄까지 다 준다 ← admin v2 saveOrders()
 @app.get("/admin/home/orders")
 def admin_home_orders(_admin: int = Depends(get_admin_session)):
-    """admin 편집 화면 — 완료한 줄까지 다 준다."""
     data = _orders_load()
     items = data.get("items") or []
     return {"items": items,
@@ -27704,15 +21102,16 @@ def admin_home_orders(_admin: int = Depends(get_admin_session)):
             "updated_at": data.get("updated_at", "")}
 
 
-# ── 사업부별 한 눈 (앱 홈의 매출 · 진행현황) ────────────────────
-#
-# 사람이 넣는 건 타겟뿐이다. 실적은 사업부마다 이미 들어오는 자료가 달라서
-# (반도체는 주간보고, 블룸은 매일 올리는 보고자료, 나머지는 모델의 판가 ×
-# 출하 실적) 여기서 출처까지 같이 들고 나간다. 어디서 온 숫자인지 모르면
-# 틀렸을 때 어디를 고쳐야 하는지도 모른다.
+# ============================================================
+#  사업부별 한 눈 (앱 홈의 매출 · 진행현황)
+# ============================================================
+# 사람이 넣는 건 타겟뿐이다. 실적은 사업부마다 이미 들어오는 자료가 달라서 (반도체는 주간보고, 블룸은 매일 올리는 보고자료, 나머지는 모델의 판가 × 출하 실적)
+# 여기서 출처까지 같이 들고 나간다
 DIV_TARGET_FILE = DATA_DIR / "division_targets.json"
 
-
+# ============================================================
+#  사업부 목표 · 실적 (홈 매출 카드)
+# ============================================================
 def _div_targets() -> dict:
     try:
         raw = json.loads(DIV_TARGET_FILE.read_text(encoding="utf-8"))
@@ -27723,6 +21122,7 @@ def _div_targets() -> dict:
         return {}
 
 
+# 사업부 월 매출 목표 하나를 저장한다
 def _div_target_set(month: str, division_id: str, total) -> dict:
     data = _div_targets()
     mon = data.setdefault(month, {})
@@ -27740,8 +21140,8 @@ def _div_target_set(month: str, division_id: str, total) -> dict:
     return data
 
 
+# 모델의 판가 × 출하 실적. 달을 나눌 수 없어서 누계다
 def _div_model_money(models: list) -> float:
-    """모델의 판가 × 출하 실적. 달을 나눌 수 없어서 누계다."""
     out = 0.0
     for m in models or []:
         if not isinstance(m, dict):
@@ -27753,8 +21153,83 @@ def _div_model_money(models: list) -> float:
     return round(out, 2)
 
 
+# 그 달 주차별 **실적**을 다 더한 금액 (판가 × 실적 수량).
+def _div_actual_money(models: list, month: str):
+    out = 0.0
+    hit = False
+    for m in models or []:
+        if not isinstance(m, dict):
+            continue
+        bucket = ((m.get("weekly_plan") or {}).get(month) or {})
+        qty = 0
+        for cell in bucket.values():
+            if not isinstance(cell, dict):
+                continue
+            got = cell.get("actual")
+            if got is None:
+                continue
+            try:
+                qty += int(got)
+            except Exception:
+                continue
+            hit = True
+        if not qty:
+            continue
+        try:
+            out += _as_money(m.get("price"), 0) * qty
+        except Exception:
+            continue
+    return round(out, 2) if hit else None
+
+
+# 그 달 주차별 계획을 다 더한 금액 (판가 × 계획 수량).
+def _div_plan_money(models: list, month: str) -> float:
+    out = 0.0
+    for m in models or []:
+        if not isinstance(m, dict):
+            continue
+        bucket = ((m.get("weekly_plan") or {}).get(month) or {})
+        qty = 0
+        for cell in bucket.values():
+            if isinstance(cell, dict):
+                try:
+                    qty += int(cell.get("plan") or 0)
+                except Exception:
+                    continue
+        if not qty:
+            continue
+        try:
+            out += _as_money(m.get("price"), 0) * qty
+        except Exception:
+            continue
+    return round(out, 2)
+
+
+# (그 달 출하 계획 금액, 출하 실적 금액).
+def _daily_div_money(plist: list, projects: dict, month: str) -> tuple:
+    plan = act = 0.0
+    for p in plist or []:
+        pk = (p or {}).get("id")
+        if not pk:
+            continue
+        try:
+            _div = _daily_board_division(pk)
+            if not _div or _daily_store_key(_div) == pk:
+                continue
+            price = _daily_unit_price(projects.get(pk) or {})
+            if price <= 0:
+                continue
+            wk = _daily_ship_weeks(pk, month)
+        except Exception as _e:
+            print("[일보고매출] %s 계산 실패(무시) — %s" % (pk, _e))
+            continue
+        plan += sum(int((c or {}).get("plan") or 0) for c in wk.values()) * price
+        act += sum(int((c or {}).get("actual") or 0) for c in wk.values()) * price
+    return round(plan, 2), round(act, 2)
+
+
+# 정상 · 지연 · 특이사항 · 집중관리.
 def _div_counts(models: list) -> dict:
-    """정상 · 지연 · 특이사항 · 집중관리. 모델 관리에 적은 값을 그대로 센다."""
     c = {"total": 0, "normal": 0, "delayed": 0, "issue": 0, "watch": 0}
     for m in models or []:
         if not isinstance(m, dict):
@@ -27772,8 +21247,13 @@ def _div_counts(models: list) -> dict:
     return c
 
 
+# 홈 사업부 매출 카드 한 줄씩 — 목표 · 실적 · 어디서 온 숫자인지.
 def _home_division_rows(month: str) -> list:
     data = _load_models()
+    # 앱에서 숨긴 사업부. 홈 관리 화면이 켜고 끄는 값이고,
+    # 매출 · 진행현황 표에는 '앱 숨김' 꼬리표로 붙는다. admin 에서는
+    # 숨겨도 줄이 사라지지 않는다 — 자료는 계속 올려야 한다.
+    _app_hidden = _dvis.hidden_set()
     projects = data.get("projects") or {}
     targets = (_div_targets().get(month) or {})
 
@@ -27799,8 +21279,23 @@ def _home_division_rows(month: str) -> list:
 
         actual, a_src, a_at = 0.0, "", ""
         target, t_src = 0.0, ""
+        # -----------------------------------------------------------
+        # 매출 파일이 있으면 그게 먼저다
+        # -----------------------------------------------------------
+        # 판가 × 실적은 어림값이다. 회계가 쓰는 숫자에는 스페어 부품 · 반제품 단가 차이 · 선매출 · 환율 적용 시점이 다 들어 있어서, ESS 10월만 놓고도
+        # $516만이 달랐다
+        _file_usd = None
+        try:
+            _file_usd = _drev.month_usd(did, month)
+        except Exception as _e:
+            print("[사업부매출] %s 읽기 실패(무시) — %s" % (did, _e))
+        if _file_usd is not None:
+            actual, a_src = float(_file_usd), "매출 파일"
+            a_at = ""
 
-        if did == "semiconductor":
+        if _file_usd is not None:
+            pass
+        elif did == "semiconductor":
             actual = float(rv.get("actual") or 0)
             a_src, a_at = "주간보고", str(rv.get("as_of") or "")
             if rv.get("has_target"):
@@ -27814,13 +21309,44 @@ def _home_division_rows(month: str) -> list:
             if actual or target:
                 a_src, t_src = "보고자료 금액", "보고자료 계획"
         else:
-            actual = _div_model_money(models)
-            a_src = "모델 판가 × 출하" if models else ""
+            # 그 달 주차 실적이 있으면 달로 가른다
+            _mon_actual = _div_actual_money(models, month)
+            if _mon_actual is None:
+                actual, a_src = 0.0, ""
+            else:
+                actual = _mon_actual
+                a_src = "판가 × 그 달 실적"
+        # -----------------------------------------------------------
+        # 타겟도 매출 파일이 먼저다
+        # -----------------------------------------------------------
+        # 네트워크 · 자동차 파일에는 그 달 '실행계획' 이 같이 들어 있다.
+        # 사람이 손으로 넣은 값이 있으면 그게 더 먼저다 — 아래에서 덮는다.
+        try:
+            _file_plan = _drev.month_plan(did, month)
+        except Exception:
+            _file_plan = None
+        if _file_plan:
+            target, t_src = float(_file_plan), "매출 파일 계획"
 
         # 자료에 계획이 없는 사업부는 손으로 넣은 타겟을 쓴다
-        if not target and did in targets:
+        if did in targets and (targets.get(did) or {}).get("total"):
             target = float((targets.get(did) or {}).get("total") or 0)
             t_src = "직접 입력"
+
+        # 그래도 없으면 그 달 주차별 계획을 다 더해 쓴다.
+        # 손으로 적은 값이 늘 먼저다 — 사람이 정한 숫자를 계산이 덮지 않는다.
+        if not target:
+            target = _div_plan_money(models, month)
+            if target:
+                t_src = "그 달 계획 합계"
+
+        # 일 보고 사업부(블룸·ESS)는 계획이 일 보고 보드에 있다 (_daily_div_money).
+        if not target and _daily_store_key(did):
+            _dp, _da = _daily_div_money(plist, projects, month)
+            if _dp:
+                target, t_src = _dp, "그 달 계획 합계 (일 보고)"
+                if not actual and _da:
+                    actual, a_src = _da, "일 보고 출하 실적"
 
         rows.append({
             "id": did, "label": d.get("label"), "order": d.get("order", 999),
@@ -27832,15 +21358,16 @@ def _home_division_rows(month: str) -> list:
             "models": len(models),
             "counts": _div_counts(models),
             "target_editable": t_src != "보고자료 계획",
+            "app_visible": str(did or "").lower() not in _app_hidden,
         })
     rows.sort(key=lambda r: r.get("order", 999))
     return rows
 
 
+# admin '홈 관리' 화면 — 앱 홈에 뜨는 것을 한자리에서 ← admin v2 renderHomeAdmin()
 @app.get("/admin/home/summary")
 def admin_home_summary(month: str = None,
                        _admin: int = Depends(get_admin_session)):
-    """admin '홈 관리' 화면 — 앱 홈에 뜨는 것을 한자리에서."""
     month = _check_month(month)
     rows = _home_division_rows(month)
     orders = _orders_load()
@@ -27856,12 +21383,12 @@ def admin_home_summary(month: str = None,
     }
 
 
+# 자료에 계획이 없는 사업부의 그 달 타겟 ← admin v2 sv.onclick() · saveTarget()
 @app.post("/admin/home/division-target")
 def admin_home_division_target(month: str = Form(...),
                                division_id: str = Form(...),
                                total: str = Form(...),
                                _admin: int = Depends(get_admin_session)):
-    """자료에 계획이 없는 사업부의 그 달 타겟. 0 이면 지운다."""
     month = _check_month(month)
     if not _cl.get_division(division_id):
         raise HTTPException(status_code=400, detail="없는 사업부입니다.")
@@ -27869,11 +21396,10 @@ def admin_home_division_target(month: str = Form(...),
     return {"ok": True, "divisions": _home_division_rows(month)}
 
 
+# 목록을 통째로 저장한다. 줄이 몇 개 안 되고 순서도 뜻이 있어서 한 줄씩 고치는 것보다 통째로 주고받는 쪽이 어긋날 일이 없다 ← admin v2 saveOrders()
 @app.put("/admin/home/orders")
 async def admin_home_orders_save(payload: dict = Body(...),
                                  _admin: int = Depends(get_admin_session)):
-    """목록을 통째로 저장한다. 줄이 몇 개 안 되고 순서도 뜻이 있어서
-    한 줄씩 고치는 것보다 통째로 주고받는 쪽이 어긋날 일이 없다."""
     items = payload.get("items") if isinstance(payload, dict) else None
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items 목록이 필요합니다.")
@@ -27887,15 +21413,17 @@ async def admin_home_orders_save(payload: dict = Body(...),
 
 _MONTH_RE = re.compile(r"20\d\d-\d{2}$")
 
-
+# ============================================================
+#  매출 파일 · 매출 상세
+# ============================================================
 def _check_month(month: str) -> str:
-    """'2026' 이나 '2026-9' 가 들어오면 그 달이 통째로 0 으로 보인다."""
     month = (month or "").strip() or datetime.now().strftime("%Y-%m")
     if not _MONTH_RE.match(month):
         raise HTTPException(status_code=400, detail="month 는 YYYY-MM 형식입니다.")
     return month
 
 
+# 매출 실적 자료(revenue.json)를 읽는다
 def _load_revenue() -> dict:
     try:
         return _rev.load(REVENUE_FILE)
@@ -27905,25 +21433,139 @@ def _load_revenue() -> dict:
                             detail=f"매출 파일을 읽지 못했습니다: {e}")
 
 
+# 매출 실적 자료를 저장한다
 def _save_revenue(store: dict) -> None:
     _rev.save(REVENUE_FILE, store)
 
 
+# 파일 이름에서 연도(20xx)를 뽑는다
 def _year_hint(name: str) -> int:
     m = re.search(r"(20\d\d)", str(name or ""))
     return int(m.group(1)) if m else datetime.now().year
 
 
+# 사업부 하나를 더 쪼갠 줄들. 없으면 빈 목록.
+def _div_breakdown(div: str, month: str) -> list:
+    out = []
+    try:
+        if div == "semiconductor":
+            rv = _rev.month_view(_load_revenue(), month) or {}
+            # 내부거래도 한 줄로 세운다. 빼 놓으면 쪼갠 줄을 다 더해도 사업부 줄과 안 맞는다 — 10월만 해도 $421만이 비었다 (묶음 합 $1652만 vs 사업부 줄
+            # $2073만).
+            _gs = list(rv.get("groups") or [])
+            if isinstance(rv.get("internal"), dict):
+                _gs.append(rv["internal"])
+            for g in _gs:
+                a = int(round(float(g.get("actual") or 0)))
+                if not a:
+                    continue
+                out.append({"item": str(g.get("label") or g.get("key") or ""),
+                            "actual": a})
+        else:
+            # month_detail 은 {"groups": [{label, actual, items}]} 모양이다.
+            det = _drev.month_detail(div, month) or {}
+            for g in (det.get("groups") or []):
+                a = int(round(float(g.get("actual") or 0)))
+                if not a:
+                    continue
+                # '고객사별' 은 위 묶음들을 다시 쪼갠 같은 돈이다. 같이
+                # 세우면 사업부 합계의 두 배가 선다.
+                if str(g.get("key") or "") == "cust":
+                    continue
+                out.append({"item": str(g.get("label") or ""), "actual": a})
+    except Exception as _e:
+        print("[전사매출] %s 쪼개기 실패(무시) — %s" % (div, _e))
+        return []
+    out.sort(key=lambda x: -x["actual"])
+    return out
+
+
+# 매출 상세 화면 — 사업부별 목표 · 실적 표.
+def _all_division_revenue_view(month: str, only: str = "") -> dict:
+    rows = [r for r in _home_division_rows(month) if r.get("app_visible")]
+    if only:
+        rows = [r for r in rows if r.get("id") == only]
+
+    actual = sum(float(r.get("actual") or 0) for r in rows)
+    target = sum(float(r.get("target") or 0) for r in rows)
+
+    ytd = 0.0
+    for r in rows:
+        try:
+            ytd += float(_div_ytd_money(r.get("id"), month) or 0)
+        except Exception as _e:
+            print("[전사매출] %s 누적 실패(무시) — %s" % (r.get("id"), _e))
+
+    # 묶음 = 사업부. 반도체 화면의 '반도체 · 데이터센터 · 우주항공' 자리에
+    # 사업부 이름이 들어간다 — 전사로 보면 그게 묶음이다.
+    groups = []
+    for r in rows:
+        a = float(r.get("actual") or 0)
+        t = float(r.get("target") or 0)
+        if not a and not t:
+            continue
+        groups.append({
+            "key": str(r.get("id") or ""),
+            "label": str(r.get("label") or r.get("id") or ""),
+            "actual": int(round(a)),
+            "estimate": int(round(t)),
+            "rate": int(round(a / t * 100)) if t > 0 else None,
+            # 그 사업부 안의 쪼갬
+            "items": _div_breakdown(str(r.get("id") or ""), month),
+        })
+
+    # 언제 기준인지. 사업부마다 다르면 제일 늦은 날짜를 적는다.
+    # 실적이 있는 줄만 본다 — 11월 실적이 0 인데 반도체 보고자료 날짜를 따라
+    # '2026-10-05 까지' 가 떠서, 11월 실적이 10월 5일에 멈춘 것처럼 읽혔다.
+    as_of = ""
+    for r in rows:
+        if not float(r.get("actual") or 0):
+            continue
+        at = str(r.get("actual_at") or "")
+        if at > as_of:
+            as_of = at
+
+    # 목표도 실적도 없는 사업부 — 줄로는 안 세우고 이름만 알려 준다.
+    # 아예 안 보이면 '그 사업부는 목표가 없다' 는 것을 알 길이 없다.
+    no_target = [str(r.get("label") or r.get("id") or "") for r in rows
+                 if not float(r.get("actual") or 0) and not float(r.get("target") or 0)]
+
+    return {
+        "month": month,
+        "actual": int(round(actual)),
+        "target": int(round(target)),
+        "has_target": target > 0,
+        "target_rate": int(round(actual / target * 100)) if target > 0 else None,
+        "target_left": int(round(max(0.0, target - actual))),
+        "estimate": int(round(target)),
+        "rate": int(round(actual / target * 100)) if target > 0 else None,
+        "left": int(round(max(0.0, target - actual))),
+        "ytd": int(round(ytd)),
+        "as_of": as_of,
+        "groups": groups,
+        "no_target": no_target,
+        "internal": None,
+        "has_data": bool(groups),
+        "has_estimate": target > 0,
+        "has_estimate_groups": any(g.get("estimate") for g in groups),
+        "scope": "전사" if not only else str(only),
+    }
+
+
+# 그 달의 묶음별 실적 + 사람이 넣은 예상 ← admin v2 renderRevenuePage() · 앱 revenue_service.dart fetch()
 @app.get("/revenue")
-def get_revenue(month: str = None):
-    """그 달의 묶음별 실적 + 사람이 넣은 예상. 앱 홈의 매출 카드가 쓴다."""
-    return _rev.month_view(_load_revenue(), _check_month(month))
+def get_revenue(month: str = None, division: str = "semiconductor"):
+    month = _check_month(month)
+    div = (division or "").strip()
+    if div == "semiconductor":
+        return _rev.month_view(_load_revenue(), month)
+    return _all_division_revenue_view(month, div)
 
 
+# 매출 관리 화면이 처음 켜질 때 받는 것 ← admin v2 renderRevenuePage()
 @app.get("/admin/revenue/state")
 def admin_revenue_state(month: str = None,
                         _admin: int = Depends(get_admin_session)):
-    """매출 관리 화면이 처음 켜질 때 받는 것."""
     month = _check_month(month)
     store = _load_revenue()
     view = _rev.month_view(store, month)
@@ -27932,15 +21574,11 @@ def admin_revenue_state(month: str = None,
     return view
 
 
+# 주간보고 엑셀을 받는다 ← admin v2 send()
 @app.post("/admin/revenue/import")
 async def admin_revenue_import(mode: str = Form("preview"),
                                file: UploadFile = File(...),
                                _admin: int = Depends(get_admin_session)):
-    """주간보고 엑셀을 받는다.
-
-    mode=preview 면 읽기만 하고 무엇이 달라지는지 돌려준다. mode=commit
-    이어야 저장한다. 파일 한 장이 한 해 전체라 그 해를 통째로 갈아 끼운다.
-    """
     raw = await _keep_upload(file, "/admin/revenue/import", "")
     if not raw:
         raise HTTPException(status_code=400, detail="빈 파일입니다.")
@@ -27992,15 +21630,11 @@ async def admin_revenue_import(mode: str = Form("preview"),
     return out
 
 
+# 그 달 예상 매출을 Commodity 별로 넣는다
 @app.post("/admin/revenue/estimate")
 def admin_revenue_estimate(month: str = Form(...),
                            items: str = Form("[]"),
                            _admin: int = Depends(get_admin_session)):
-    """그 달 예상 매출을 Commodity 별로 넣는다.
-
-    합계는 서버가 더한다. 화면이 보낸 합계를 믿으면 둘이 어긋났을 때
-    어느 쪽이 맞는지 알 수 없다. 다 비우면 그 달 예상을 지운다.
-    """
     month = _check_month(month)
     try:
         rows = json.loads(items or "[]")
@@ -28018,16 +21652,11 @@ def admin_revenue_estimate(month: str = Form(...),
     return res
 
 
+# 그 달 타겟을 금액 하나로 넣는다 ← admin v2 tgs.onclick()
 @app.post("/admin/revenue/target")
 def admin_revenue_target(month: str = Form(...),
                          total: str = Form(...),
                          _admin: int = Depends(get_admin_session)):
-    """그 달 타겟을 금액 하나로 넣는다. 0 이면 지운다.
-
-    예상과 따로 둔다 — 예상은 지금 그렇게 될 것 같은 값이고 타겟은
-    그렇게 만들기로 한 값이다. 한 칸에 담으면 목표를 낮춰 잡았는지
-    전망이 나빠진 건지 구분이 안 된다.
-    """
     month = _check_month(month)
     store = _load_revenue()
     try:
@@ -28039,15 +21668,12 @@ def admin_revenue_target(month: str = Form(...),
     return res
 
 
+# Estimate 파일을 받아 그 달 예상 매출로 넣는다 ← admin v2 sendEst()
 @app.post("/admin/revenue/estimate/import")
 async def admin_revenue_estimate_import(month: str = Form(...),
                                         mode: str = Form("preview"),
                                         file: UploadFile = File(...),
                                         _admin: int = Depends(get_admin_session)):
-    """Estimate 파일을 받아 그 달 예상 매출로 넣는다.
-
-    주간보고와 달리 한 달짜리라서, 어느 달인지는 화면에서 받는다.
-    """
     month = _check_month(month)
     raw = await _keep_upload(file, "/admin/revenue/estimate/import", "")
     if not raw:
@@ -28075,31 +21701,28 @@ async def admin_revenue_estimate_import(month: str = Form(...),
     return out
 
 
-# ── 사업부 월별 매입·지급 현황 ──────────────────────────────────
-#
-# PCB 사업부의 '월별 매입 현황 분석' 엑셀을 담는 자리다. 매출과 달리
-# 매입은 사업부마다 형식이 제각각이라, 자동 집계 대신 admin 에서 직접
-# 넣는다. 잔액은 계산하지 않고 적힌 값을 쓴다 — 표의 잔액이 매입-지급과
-# 맞지 않는 달이 있어서다(선급금 상계로 보인다). 비워두면 그때만 계산한다.
+# ============================================================
+#  사업부 월별 매입·지급 현황
+# ============================================================
+# PCB 사업부의 '월별 매입 현황 분석' 엑셀을 담는 자리다
 import purchases as _pur
 
 PURCHASE_FILE = DATA_DIR / "purchases.json"
 
-
+# ============================================================
+#  매입 · 지급
+# ============================================================
 def _pur_load() -> dict:
     return _pur.load(PURCHASE_FILE)
 
 
+# 앱 카드 한 장이 필요한 전부 — 월별 + 누적 ← admin v2 save() · renderPurchasePage() · 앱 purchase_service.dart fetch()
 @app.get("/division/{div}/purchase")
 def get_division_purchase(div: str, region: str = "total"):
-    """앱 카드 한 장이 필요한 전부 — 월별 + 누적.
-
-    region: total(합계) · overseas(해외) · domestic(국내).
-    안 주면 합계다 — 예전 앱은 이 인자를 모르므로 지금과 똑같이 본다.
-    """
     return _pur.for_app(_pur_load(), (div or "").strip(), region)
 
 
+# 사업부 매입·지급 자료 보기 ← admin v2 save() · renderPurchasePage()
 @app.get("/admin/division/purchase")
 def admin_division_purchase(div: str, _admin: int = Depends(get_admin_session)):
     data = _pur_load()
@@ -28110,6 +21733,7 @@ def admin_division_purchase(div: str, _admin: int = Depends(get_admin_session)):
     return out
 
 
+# 사업부 매입·지급 자료 고치기 (잠김) ← admin v2 save() · renderPurchasePage()
 @app.put("/admin/division/purchase")
 def admin_division_purchase_save(payload: dict = Body(...),
                                  _admin: int = Depends(get_admin_session)):
@@ -28125,16 +21749,14 @@ def admin_division_purchase_save(payload: dict = Body(...),
     return out
 
 
-# ── 매입 현황 엑셀 올리기 ───────────────────────────────────────
-#
-# preview 로 한 번 보여 주고, commit 이어야 저장한다. 엑셀에 없는 달은
-# 건드리지 않는다 — 4~8월짜리 파일을 올렸다고 9월이 지워지면 안 된다.
-#
-# '합계 · 해외 · 국내' 세 열은 누적(summary)으로 따로 들어간다. 엑셀에
-# 그 열이 없으면 summary 를 보내지 않는다 — 안 보내면 있던 누적을 지킨다.
+# ============================================================
+#  매입 현황 엑셀 올리기
+# ============================================================
+# preview 로 한 번 보여 주고, commit 이어야 저장한다
 import purchase_import as _purim
 
 
+# 매입·지급 엑셀 올리기 ← admin v2 upload()
 @app.post("/admin/division/purchase/import-xlsx")
 async def admin_division_purchase_import(
         div: str = Form(...),
@@ -28183,18 +21805,42 @@ async def admin_division_purchase_import(
     out["state"] = _pur.for_admin(saved, div)
     return out
 
-# ── 사업부 매출 (매출 관리 화면이 반도체 아닌 사업부를 열 때) ─────
-#
-# revenue.json 은 반도체사업부 주간보고 한 장이 원본이다. 그런데 매출
-# 관리가 사이드바 '사업부' 그룹에 있어서, PCB 를 골라도 반도체 숫자가
-# 떴다. 사업부를 고른 사람에게 다른 사업부 숫자를 보여주면 안 된다.
-#
-# 반도체가 아닌 사업부는 홈 카드가 쓰는 것과 같은 자리에서 온다 —
-# 블룸은 보고자료 금액, 나머지는 모델 판가 × 출하. 타겟만 사람이 넣는다.
+# ============================================================
+#  사업부 매출 (매출 관리 화면이 반도체 아닌 사업부를 열 때)
+# ============================================================
+# 그 해 1월부터 이 달까지의 매출.
+def _div_ytd_money(div: str, month: str) -> float:
+    try:
+        year = int(str(month)[:4])
+        upto = int(str(month)[5:7])
+    except Exception:
+        return 0.0
+    data = _load_models()
+    projects = data.get("projects") or {}
+    try:
+        plist = _cl.get_projects(div, visible_only=True)
+    except Exception:
+        plist = []
+    models = []
+    for p in plist:
+        models.extend((projects.get(p.get("id")) or {}).get("models") or [])
+
+    total = 0.0
+    for mm in range(1, upto + 1):
+        key = "%04d-%02d" % (year, mm)
+        try:
+            got = _drev.month_usd(div, key)
+        except Exception:
+            got = None
+        if got is None:
+            got = _div_actual_money(models, key)
+        if got:
+            total += float(got)
+    return round(total, 2)
 
 
+# 사업부 하나의 매출. 홈 카드와 같은 숫자를 쓴다
 def _div_revenue_view(div: str, month: str) -> dict:
-    """사업부 하나의 매출. 홈 카드와 같은 숫자를 쓴다."""
     row = None
     for r in _home_division_rows(month):
         if r.get("id") == div:
@@ -28213,7 +21859,8 @@ def _div_revenue_view(div: str, month: str) -> dict:
     rows = []
     for p in plist:
         ms = (projects.get(p.get("id")) or {}).get("models") or []
-        money = _div_model_money(ms)
+        # 위 합계와 같은 잣대로 센다. 프로젝트 줄은 누계고 합계는 월별이면 더해도 안 맞아서 "어느 쪽이 틀렸지" 를 찾게 된다
+        money = _div_actual_money(ms, month) or 0.0
         shipped = sum(int(m.get("shipped_qty") or 0)
                       for m in ms if isinstance(m, dict))
         po = sum(int(m.get("po_qty") or 0)
@@ -28239,9 +21886,398 @@ def _div_revenue_view(div: str, month: str) -> dict:
         "counts": row.get("counts"),
         "projects": rows,
         "months_all": [],
+        # 반도체 화면과 같은 칸을 채운다.
+        "ytd": _div_ytd_money(div, month),
+        # -----------------------------------------------------------
+        # 구분별 실적 표
+        # -----------------------------------------------------------
+        # Min: "반도체사업부도 보면 내가 있는 품목이 아니더라도 매출 관리
+        #      파일 기준으로 구분이 나눠져 있잖아 다른 사업부들도 다
+        #      동일하게 해줘"
+        #
+        # 매출 파일이 적어 둔 구분 그대로 준다. 없으면 화면이 아래
+        # 프로젝트별 표로 떨어진다 — 그때는 판가 × 실적이다.
+        "detail": _drev.month_detail(div, month),
+        "as_of": row.get("actual_at") or "",
+        "target_rate": row.get("rate"),
+        # 매출 파일이 들어와 있나 — 화면에 '어느 파일이 언제' 를 적어 준다
+        "revenue_file": _drev.info(div),
     }
 
 
+# ============================================================
+#  품목별 개발 일정 양식 올리기
+# ============================================================
+# 양식의 줄들을 등록된 모델에 붙여 본다
+def _ds_plan(division_id: str, items: list, idx: dict) -> dict:
+    data = _load_models()
+    hit, miss = [], []
+    for it in (items or []):
+        pid = _df_find_project(it.get("project"), idx)
+        proj = (data.get("projects") or {}).get(pid) or {} if pid else {}
+        m = _ds_pick_model(proj.get("models") or [], it.get("part_number"))
+        moved = ""
+        if m is None:
+            # 적힌 고객사에 없으면 사업부 전체에서 품번으로 찾는다.
+            _pk, m = _ds_pick_in_division(data, division_id,
+                                          it.get("part_number"), pid or "")
+            if m is not None:
+                pid, proj, moved = _pk, (data["projects"][_pk] or {}), _pk
+        if m is None:
+            miss.append({"row": it.get("row"), "project": it.get("project"),
+                         "part_number": it.get("part_number"),
+                         "why": ("프로젝트를 못 찾았습니다" if not pid
+                                 else "그 프로젝트에 없는 품번입니다")})
+            continue
+        steps = it.get("steps") or []
+        # 지금 적혀 있는데 새 파일에서 비어 있어 지워질 칸 (반영은 파일 그대로)
+        _old = {str((x or {}).get("name") or ""): x
+                for x in (m.get("process") or []) if isinstance(x, dict)}
+        cleared = 0
+        for _st in steps:
+            _was = _old.get(_st.get("name") or "") or {}
+            for _f in ("expected", "actual", "expected_note", "actual_note"):
+                if str(_was.get(_f) or "").strip() and not _st.get(_f):
+                    cleared += 1
+        hit.append({
+            "project_key": pid,
+            "label": _display_project_label(pid),
+            "part_number": it.get("part_number"),
+            "name": m.get("name") or m.get("id"),
+            "steps": [s.get("name") for s in steps],
+            "plan": sum(1 for s in steps if s.get("expected")),
+            "actual": sum(1 for s in steps if s.get("actual")),
+            # 단계 이름이 바뀌는지 — 블룸은 13단계가 3단계로 바뀐다
+            "before_steps": [str((x or {}).get("name") or "")
+                             for x in (m.get("process") or [])],
+            # 적힌 고객사가 아니라 다른 프로젝트에서 찾았으면 적어 둔다
+            "moved_to": moved,
+            "cleared": cleared,
+        })
+    return {"hit": hit, "miss": miss}
+
+
+# 개발 일정 엑셀을 받아 연다 (원본은 보관함에 남긴다).
+async def _ds_open(file: UploadFile, where: str):
+    import io as _io
+    import openpyxl as _ox
+    raw = await _keep_upload(file, where=where)
+    if not raw:
+        raise HTTPException(status_code=400, detail="빈 파일입니다.")
+    try:
+        return _ox.load_workbook(_io.BytesIO(raw), data_only=True, keep_links=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="엑셀을 열지 못했습니다: %s" % e)
+
+
+# 개발 일정 양식이 무엇을 바꾸는지 먼저 보여준다 ← admin v2 fv.onclick() · _devSend()
+@app.post("/admin/divisions/{division_id}/dev-schedule/preview")
+async def admin_dev_schedule_preview(
+        division_id: str, file: UploadFile = File(...),
+        _admin: int = Depends(get_admin_session)):
+    import dev_schedule_import as _dsi
+    wb = await _ds_open(file, "divisions/dev-schedule/preview")
+    try:
+        got = _dsi.parse_workbook(wb)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    plan = _ds_plan(division_id, got["items"], _df_owner_index(division_id))
+    return {"ok": True, "preview": True, "division_id": division_id,
+            "file_name": file.filename or "", "sheet": got["sheet"],
+            "steps_max": got["steps_max"], "item_count": len(got["items"]),
+            "hit": plan["hit"], "miss": plan["miss"],
+            "warnings": got["warnings"]}
+
+
+# 개발 일정 양식을 실제로 반영한다 ← admin v2 fv.onclick() · _devSend()
+@app.post("/admin/divisions/{division_id}/dev-schedule/apply")
+async def admin_dev_schedule_apply(
+        division_id: str, file: UploadFile = File(...),
+        _admin: int = Depends(get_admin_session)):
+    import dev_schedule_import as _dsi
+    wb = await _ds_open(file, "divisions/dev-schedule/apply")
+    try:
+        got = _dsi.parse_workbook(wb)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    idx = _df_owner_index(division_id)
+    data = _load_models()
+    applied, miss, step_changed = [], [], []
+    warn_moved = []          # 적힌 고객사 말고 다른 프로젝트에서 찾은 줄
+    for it in got["items"]:
+        pid = _df_find_project(it.get("project"), idx)
+        proj = (data.get("projects") or {}).get(pid) or {} if pid else {}
+        m = _ds_pick_model(proj.get("models") or [],
+                           it.get("part_number")) if pid else None
+        if m is None:
+            # 품번은 사실상 품목의 이름값을 한다 — 적힌 고객사에 없으면
+            # 사업부 전체에서 찾는다 (딱 하나일 때만).
+            _pk, m = _ds_pick_in_division(data, division_id,
+                                          it.get("part_number"), pid or "")
+            if m is not None:
+                warn_moved.append({"row": it.get("row"),
+                                   "project": it.get("project"),
+                                   "part_number": it.get("part_number"),
+                                   "found_in": _display_project_label(_pk)})
+                pid, proj = _pk, (data["projects"][_pk] or {})
+        if m is None:
+            miss.append({"row": it.get("row"), "project": it.get("project"),
+                         "part_number": it.get("part_number")})
+            continue
+
+        old = {str((x or {}).get("name") or ""): x
+               for x in (m.get("process") or []) if isinstance(x, dict)}
+        before = [str((x or {}).get("name") or "") for x in (m.get("process") or [])]
+        names = [s.get("name") for s in (it.get("steps") or [])]
+        if before != names:
+            step_changed.append({"project_key": pid,
+                                 "part_number": it.get("part_number"),
+                                 "before": before, "after": names})
+
+        was_final = bool(m.get("process")) and _process_step_done(m["process"][-1])
+        proc = []
+        for s in (it.get("steps") or []):
+            nm = s.get("name") or ""
+            # 옛 단계에서 이어받는 건 열쇠 · 묶음(틀)뿐이다. 날짜와 글자는
+            # 새 파일 것만 쓴다 — 빈 칸이면 비운다.
+            prev = old.get(nm) or {}
+            row = {"key": prev.get("key") or _ds_key(nm),
+                   "name": nm,
+                   "group": prev.get("group") or "",
+                   "expected": s.get("expected") or "",
+                   "actual": s.get("actual") or "",
+                   "status": ""}
+            # 날짜가 아닌 글자도 같이 담는다 ('고객사 검토중' · 'PO 완료').
+            # 날짜만 받던 때는 이런 칸이 소리 없이 사라졌다.
+            for _f in ("expected_note", "actual_note"):
+                row[_f] = s.get(_f) or ""
+            # 양식 머리에 적힌 규칙 그대로 — "*완료되었으나 날짜 확인이 어려운 경우 '완료'로 작성" 실적 칸에 '완료' 라고 적혔으면 끝난 것으로 센다
+            if (_note_says_done(row.get("actual_note"))
+                    or _note_says_done(row.get("expected_note"))):
+                row["status"] = "완료"
+            proc.append(row)
+        m["process"] = proc
+        # 최종 승인이 처음 끝난 날을 적어 둔다. 실적 칸에 날짜 없이 '완료' 만
+        # 적혀 오면 언제 끝났는지 알 길이 없어서, 1주일을 셀 기준이 없다
+        # (_dev_final_day 참고).
+        if proc and _process_step_done(proc[-1]):
+            if not was_final or not m.get("final_done_seen"):
+                m["final_done_seen"] = date.today().isoformat()
+        else:
+            m.pop("final_done_seen", None)
+        # 빈 칸은 '안 적음' 이라 지우지 않는다. 한 번 적어 둔 담당이
+        # 담당 칸을 비워 올린 다음 파일에 지워지면 안 된다.
+        _own = str(it.get("owner") or "").strip()
+        if _own:
+            m["dev_owner"] = _own
+        applied.append({"project_key": pid, "part_number": it.get("part_number"),
+                        "name": m.get("name") or m.get("id"),
+                        "steps": len(proc)})
+
+    _save_models(data)
+    print("[개발일정] %s '%s': %d품목 반영 · 단계 바뀜 %d · 못 찾음 %d"
+          % (division_id, file.filename or "", len(applied),
+             len(step_changed), len(miss)))
+    return {"ok": True, "division_id": division_id,
+            "file_name": file.filename or "", "sheet": got["sheet"],
+            "steps_max": got["steps_max"], "item_count": len(got["items"]),
+            # 몇 칸이 들어갔는지 숫자로 돌려준다. 전에는 통째로 버려도
+            # '경고 0건' 이라 괜찮아 보였다 (Min: "엑셀에는 내용 다
+            # 적혀져 있고 날짜도 작성 되어 있는데 왜 적용을 못 하는거야").
+            "date_cells": got.get("date_cells", 0),
+            "note_cells": got.get("note_cells", 0),
+            "applied": applied, "step_changed": step_changed, "miss": miss,
+            "moved": warn_moved,
+            "warnings": got["warnings"]}
+
+
+# 품번 한 칸 → 맞춰 볼 열쇠들.
+def _pn_variants(t) -> set:
+    import re as _re
+    raw = str(t or "").strip()
+    if not raw:
+        return set()
+    out = {_df_norm(raw)}
+    head = _re.split(r"[(\[]", raw)[0]
+    head = _re.sub(r"(?i)^\s*(part\s*(no|number)?|품번|파트\s*넘버)\s*[:：]?\s*",
+                   "", head)
+    out.add(_df_norm(head))
+    m = _re.search(r"[(\[]([^)\]]+)[)\]]", raw)
+    if m:
+        out.add(_df_norm(m.group(1)))
+    out.discard("")
+    return out
+
+
+# 개발 일정 양식 한 줄 → 등록된 모델.
+def _ds_pick_model(models: list, pn: str):
+    want = _pn_variants(pn)
+    if not want:
+        return None
+    # -----------------------------------------------------------
+    # 글자 그대로 — 지금까지 맞던 것은 그대로 맞아야 한다
+    # -----------------------------------------------------------
+    exact = _df_norm(pn)
+    for m in models:
+        for f in ("part_number", "id"):
+            if _df_norm(m.get(f)) == exact:
+                return m
+    # -----------------------------------------------------------
+    # 괄호를 가린 뒤 — 딱 하나일 때만
+    # -----------------------------------------------------------
+    hit = []
+    for m in models:
+        mine = set()
+        for f in ("part_number", "id"):
+            mine |= _pn_variants(m.get(f))
+        if mine & want:
+            hit.append(m)
+    return hit[0] if len(hit) == 1 else None
+
+
+# 그 사업부의 (프로젝트키, 프로젝트) 목록.
+def _ds_div_projects(data: dict, division_id: str) -> list:
+    out = []
+    for pk, proj in (data.get("projects") or {}).items():
+        try:
+            if (_cl.derive_division_from_project(pk) or "") == division_id:
+                out.append((pk, proj or {}))
+        except Exception:
+            continue
+    return out
+
+
+# 사업부 전체에서 품번으로 찾는다 → (프로젝트키, 모델) 또는 (None, None).
+def _ds_pick_in_division(data: dict, division_id: str, pn: str, skip: str = ""):
+    hit = []
+    for pk, proj in _ds_div_projects(data, division_id):
+        if pk == skip:
+            continue
+        m = _ds_pick_model(proj.get("models") or [], pn)
+        if m is not None:
+            hit.append((pk, m))
+    if len(hit) == 1:
+        return hit[0]
+    return None, None
+
+
+# 보여 줄 때만, 날짜가 없는 칸에 적혀 있던 글자를 채워 넣는다
+def _ds_show_notes(proc: list) -> list:
+    import re as _re
+    out = []
+    for st in (proc or []):
+        st = dict(st or {})
+        for f in ("expected", "actual"):
+            if not str(st.get(f) or "").strip():
+                note = str(st.get(f + "_note") or "").strip()
+                if note:
+                    st[f] = note
+        # 끝난 단계인데 실적에 날짜가 없으면 실적 자리에 '완료' 라고 쓴다
+        if st.get("status") == "완료" \
+                and not _re.search(r"\d{4}-\d{1,2}-\d{1,2}", str(st.get("actual") or "")):
+            st["actual"] = "완료"
+        out.append(st)
+    return out
+
+
+# 단계 이름 → 저장용 열쇠.
+def _ds_key(name: str) -> str:
+    import hashlib as _hl
+    import re as _re
+    raw = str(name or "")
+    t = _re.sub(r"[^0-9A-Za-z]+", "_", raw).strip("_").lower()
+    plain = _re.sub(r"[^0-9A-Za-z]+", "", raw)
+    if plain and len(plain) == len(_re.sub(r"\s+", "", raw)):
+        return t                      # 영문·숫자만 있는 이름
+    h = _hl.sha1(raw.encode("utf-8")).hexdigest()[:6]
+    return (t + "_" + h) if t else ("s_" + h)
+
+
+# ============================================================
+#  사업부 매출 파일 올리기
+# ============================================================
+# 매출 파일 엑셀을 받아 연다 (원본은 보관함에 남긴다).
+async def _rv_file_open(file: UploadFile, where: str = ""):
+    import io as _io
+    import openpyxl as _ox
+    # 원본을 보관함에 한 벌 남긴다. 숫자가 이상할 때 '그때 올린 그 파일'
+    # 을 다시 열어 볼 수 있어야 한다 — 매출은 특히 그렇다.
+    raw = await _keep_upload(file, where=where)
+    if not raw:
+        raise HTTPException(status_code=400, detail="빈 파일입니다.")
+    try:
+        return _ox.load_workbook(_io.BytesIO(raw), data_only=True, keep_links=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="엑셀을 열지 못했습니다: %s" % e)
+
+
+# 미리보기·반영이 같은 글자를 쓰게 한 자리에서 만든다
+def _rv_file_view(got: dict) -> dict:
+    months = []
+    for k, v in sorted((got.get("months") or {}).items()):
+        months.append({"month": k, "krw": v.get("krw"),
+                       "usd": v.get("usd"), "fx": v.get("fx")})
+    # 고객사별로 묶어 보여 준다 — 남의 사업부 줄이 섞여 있으면 여기서 보인다
+    by_cust = {}
+    for r in (got.get("rows") or []):
+        by_cust.setdefault(r.get("customer") or "", 0)
+        by_cust[r.get("customer") or ""] += 1
+    for m in months:
+        m["plan"] = (got.get("plan_months") or {}).get(m["month"])
+    cl = got.get("customers") or [k for k, _v in sorted(by_cust.items())]
+    return {"year": got.get("year"), "sheet": got.get("sheet"),
+            "shape": got.get("shape") or "", "fx_weeks": got.get("fx_weeks"),
+            "plan_kind": got.get("plan_kind") or "",
+            "weeks": len(got.get("weeks") or {}),
+            "months": months,
+            "customers": [{"name": k, "rows": by_cust.get(k, 0)} for k in cl],
+            "warnings": got.get("warnings") or []}
+
+
+# 매출 파일이 무엇을 바꾸는지 먼저 보여준다 ← admin v2 inp.onchange()
+@app.post("/admin/divisions/{division_id}/revenue-file/preview")
+async def admin_division_revenue_file_preview(
+        division_id: str, file: UploadFile = File(...),
+        _admin: int = Depends(get_admin_session)):
+    import revenue_file_import as _rfi
+    wb = await _rv_file_open(file, "divisions/revenue-file/preview")
+    try:
+        got = _rfi.parse_workbook(wb)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    out = _rv_file_view(got)
+    out.update({"ok": True, "division_id": division_id,
+                "file_name": file.filename or "", "preview": True})
+    return out
+
+
+# 매출 파일을 실제로 담는다. 그 해만 갈아 끼운다 ← admin v2 go.onclick()
+@app.post("/admin/divisions/{division_id}/revenue-file/apply")
+async def admin_division_revenue_file_apply(
+        division_id: str, file: UploadFile = File(...),
+        _admin: int = Depends(get_admin_session)):
+    import revenue_file_import as _rfi
+    wb = await _rv_file_open(file, "divisions/revenue-file/apply")
+    try:
+        got = _rfi.parse_workbook(wb)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    saved = _drev.put(division_id, got.get("year"), got.get("months") or {},
+                      got.get("rows") or [], file.filename or "",
+                      plan_months=got.get("plan_months") or {},
+                      weeks=got.get("weeks") or {},
+                      shape=got.get("shape") or "",
+                      detail=got.get("detail") or {})
+    out = _rv_file_view(got)
+    out.update({"ok": True, "division_id": division_id,
+                "file_name": file.filename or "", "saved": saved.get("saved")})
+    print("[사업부매출] %s '%s': %d개 달 담음"
+          % (division_id, file.filename or "", len(saved.get("saved") or [])))
+    return out
+
+
+# 매출 파일로 들어온 사업부 매출 보기 ← admin v2 renderRevenuePage()
 @app.get("/admin/division/revenue")
 def admin_division_revenue(div: str, month: str = None,
                            _admin: int = Depends(get_admin_session)):
@@ -28252,18 +22288,15 @@ def admin_division_revenue(div: str, month: str = None,
     return _div_revenue_view(div, month)
 
 
-# ── 사라진 모델 되살리기 ────────────────────────────────────────
-#
-# 모델 저장이 '전체 교체' 라, 화면이 목록을 덜 들고 저장하면 나머지가
-# 통째로 지워진다. 챔버 19종·SpaceX 16종·자동차 9종이 그렇게 날아갔고,
-# 서버 자동 백업은 10개만 남아 그때까지 거슬러 올라가지 못했다.
-#
-# 그래서 오래된 백업에서 뽑아 둔 파일을 backend/restore/ 에 넣어 두고,
-# '지금 없는 모델만' 더한다. 지금 있는 것은 절대 건드리지 않는다 —
-# 되살리려다 그 뒤 13일치 작업을 덮으면 그게 더 큰 사고다.
+# ============================================================
+#  사라진 모델 되살리기
+# ============================================================
+# 모델 저장이 '전체 교체' 라, 화면이 목록을 덜 들고 저장하면 나머지가 통째로 지워진다
 RESTORE_DIR = BASE_DIR / "restore"
 
-
+# ============================================================
+#  백업 되살리기 · 특근
+# ============================================================
 def _restore_file(name: str):
     safe = os.path.basename(str(name or "").strip())
     if not safe or not safe.endswith(".json"):
@@ -28275,9 +22308,9 @@ def _restore_file(name: str):
         return safe, json.load(f)
 
 
+# backend/restore/ 에 있는 복구 파일 목록.
 @app.get("/admin/models/restore-files")
 def admin_models_restore_files(_admin: int = Depends(get_admin_session)):
-    """backend/restore/ 에 있는 복구 파일 목록."""
     out = []
     if RESTORE_DIR.exists():
         for p in sorted(RESTORE_DIR.glob("*.json")):
@@ -28293,16 +22326,10 @@ def admin_models_restore_files(_admin: int = Depends(get_admin_session)):
     return {"ok": True, "files": out}
 
 
+# 복구 파일에서 '지금 없는 모델만' 더한다
 @app.post("/admin/models/restore-missing")
 def admin_models_restore_missing(payload: dict = Body(...),
                                  _admin: int = Depends(get_admin_session)):
-    """복구 파일에서 '지금 없는 모델만' 더한다.
-
-    payload = {name, projects?: [키...], mode: "preview"|"commit"}
-
-    같은 id 가 이미 있으면 건너뛴다. 값을 덮지 않으므로 여러 번 돌려도
-    결과가 같다. 저장 직전 상태는 _save_models 가 자동 백업으로 남긴다.
-    """
     name, doc = _restore_file((payload or {}).get("name"))
     want = [str(k).strip() for k in ((payload or {}).get("projects") or []) if str(k).strip()]
     mode = str((payload or {}).get("mode") or "preview").strip()
@@ -28369,51 +22396,47 @@ def admin_models_restore_missing(payload: dict = Body(...),
     out["saved"] = True
     return out
 
-# ── 전사 사업부별 잔업·특근 ────────────────────────────────────
-#
-# 주 단위다. 한 주에 사업부 16곳, 각 곳이 요일 7줄. 지표는 잔업률(월~토)과
-# 특근률(일) 둘이고 각각 전체/직접/간접으로 갈린다.
-#
-# 앱은 지표 하나 · 범위 하나씩만 받아 간다. 한 화면에 96칸을 내려보내면
-# 폰에서 읽을 방법이 없다.
+# ============================================================
+#  전사 사업부별 잔업·특근
+# ============================================================
+# 주 단위다. 한 주에 사업부 16곳, 각 곳이 요일 7줄.
 import overtime as _ot
 import overtime_import as _otim
 
 OVERTIME_FILE = DATA_DIR / "overtime.json"
 
-
+# ============================================================
+#  특근
+# ============================================================
 def _ot_load():
     return _ot.load(OVERTIME_FILE)
 
 
+# 전사 화면 — 주차 하나, 지표 하나, 범위 하나 ← 앱 overtime_service.dart fetchWeek()
 @app.get("/overtime/week")
 def overtime_week(w: str = "", kind: str = "overtime", scope: str = "total"):
-    """전사 화면 — 주차 하나, 지표 하나, 범위 하나."""
     return _ot.for_app(_ot_load(), w, kind, scope)
 
 
+# 사업부 하나 — 요일별까지 ← 앱 overtime_service.dart fetchDivision()
 @app.get("/overtime/week/{div}")
 def overtime_division(div: str, w: str = ""):
-    """사업부 하나 — 요일별까지."""
     out = _ot.for_division(_ot_load(), div, w)
     if not out.get("has_data"):
         raise HTTPException(status_code=404, detail="그 주에 그 사업부가 없습니다.")
     return out
 
 
+# 특근 자료 보기 ← admin v2 save() · load()
 @app.get("/admin/overtime")
 def admin_overtime_get(w: str = "", _admin: int = Depends(get_admin_session)):
     return _ot.for_admin(_ot_load(), w)
 
 
+# 주차 하나를 통째로 갈아끼운다 — 다른 주는 건드리지 않는다 ← admin v2 save() · load()
 @app.put("/admin/overtime")
 def admin_overtime_put(payload: dict = Body(...),
                        _admin: int = Depends(get_admin_session)):
-    """주차 하나를 통째로 갈아끼운다 — 다른 주는 건드리지 않는다.
-
-    통째 교체라, 화면이 사업부를 덜 들고 저장하면 나머지가 지워진다.
-    모델이 그렇게 68종 날아간 적이 있어서, 줄어드는 저장은 막는다.
-    """
     wk = _ot.week_key((payload or {}).get("week"))
     if not wk:
         raise HTTPException(status_code=400, detail="주차는 2026-W39 처럼 적어 주세요.")
@@ -28431,6 +22454,7 @@ def admin_overtime_put(payload: dict = Body(...),
     return _ot.for_admin(saved, wk)
 
 
+# 취합 엑셀 올리기. preview 로 먼저 보여 주고 commit 이어야 저장한다 ← admin v2 upload()
 @app.post("/admin/overtime/import-xlsx")
 async def admin_overtime_import(
         file: UploadFile = File(...),
@@ -28438,7 +22462,6 @@ async def admin_overtime_import(
         week: Optional[str] = Form(None),
         mode: str = Form("preview"),
         _admin: int = Depends(get_admin_session)):
-    """취합 엑셀 올리기. preview 로 먼저 보여 주고 commit 이어야 저장한다."""
     name = file.filename or ""
     if not name.lower().endswith((".xlsx", ".xlsm")):
         raise HTTPException(status_code=400, detail="xlsx 파일을 올려 주세요.")
@@ -28479,16 +22502,16 @@ async def admin_overtime_import(
     return out
 
 
-# ── 일일 백업 ───────────────────────────────────────────────────────
-#
-# 요청이 들어올 때 '오늘 것이 있나' 를 보고 없으면 만든다. fly 머신이
-# auto_stop 이라 자정에 깨어 있지 않아서, 시계에 기대는 스케줄러를 쓸 수
-# 없다. 아침에 누가 앱을 처음 열면 그때 그날 백업이 생긴다.
-#
-# 백업은 /data/backups/ 안에서만 지운다. 운영 데이터는 건드리지 않는다.
+# ============================================================
+#  일일 백업
+# ============================================================
+# 요청이 들어올 때 '오늘 것이 있나' 를 보고 없으면 만든다
 import backups as _bk
 
-
+# ============================================================
+#  자동 백업
+# ============================================================
+# 모든 요청이 지나가는 문 (미들웨어)
 @app.middleware("http")
 async def _daily_backup_mw(request, call_next):
     # 백업이 실패해도 요청은 그대로 흘러가야 한다. 백업 때문에 앱이
@@ -28502,14 +22525,15 @@ async def _daily_backup_mw(request, call_next):
     return await call_next(request)
 
 
+# 오래 걸리는 일을 별도 일꾼에서 돌린다 (서버가 멈추지 않게).
 async def _run_in_threadpool_safe(fn, *a):
     from starlette.concurrency import run_in_threadpool
     return await run_in_threadpool(fn, *a)
 
 
+# 백업 목록 + 지금 보관 계획. name 을 주면 그 안을 들여다본다 ← admin v2 load()
 @app.get("/admin/backups")
 def admin_backups(name: str = "", _admin: int = Depends(get_admin_session)):
-    """백업 목록 + 지금 보관 계획. name 을 주면 그 안을 들여다본다."""
     rows = _bk.list_backups(DATA_DIR)
     out = {"ok": True,
            "backups": rows,
@@ -28529,10 +22553,10 @@ def admin_backups(name: str = "", _admin: int = Depends(get_admin_session)):
     return out
 
 
+# 지금 한 벌 뜬다. 오늘 것이 있으면 그 위에 덮어쓴다 ← admin v2 run.onclick()
 @app.post("/admin/backups/run")
 def admin_backups_run(payload: dict = Body(default=None),
                       _admin: int = Depends(get_admin_session)):
-    """지금 한 벌 뜬다. 오늘 것이 있으면 그 위에 덮어쓴다."""
     label = str((payload or {}).get("label") or "")[:24]
     res = _bk.snapshot(DATA_DIR, label=label)
     if not res.get("ok"):
@@ -28544,22 +22568,18 @@ def admin_backups_run(payload: dict = Body(default=None),
     return res
 
 
+# 보관 기간 지난 것 정리. dry_run 이면 무엇을 지울지만 알려준다 ← admin v2 pr.onclick()
 @app.post("/admin/backups/prune")
 def admin_backups_prune(payload: dict = Body(default=None),
                         _admin: int = Depends(get_admin_session)):
-    """보관 기간 지난 것 정리. dry_run 이면 무엇을 지울지만 알려준다."""
     dry = bool((payload or {}).get("dry_run"))
     return {"ok": True, **_bk.prune(DATA_DIR, dry_run=dry), "dry_run": dry}
 
 
+# 되돌리기. payload = {name, files?: [파일명...]} ← admin v2 el.onclick()
 @app.post("/admin/backups/restore")
 def admin_backups_restore(payload: dict,
                           _admin: int = Depends(get_admin_session)):
-    """되돌리기. payload = {name, files?: [파일명...]}
-
-    files 를 주면 그 파일만 바꾼다. 덮어쓰기 전에 지금 상태를 먼저
-    한 벌 떠 두므로 되돌린 게 잘못이어도 다시 되돌릴 수 있다.
-    """
     name = str((payload or {}).get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="백업 이름이 필요합니다")
@@ -28573,9 +22593,9 @@ def admin_backups_restore(payload: dict,
     return res
 
 
+# 백업 파일 내려받기. 서버 밖에도 한 벌 두고 싶을 때 ← admin v2 detail()
 @app.get("/admin/backups/download")
 def admin_backups_download(name: str, _admin: int = Depends(get_admin_session)):
-    """백업 파일 내려받기. 서버 밖에도 한 벌 두고 싶을 때."""
     from fastapi.responses import FileResponse
     import os as _os
     safe = _os.path.basename(name)
@@ -28585,26 +22605,19 @@ def admin_backups_download(name: str, _admin: int = Depends(get_admin_session)):
     return FileResponse(str(p), media_type="application/gzip", filename=safe)
 
 
-# ── 주차별 계획·실적 양식 내려받기 ──────────────────────────────────
-#
-# 주차는 반드시 week_calendar 에서 받는다. 손으로 적으면 어긋난다 —
-# 2026-10 의 주차는 W41~W44 이고 W40 은 9월 소유다. 양식과 보드가 서로
-# 다른 주차를 말하면 올려도 칸이 안 맞는다.
-#
-# 모델 칸을 채워 보내는 이유는 따로 있다. 매주 품번 수십 개를 손으로
-# 적게 하면 언젠가 하나를 다르게 적고, 다르게 적힌 줄은 어느 모델에도
-# 안 붙어 조용히 사라진다.
+# ============================================================
+#  주차별 계획·실적 양식 내려받기
+# ============================================================
+# 주차는 반드시 week_calendar 에서 받는다
 import weekly_template as _wt
 
-
+# ============================================================
+#  엑셀 양식 내려받기 (주차 · 계획 · 블룸)
+# ============================================================
+# 그 프로젝트의 주차별 계획·실적 양식.
 @app.get("/admin/projects/{project_key}/weekly-template")
 def admin_weekly_template(project_key: str, month: str = "", months: int = 1,
                           _admin: int = Depends(get_admin_session)):
-    """그 프로젝트의 주차별 계획·실적 양식.
-
-    month  기준 달 (YYYY-MM). 없으면 이번 달.
-    months 몇 달치 시트를 넣을지 (1~6).
-    """
     import datetime as _dt
     from urllib.parse import quote
 
@@ -28668,8 +22681,9 @@ def admin_weekly_template(project_key: str, month: str = "", months: int = 1,
                  f"filename*=UTF-8''{quote(fname)}"})
 
 
-# ── 연간 내보내기 ───────────────────────────────────────────────────
-#
+# ============================================================
+#  연간 내보내기
+# ============================================================
 # 받는 양식과 모양이 다르다. 받는 쪽은 한 달이 한 시트(세로로 길다),
 # 이건 한 해가 한 시트(가로로 길다)다. 한 해를 한 장에 놓고 보려고
 # 쓰던 파일이라 그 모양을 그대로 따라간다.
@@ -28677,19 +22691,10 @@ import plan_export as _pex
 import plan_form as _pfm
 
 
+# 작성용 양식 — 한 해 한 장, 고른 달만 주차 칸이 열린다 ← admin v2 el.onclick()
 @app.get("/admin/projects/{project_key}/plan-form")
 def admin_plan_form(project_key: str, month: str = "",
                     _admin: int = Depends(get_admin_session)):
-    """작성용 양식 — 한 해 한 장, 고른 달만 주차 칸이 열린다.
-
-    달마다 한 장이던 때는, 이번 주를 적는 사람이 '지난 달까지 얼마나
-    나갔더라' 를 보려면 시트를 넘기거나 보드를 따로 띄워야 했다. 한 해를
-    한 장에 놓고 지난 달은 월 합계 두 칸만 둔다 — 보는 자리지 고치는
-    자리가 아니다. 지난 달 주차 칸을 같이 두지 않는 이유는 분명하다.
-    올리는 쪽은 시트 이름으로 달을 정하고 그 달 주차만 읽으니, 지난 달
-    칸은 적어도 조용히 안 들어간다. 적을 수 있게 생겼는데 안 먹는 칸이
-    제일 나쁘다.
-    """
     import datetime as _dt
     from urllib.parse import quote
 
@@ -28732,7 +22737,7 @@ def admin_plan_form(project_key: str, month: str = "",
             notes[_ym] = _got
 
     # 프로젝트 현황도 같이 싣는다. 받는 사람이 지금 뭐라고 적혀 있는지
-    # 보고 고칠 수 있어야 한다 (2026-10-22)
+    # 보고 고칠 수 있어야 한다
     data = _pfm.build_year_form(label, y, mon, models, notes=notes,
                                 status_note=str(proj.get("status_note") or ""),
                                 hold=_project_hold(proj))
@@ -28745,10 +22750,10 @@ def admin_plan_form(project_key: str, month: str = "",
                  f"filename*=UTF-8''{quote(fname)}"})
 
 
+# 그 해에 주차 숫자가 적힌 달. 고르는 창의 기본 체크에 쓴다 ← admin v2 back.onclick() · done()
 @app.get("/admin/projects/{project_key}/plan-export/months")
 def admin_plan_export_months(project_key: str, year: int = 0,
                              _admin: int = Depends(get_admin_session)):
-    """그 해에 주차 숫자가 적힌 달. 고르는 창의 기본 체크에 쓴다."""
     import datetime as _dt
 
     key = _model_key_alias((project_key or "").strip())
@@ -28759,15 +22764,10 @@ def admin_plan_export_months(project_key: str, year: int = 0,
             "has": _pex.months_with_weeks(models, y)}
 
 
+# 그 프로젝트 한 해치 주차별 계획·실적 엑셀 ← admin v2 onclick()
 @app.get("/admin/projects/{project_key}/plan-export")
 def admin_plan_export(project_key: str, year: int = 0, months: str = None,
                       _admin: int = Depends(get_admin_session)):
-    """그 프로젝트 한 해치 주차별 계획·실적 엑셀.
-
-    months  주차를 펼쳐 둘 달 ('2026-09,2026-10'). 안 주면 주차 숫자가
-            적힌 달만 펼친다. 나머지는 접혀서 월 합계 두 칸만 보인다 —
-            쉰두 주를 다 늘어놓으면 눈이 어디를 봐야 할지 모른다.
-    """
     import datetime as _dt
     from urllib.parse import quote
 
@@ -28803,23 +22803,17 @@ def admin_plan_export(project_key: str, year: int = 0, months: str = None,
                  f"filename*=UTF-8''{quote(fname)}"})
 
 
-# ── 블룸 일 보고 — 빈 양식 내려주기 ──────────────────────────────────
-#
-# 기준은 사람이 쓰던 '블룸_보고자료_..._ver4_1.xlsx' 의 '10월 보고자료'
-# 시트다. 새 모양을 짜내지 않고 그 모양을 그대로 만든다 — 받는 분들이
-# 지금 쓰던 대로 채우면 되고, 파서도 그 머리글을 보고 열을 찾는다.
-#
-# 품목 칸은 미리 채워 보낸다. 매달 품목 여덟 개를 손으로 적게 하면
-# 언젠가 하나를 다르게 적고, 다르게 적힌 줄은 어느 품목에도 안 붙어
-# 조용히 사라진다. config 의 bloom_item 순서대로 깔고, 이미 올라와 있는
-# 보드에만 있는 품목(SS8 처럼 프로젝트가 없는 것)을 뒤에 붙인다.
+# ============================================================
+#  블룸 일 보고 — 빈 양식 내려주기
+# ============================================================
+# 기준은 사람이 쓰던 '블룸_보고자료_..._ver4_1.xlsx' 의 '10월 보고자료' 시트다
 import bloom_template as _bt
 
 
+# 블룸 일 보고 자료 빈 양식 (품목 칸은 채워서) ← admin v2 fm.onclick()
 @app.get("/admin/projects/{project_key}/bloom-template")
 def admin_bloom_template(project_key: str, month: str = "",
                          _admin: int = Depends(get_admin_session)):
-    """블룸 일 보고 자료 빈 양식 (품목 칸은 채워서)."""
     import datetime as _dt
     from urllib.parse import quote
 
@@ -28876,3 +22870,58 @@ def admin_bloom_template(project_key: str, month: str = "",
         headers={"Content-Disposition":
                  f"attachment; filename=bloom_template.xlsx; "
                  f"filename*=UTF-8''{quote(fname)}"})
+
+
+# ============================================================
+#  앱 오프라인용 묶음 — 사업부 하나의 화면 자료를 한 번에
+# ============================================================
+# 앱이 프로젝트마다 일곱 번씩 따로 받으면 150곳 × 7 = 1,000번이 넘어서,
+# 다 받기 전에 오프라인이 되면 처음 여는 프로젝트가 비었다. 사업부마다 한 번에
+# 묶어 주면 여덟 번이면 끝난다. 앱은 주소별로 쪼개 저장한다 (offline_prefetch.dart).
+# 각 칸은 그 주소를 직접 부른 것과 같은 값이다 — 실패한 칸은 빠진다.
+def _bundle_value(x):
+    # 주소 함수가 Response 를 돌려주는 경우(JSONResponse)도 값으로 꺼낸다
+    if isinstance(x, Response):
+        try:
+            return json.loads(x.body)
+        except Exception:
+            return None
+    return x
+
+
+# 사업부 하나의 오프라인 묶음 ← 앱 offline_prefetch.dart
+@app.get("/divisions/{division_id}/offline-bundle")
+def get_division_offline_bundle(division_id: str, month: str = ""):
+    import gzip as _gzip
+    month = (month or "").strip() or datetime.now().strftime("%Y-%m")
+    out = {}
+    q = "?month=" + month
+
+    def _put(path, fn, *args, **kw):
+        try:
+            v = _bundle_value(fn(*args, **kw))
+        except Exception:
+            return                       # 그 칸만 빠진다 (주소를 부를 때도 실패했을 것)
+        if v is not None:
+            out[path] = v
+
+    for p in _cl.get_projects(division_id, visible_only=True):
+        pk = p.get("id")
+        if not pk:
+            continue
+        base = "/projects/%s" % pk
+        _put(base + "/models/detail", get_project_models_detail, pk)
+        _put(base + "/models", get_project_models, pk)
+        _put(base + "/weekly-plan", get_weekly_plan, pk)
+        _put(base + "/issues/summary", get_issues_summary, pk)
+        _put(base + "/process-steps", get_process_steps, pk)
+        _put(base + "/weekly-board" + q, get_weekly_board, pk, month)
+        _put(base + "/weekly-revenue" + q, get_weekly_revenue, pk, month)
+    # 일 보고 사업부(블룸 · ESS)는 사업부 보드도
+    _put("/divisions/%s/daily-view" % division_id, get_division_daily_view, division_id, "", "")
+    _put("/divisions/%s/daily-view%s" % (division_id, q), get_division_daily_view, division_id, month, "")
+    body = json.dumps({"division_id": division_id, "month": month, "urls": out},
+                      ensure_ascii=False, default=str).encode("utf-8")
+    # 묶음이 커서(반도체 1MB 안팎) 줄여 보낸다. 앱의 http 는 gzip 을 알아서 푼다.
+    return Response(content=_gzip.compress(body), media_type="application/json",
+                    headers={"Content-Encoding": "gzip"})

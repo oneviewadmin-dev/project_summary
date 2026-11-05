@@ -8,10 +8,10 @@
 //
 // 못 받아오면 null 을 돌려준다. 신호가 나쁜 걸 '자료가 바뀌었다' 로
 // 읽으면 안 된다 — 전체 새로고침이 계속 돌아간다.
+import 'offline_store.dart';
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:http/http.dart' as http;
 
 class DataVersionService {
   static const String _baseUrl = String.fromEnvironment(
@@ -22,8 +22,8 @@ class DataVersionService {
   /// 자료 버전 한 줄. 실패하면 null.
   static Future<String?> fetch() async {
     try {
-      final r = await http
-          .get(Uri.parse('$_baseUrl/data-version'))
+      final r = await OfflineStore
+          .httpGet(Uri.parse('$_baseUrl/data-version'))
           .timeout(const Duration(seconds: 8));
       if (r.statusCode != 200) return null;
       final d = jsonDecode(r.body);

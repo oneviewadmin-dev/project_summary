@@ -1,6 +1,6 @@
+import '../services/offline_store.dart';
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 import '../config/app_config.dart';
 import '../design/colors.dart';
 import '../design/typography.dart';
@@ -50,7 +50,16 @@ List<String> _devProcessStepsFor(String projectKey) =>
 class _Step {
   final String name;
   final int? weeks;
-  const _Step(this.name, this.weeks);
+
+  /// 칩에 적을 글자. 서버가 만들어 준다 ('6개월' · '2주') — 2026-11-03.
+  /// 자동차는 고객사가 개월로 센다. 주로 바꿔 적으면 '21개월' 이
+  /// '91주' 가 되어 아무도 안 읽는다. 단위는 서버가 정한다.
+  final String label;
+  const _Step(this.name, this.weeks, [this.label = '']);
+
+  /// 칩 꼬리. 안 정한 단계는 빈 글자 — 아무것도 안 붙는다.
+  String get tail =>
+      label.isNotEmpty ? label : (weeks == null ? '' : '$weeks주');
 }
 
 /// 개발 모델에 실제 공정 데이터가 입력되어 있는지 판정.
@@ -93,6 +102,26 @@ String holdOf(Map m) {
     return '보류';
   }
   return '';
+}
+
+/// 이 모델을 **어느 틀로 그릴까** (2026-10-28).
+///
+/// Min: "양산 개발을 나뉘는데 개발에 들어가더라도 양산처럼 틀 똑같이
+///      맞춰달라는거였어"
+///
+/// 구분(display_group)과 틀(frame)은 다른 이야기다.
+///   구분 — 목록이 양산 · 개발 두 묶음으로 나뉘는 기준
+///   틀   — 그 묶음에 들어갔을 때 어떤 카드 · 어떤 상세 화면으로 보나
+///
+/// 아리스타 개발은 '개발' 묶음에 그대로 있되, 안에서는 양산처럼 주차별
+/// 계획 · 실적으로 본다. 공정 13단계는 반도체 것이라 PCB 에는 맞는 단계가
+/// 하나도 없어서, 들어가면 빈 단계표만 떴다.
+///
+/// 서버가 frame 을 안 주는 옛 버전이면 지금까지처럼 구분을 그대로 쓴다.
+String frameOf(Map m) {
+  final f = (m['frame'] ?? '').toString();
+  if (f.isNotEmpty) return f;
+  return (m['display_group'] ?? m['group'] ?? '').toString();
 }
 
 /// 양산으로 넘어왔는데 PO 가 아직 안 들어온 모델.
@@ -172,9 +201,12 @@ class _ModelListScreenState extends State<ModelListScreen> {
 
   Future<void> _loadSteps() async {
     if (widget.groupName != '개발') return;
+    // 틀이 전부 양산이면 공정 단계를 부를 일이 없다
+    if (widget.models.isNotEmpty &&
+        !widget.models.any((m) => frameOf(m) == '개발')) return;
     try {
-      final res = await http
-          .get(Uri.parse('$kApiBaseUrl/projects/$projectKey/process-steps'))
+      final res = await OfflineStore
+          .httpGet(Uri.parse('$kApiBaseUrl/projects/$projectKey/process-steps'))
           .timeout(const Duration(seconds: 6));
       if (res.statusCode != 200) return;
       final d = jsonDecode(utf8.decode(res.bodyBytes));
@@ -183,6 +215,7 @@ class _ModelListScreenState extends State<ModelListScreen> {
           .map((e) => _Step(
                 (e['name'] ?? '').toString(),
                 (e['weeks'] as num?)?.toInt(),
+                (e['label'] ?? '').toString(),
               ))
           .where((e) => e.name.isNotEmpty)
           .toList();
@@ -287,7 +320,7 @@ class _ModelListScreenState extends State<ModelListScreen> {
   Future<bool> _checkReportExists(String projectKey) async {
     try {
       final uri = Uri.parse('$kApiBaseUrl/projects/$projectKey');
-      final res = await http.get(uri).timeout(const Duration(seconds: 5));
+      final res = await OfflineStore.httpGet(uri).timeout(const Duration(seconds: 5));
       if (res.statusCode != 200) return false;
       final decoded = jsonDecode(utf8.decode(res.bodyBytes));
       if (decoded is Map<String, dynamic> && decoded.isNotEmpty) return true;
@@ -330,8 +363,13 @@ class _ModelListScreenState extends State<ModelListScreen> {
     final hold = holdOf(m);
     if (hold.isNotEmpty) return '$hold · $stage';
 
-    // PO 가 아직 없으면 끝난 게 아니라 다음 PO 를 기다리는 중이다.
-    if (progress >= 100) {
+    // 최종 승인 뒤 1주일은 '완료', 그다음은 PO 대기 — 서버가 정한다
+    // (main.py _dev_po_wait). 서버가 안 알려 주는 옛 버전이면 예전처럼
+    // PO 수량으로 가른다.
+    if (m.containsKey('dev_po_wait')) {
+      if (m['po_wait'] == true) return 'PO 대기';
+      if (progress >= 100) return '완료';
+    } else if (progress >= 100) {
       return ((m['po_qty'] as num?)?.toInt() ?? 0) > 0 ? '완료' : 'PO 대기';
     }
     if (progress == 0) return '대기중';
@@ -421,9 +459,9 @@ class _ModelListScreenState extends State<ModelListScreen> {
                           fontWeight: FontWeight.w600,
                           color: Color(0xFF7C3AED),
                         )),
-                    if (list[i].weeks != null) ...[
+                    if (list[i].tail.isNotEmpty) ...[
                       const SizedBox(width: 3),
-                      Text('(${list[i].weeks}주)',
+                      Text('(${list[i].tail})',
                           style: const TextStyle(
                             fontSize: 9.5,
                             fontWeight: FontWeight.w700,
@@ -460,7 +498,10 @@ class _ModelListScreenState extends State<ModelListScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final isDev = groupName == '개발';
+    // 개발 묶음이어도 틀이 양산이면 공정 칩 줄을 안 그린다 (2026-10-28).
+    // 아리스타는 그 단계가 아예 없어서 빈 칩만 늘어섰다.
+    final isDev = groupName == '개발' &&
+        (models.isEmpty || models.any((m) => frameOf(m) == '개발'));
     return Scaffold(
       backgroundColor: const Color(0xFFF5F6F8),
       appBar: AppBar(
@@ -522,9 +563,9 @@ class _ModelListScreenState extends State<ModelListScreen> {
                       itemCount: list.length,
                       itemBuilder: (context, i) {
                         // 양산·개발이 섞여 들어올 수 있다 (개요의 '확인 필요' 목록).
+                        // 어느 카드로 그릴지는 구분이 아니라 **틀**이 정한다.
                         final m = list[i];
-                        final g = (m['display_group'] ?? m['group'] ?? '').toString();
-                        return g == '개발'
+                        return frameOf(m) == '개발'
                             ? _devCard(context, m)
                             : _massCard(context, m);
                       },
@@ -549,7 +590,7 @@ class _ModelListScreenState extends State<ModelListScreen> {
         Map<String, dynamic> modelData = m;
         try {
           final uri = Uri.parse('$kApiBaseUrl/projects/$projectKey/models');
-          final res = await http.get(uri).timeout(const Duration(seconds: 8));
+          final res = await OfflineStore.httpGet(uri).timeout(const Duration(seconds: 8));
           if (res.statusCode == 200) {
             final decoded = jsonDecode(utf8.decode(res.bodyBytes));
             final groups = decoded['groups'] as Map<String, dynamic>? ?? const {};
@@ -685,19 +726,25 @@ class _ModelListScreenState extends State<ModelListScreen> {
                       style: AppText.bodyStrong.copyWith(fontSize: 15),
                       overflow: TextOverflow.ellipsis),
                 ),
-                const SizedBox(width: 6),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: isRpm ? const Color(0xFFE0F2FE) : const Color(0xFFEDE9FE),
-                    borderRadius: BorderRadius.circular(8),
+                // 유형이 비어 있으면 배지를 안 그린다 (2026-11-03).
+                // Min: "파란색 동그라미는 왜 저걸 둔 이유를 모르겠어"
+                // 글자 없는 연보라 알약이 이름 옆에 붙어 있었다 — 자동차
+                // 품목은 dev_type 이 비어서 빈 배지만 남았다.
+                if (devType.trim().isNotEmpty) ...[
+                  const SizedBox(width: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: isRpm ? const Color(0xFFE0F2FE) : const Color(0xFFEDE9FE),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(devType,
+                        style: TextStyle(
+                          fontSize: 10, fontWeight: FontWeight.w800,
+                          color: isRpm ? const Color(0xFF0284C7) : const Color(0xFF7C3AED),
+                        )),
                   ),
-                  child: Text(devType,
-                      style: TextStyle(
-                        fontSize: 10, fontWeight: FontWeight.w800,
-                        color: isRpm ? const Color(0xFF0284C7) : const Color(0xFF7C3AED),
-                      )),
-                ),
+                ],
                 ..._tagsFor(m),
               ]),
               const SizedBox(height: 4),
@@ -813,8 +860,8 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
     final key = (model['project_key'] ?? model['project_id'] ?? '').toString();
     if (key.isEmpty) return;
     try {
-      final res = await http
-          .get(Uri.parse('$kApiBaseUrl/projects/$key/weekly-plan'))
+      final res = await OfflineStore
+          .httpGet(Uri.parse('$kApiBaseUrl/projects/$key/weekly-plan'))
           .timeout(const Duration(seconds: 6));
       if (res.statusCode != 200) return;
       final d = jsonDecode(utf8.decode(res.bodyBytes));

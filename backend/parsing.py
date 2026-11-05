@@ -1,19 +1,7 @@
 # -*- coding: utf-8 -*-
-"""파싱 — 사람이 쓴 글자에서 뜻을 꺼내는 함수들.
-
-main.py 에서 떼어 왔다. 여기 들어오는 것의 조건은 하나다.
-**서버 상태를 모른다** — 파일도 안 읽고, 설정도 안 보고, 전역 변수도 안 쓴다.
-글자(또는 셀 목록)를 받아 dict 를 돌려줄 뿐이다. 그래서 따로 시험해 보기 쉽다.
-
-  _parse_due_text              "8월 24일"      → "2026-08-24"
-  _parse_report_filename       파일명          → 프로젝트 · 날짜 · 주차
-  _extract_excel_markers       노트 글         → 본문과 표 마커를 분리
-  _parse_shipping_table_header 출하표 머리 3줄 → 어느 칸이 무슨 뜻인지
-  _parse_sales_input           매출 입력 글    → 판가와 주차별 숫자
-
-엑셀 파일 자체를 여는 파서(프로젝트마다 양식이 달라 따로 만든 것들)는
-여기가 아니라 *_import.py 에 있다. 여기는 '글자' 만 다룬다.
-"""
+# ============================================================
+#  파싱 — 사람이 쓴 글자에서 뜻을 꺼내는 함수들
+# ============================================================
 import re
 from datetime import date, datetime
 
@@ -24,8 +12,8 @@ _EXCEL_MARKER_RE = re.compile(
 )
 
 
+# due_text '8월 24일' -> 'YYYY-MM-DD' (올해 기준, 지났으면 내년)
 def _parse_due_text(t: str):
-    """due_text '8월 24일' -> 'YYYY-MM-DD' (올해 기준, 지났으면 내년)"""
     import re as _re
     from datetime import date as _date, datetime as _dt
     m = _re.search(r"(\d{1,2})월\s*(\d{1,2})일", t or "")
@@ -43,18 +31,8 @@ def _parse_due_text(t: str):
     return None
 
 
+# 파일명에서 프로젝트명 / 날짜 / 주차 추출.
 def _parse_report_filename(file_name: str, fallback_date: str = "") -> dict:
-    """
-    파일명에서 프로젝트명 / 날짜 / 주차 추출.
-
-    Examples:
-        "260703_파워박스 진행현황.pptx"
-            -> {"projects": ["파워박스"], "date": "2026-07-03", "week": 27, "display_title": "파워박스 · W27 주간보고"}
-        "260528_내재화프레임, 메이져모듈 진행현황.pptx"
-            -> {"projects": ["내재화프레임", "메이져모듈"], "date": "2026-05-28", "week": 22, "display_title": "내재화프레임, 메이져모듈 · W22 주간보고"}
-        "Chamber_W26_20260706.pptx"
-            -> {"projects": ["Chamber"], "date": "2026-07-06", "week": 26, "display_title": "Chamber · W26 주간보고"}
-    """
     import re as _re
     import unicodedata as _ud
     from datetime import datetime as _dt, date as _date
@@ -122,10 +100,8 @@ def _parse_report_filename(file_name: str, fallback_date: str = "") -> dict:
     }
 
 
+# 텍스트에서 엑셀 마커 추출. 반환: (clean_text, [{filename, table_ref, anchor}])
 def _extract_excel_markers(text: str):
-    """텍스트에서 엑셀 마커 추출.
-    반환: (clean_text, [{filename, table_ref, anchor}])
-    """
     lines = text.split("\n")
     out_lines = []
     tables = []
@@ -148,14 +124,8 @@ def _extract_excel_markers(text: str):
     return ("\n".join(out_lines), tables)
 
 
+# 헤더 3행(R1, R2, R3)을 분석해 각 컬럼의 의미를 매핑.
 def _parse_shipping_table_header(rows: list) -> dict:
-    """헤더 3행(R1, R2, R3)을 분석해 각 컬럼의 의미를 매핑.
-
-    처리 규칙:
-    - R1: 대분류 (월/누적합계) - forward-fill (병합 셀)
-    - R2: 서브그룹 (W27/W28.../합계) - forward-fill (계획/실적 쌍의 왼쪽 셀에만 값 있음)
-    - R3: 세부 (계획/실적/PO/출하)
-    """
     if len(rows) < 3:
         return {"columns": [], "detected_months": [], "current_month": None}
 
@@ -164,8 +134,8 @@ def _parse_shipping_table_header(rows: list) -> dict:
     r3 = rows[2]
     n_cols = max(len(r1), len(r2), len(r3))
 
+    # forward-fill: 빈 셀은 왼쪽 값으로 채움
     def _fill(row, n):
-        """forward-fill: 빈 셀은 왼쪽 값으로 채움"""
         out = []
         last = ""
         for i in range(n):
@@ -266,18 +236,8 @@ def _parse_shipping_table_header(rows: list) -> dict:
     }
 
 
+# [모델/판가] EFEM=65 VTM=24
 def _parse_sales_input(text: str) -> dict:
-    """
-    [모델/판가]
-    EFEM=65
-    VTM=24
-    
-    [주차별]
-    W27: EFEM 2/2, VTM 2/2
-    W30: EFEM 5/0, VTM 1/0
-    
-    → {"prices": {"EFEM": 65.0}, "weeks": {"W27": {"EFEM": {"plan":2,"actual":2}}}}
-    """
     prices = {}
     weeks = {}
     section = None

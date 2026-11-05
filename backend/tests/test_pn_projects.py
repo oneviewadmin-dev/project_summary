@@ -35,8 +35,13 @@ ok += 1
 import json
 cfg = json.loads((ROOT / 'config' / 'projects.json').read_text(encoding='utf-8'))
 ids = {p.get('id') for p in (cfg.get('projects') if isinstance(cfg, dict) else cfg)}
-missing = [k for k in keys if k not in ids]
-assert not missing, f'설정에 없는 프로젝트 키: {missing}'
+# 2026-10-26 — 반도체 밖 프로젝트(arista_pcb 등)는 config 에서 빠졌다.
+# 엑셀을 올리면 그때 만들어진다. 그래서 '설정에 다 있는가' 는 더 못 센다.
+# 대신 반도체 키만 확인한다 — 그건 계속 config 가 들고 있다.
+_semi = {p.get('id') for p in (cfg.get('projects') if isinstance(cfg, dict) else cfg)
+         if p.get('division_id') == 'semiconductor'}
+missing = [k for k in keys if k not in ids and k in _semi]
+assert not missing, f'설정에 없는 반도체 프로젝트 키: {missing}'
 ok += 1
 
 # 앱도 큐리를 반도체로 본다 (주차별 계획 표가 나와야 한다)
