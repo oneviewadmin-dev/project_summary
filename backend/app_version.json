@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.71",
-  "latest_version_code": 94,
+  "latest_version": "2.3.72",
+  "latest_version_code": 95,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "온라인일 때 모든 프로젝트 자료를 한 번에 받아 둡니다.\n\n· 처음 여는 프로젝트도 오프라인에서 그대로\n· 캘린더: 오늘까지 할 일만 · 완료 단추 없앰\n· 확인 필요 · 알림 목록은 품번으로 먼저 표시",
+  "release_notes": "개발 공정 · 주차 표를 더 읽기 쉽게 바꿨습니다.\n\n· 계획이 빈 단계에 예상일 표시\n· 실적 칸은 회색, 오늘은 빨간 테두리\n· 출하율은 이번 달 기준으로",
   "force_update": false
 }
