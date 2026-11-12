@@ -1,8 +1,8 @@
 {
-  "latest_version": "2.3.72",
-  "latest_version_code": 95,
+  "latest_version": "2.3.73",
+  "latest_version_code": 96,
   "download_url": "/app/download",
   "apk_url": "/app/download",
-  "release_notes": "개발 공정 · 주차 표를 더 읽기 쉽게 바꿨습니다.\n\n· 계획이 빈 단계에 예상일 표시\n· 실적 칸은 회색, 오늘은 빨간 테두리\n· 출하율은 이번 달 기준으로",
+  "release_notes": "개발 공정 · PCB · 챔버 화면을 고쳤습니다.\n\n· 진행중 단계 바로잡음, 확인 필요에 지금 단계\n· PCB 매출 밑에 고객 요청일 카드\n· 챔버 주차 보드를 화이트보드 모양으로",
   "force_update": false
 }
